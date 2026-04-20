@@ -40,6 +40,7 @@ Every test run should be logged here with its configuration, commit, date, and r
 | 21 | 2026-04-16 | nvfp4 branch | 223.167.85.181 | **NVFP4 W4A4** (modelopt, block_size=16, FP8 KV, dense) | **~12%** | **~15%** | **0** | 0.00% | 7.00% | 50.00% | 0.00% | 3.33% | ~7200s | 1636 | **CATASTROPHIC**: FP4 quantization destroys reasoning; avg output 30k-54k tokens (infinite think loops); decode throughput excellent (1636 tok/s) but accuracy unusable; 5 requests timed out (3000s) |
 | 23 | 2026-04-17 | f373fbade | 223.167.85.181 | CHANGE_0100: residual scale folding + GPTQ + FP8 KV + dense + torch.compile(max-bs=8) + mixed-chunk | **78.64%** | **98.30%** | **0.96** | 56.67% | 81.00% | 98.89% | 100% | 56.67% | 3234s | 492.87 | Accuracy regression vs Test 20; C drops to 0.96 (not submission-safe yet) |
 | 24 | 2026-04-18 | 96304f9cd | 223.167.85.181 | CHANGE_0110: **dense-calibrated GPTQ** + FP8 KV + dense + torch.compile(max-bs=8) + mixed-chunk | **77.64%** | **97.05%** | **0.92** | **50.00%** | 79.33% | 98.89% | 100% | 60.00% | 3059s | — | **FAILED**: Dense calibration made accuracy WORSE; mcq crashed to 50%; C=0.92 |
+| 25 | 2026-04-20 | 08fd86023 | 223.167.85.181 | **CHANGE_0120**: prefill-max-req=4, sched-cons=0.8, chunk=65536 | **79.00%** | **98.75%** | **0.96** | 53.33% | 85.00% | 100% | 100% | 56.67% | 2988s | 423.75 | mcq=53.33% (variance); cwe improved 85%; fwe/niah perfect; duration 2988s (vs 3171s Test 20); C=0.96 |
 
 ---
 
@@ -70,6 +71,7 @@ Every test run should be logged here with its configuration, commit, date, and r
 | 25A-spd | 2026-04-20 | (local) | **prefill-max-req=4, sched-cons=0.8**, chunk=32K | **110.58s** | 40.53s | 33.58s | — | **S1 -8.2%**, S8/Smax unchanged |
 | 25B-spd | 2026-04-20 | (local) | prefill-max-req=4, sched-cons=0.8, **chunk=65K** | **110.54s** | 40.54s | 33.59s | — | Chunk=65K: same as 32K on old data (inputs too short to matter) |
 | 25C-spd | 2026-04-20 | (local) | prefill-max-req=8, sched-cons=0.5, chunk=65K | **110.53s** | 40.54s | 33.54s | — | More aggressive: no further gain, plateau at ~110.5s |
+| 26-prof | 2026-04-20 | 08fd86023 | **PROFILING**: torch profiler, stage-separated, 3 steps each | — | — | — | — | GEMM=85.3% prefill, FLA=12.4%. See CHANGE_0120_profiling_analysis |
 
 ---
 

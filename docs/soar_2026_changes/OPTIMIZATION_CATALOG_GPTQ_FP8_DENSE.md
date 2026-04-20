@@ -70,9 +70,18 @@ This document catalogs **every known speed optimization vector** for our baselin
 
 **A4 — Recurrent threshold (TESTED, NO GAIN)**: Tested threshold=64/128/256. No measurable impact. The threshold controls chunk vs recurrent kernel selection for prefill; decode always uses recurrent regardless of threshold.
 
-### Critical Insight
+### Critical Insight (UPDATED 2026-04-20 — PROFILING DATA)
 
-**The 24 SimpleGLA layers account for ~75% of forward pass time.** Optimizations in this layer (A1-A3) have the highest ROI because they affect 24/32 layers. The 8 standard attention layers are already well-optimized via FlashInfer.
+> **PREVIOUS ASSUMPTION (DISPROVED)**: "The 24 SimpleGLA layers account for ~75% of forward pass time."
+>
+> **ACTUAL PROFILING RESULT**: On 25K-30K token inputs:
+> - **GEMM (Marlin/GPTQ) = 85.3% of prefill** — the true bottleneck
+> - FLA/SimpleGLA = 12.4% of prefill (chunk_fwd = 1%, FlashInfer attention = 8.8%, rest = 2.6%)
+> - For decode: GEMM = 63.5%, torch.compile fused = 29.4%, FLA = 4.9%
+>
+> A1/A3 optimizations still have value for decode, but **GEMM optimization (Layer 5) is now the highest-impact target** for overall throughput, especially with the new 32K-512K token dataset.
+>
+> See `docs/soar_2026_changes/CHANGE_0120_profiling_analysis.en.md` for full profiling data.
 
 ---
 
@@ -144,9 +153,11 @@ This document catalogs **every known speed optimization vector** for our baselin
 ### Tier 3: Medium Code Changes (3-5 days, medium risk)
 | Priority | ID | Optimization | Expected Gain | Status |
 |----------|----|-------------|---------------|--------|
-| 9 | A1 | SimpleGLA state contiguity guarantee | **5-8% decode** | ⬜ Not started |
-| 10 | A2 | FLA chunk size tuning | ~~5-10%~~ **0%** | ❌ TESTED — no gain (Test 19) |
-| 11 | K4 | Fused RMSNorm + residual_scale kernel | **1-2%** | ⬜ Not started |
+| 9 | **G4** | **Marlin GEMM SM120 auto-config** | **5-15% prefill** | ⬜ Not started — **NEW #1 PRIORITY (85.3% of prefill)** |
+| 10 | **G5** | **FP8 W8A16 quantization** | **10-30% prefill** | ⬜ Not started — replace Marlin W4 with FP8 tensor cores |
+| 11 | A1 | SimpleGLA state contiguity guarantee | ~~5-8% decode~~ **<1% prefill, ~3% decode** | ⬜ Not started — **deprioritized by profiling** |
+| 12 | A2 | FLA chunk size tuning | ~~5-10%~~ **0%** | ❌ TESTED — no gain (Test 19) |
+| 13 | K4 | Fused RMSNorm + residual_scale kernel | ~~1-2%~~ **<0.5%** | ⬜ Not started — **deprioritized by profiling** |
 
 ### Tier 4: Major Engineering (1-2 weeks, high effort)
 | Priority | ID | Optimization | Expected Gain |
@@ -165,7 +176,7 @@ If all optimizations succeed (optimistic):
 - Tier 4 (major): ~12-20%
 - **Total theoretical**: ~40-70% (multiplicative, not additive)
 
-**Reality check**: Optimizations often don't stack linearly. A realistic target combining Tier 1 + Tier 2 + partial Tier 3 is **20-35%** speedup. With score at 40.23 (#19) after new long-context dataset rerun, we need **~37.7% faster** to reach #5 (64.58). Tier 1 config tuning is now largely exhausted (+8.2% S1). Remaining gap requires kernel-level work (Tier 3+4) or alternative quantization (FP8 weights).
+**Reality check (updated with profiling data)**: Profiling shows GEMM is 85.3% of prefill and 63.5% of decode. With the new 32K-512K dataset being prefill-dominant, the highest-leverage optimization is **faster GEMM** — either via Marlin kernel tuning for Blackwell SM120 or switching to FP8 W8A16 (native tensor cores). FLA/SimpleGLA optimization has much lower impact than originally estimated (~12.4% of prefill vs assumed 75%). With score at 40.23 (#19), we need **~37.7% faster** to reach #5 (64.58). This magnitude of speedup likely requires GEMM-level changes (FP8 quantization) rather than scheduling tuning or minor kernel fusions.
 
 ---
 
@@ -186,12 +197,14 @@ All Layer 1 (scheduling) optimizations have been tested:
 ### NVFP4 Status: NOT VIABLE
 Test 21 showed catastrophic accuracy failure (~12%) with W4A4 FP4 quantization. Model generates infinite `<think>` loops. FP4 is too aggressive for this reasoning architecture. Mixed-precision NVFP4 (per-layer exclusion) would require major engineering.
 
-### Priority Paths Forward
-1. **Submit with best config** (immediate) — prefill-max-req=4, sched-cons=0.8, chunk=65536
-2. **FLA/SimpleGLA kernel optimization** (this week) — 75% of forward pass time; A1 state contiguity, A3 fused state I/O
-3. **Blackwell GEMM tuning** (next week) — profile Marlin SM120 auto-config optimality
-4. **FP8 weight quantization** (alternative) — W8A16 less aggressive than FP4
-5. **EAGLE3 spec decode** (if time) — diminished returns on prefill-dominant workload
+### Priority Paths Forward (REVISED per profiling data 2026-04-20)
+1. **Submit with best config v19** (immediate) — prefill-max-req=4, sched-cons=0.8, chunk=65536
+2. **Marlin GEMM profiling & tuning** (highest impact) — 85.3% of prefill; verify SM120 auto-config tile sizes, thread group selection
+3. **FP8 weight quantization (W8A16)** (potentially transformative) — Replace Marlin W4 dequant+FP16 GEMM with native FP8 tensor cores (~2× GEMM throughput). Safe accuracy (8-bit)
+4. **FlashInfer attention optimization** (8 standard layers) — 8.8% of prefill (each `BatchPrefillWithRaggedKVCacheKernel` call ~55ms)
+5. **FLA chunk kernel optimization** (deprioritized) — only 1% of prefill (chunk_fwd_o + chunk_fwd_h = 50ms vs GEMM 4258ms)
+6. **A1 state contiguity / A3 fused state I/O** (decode-focused) — 4.9% of decode; state I/O indexing ~3% of decode
+7. **EAGLE3 spec decode** (if time) — diminished returns on prefill-dominant workload
 
 ---
 
