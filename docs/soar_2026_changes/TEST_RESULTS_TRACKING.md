@@ -41,6 +41,7 @@ Every test run should be logged here with its configuration, commit, date, and r
 | 23 | 2026-04-17 | f373fbade | 223.167.85.181 | CHANGE_0100: residual scale folding + GPTQ + FP8 KV + dense + torch.compile(max-bs=8) + mixed-chunk | **78.64%** | **98.30%** | **0.96** | 56.67% | 81.00% | 98.89% | 100% | 56.67% | 3234s | 492.87 | Accuracy regression vs Test 20; C drops to 0.96 (not submission-safe yet) |
 | 24 | 2026-04-18 | 96304f9cd | 223.167.85.181 | CHANGE_0110: **dense-calibrated GPTQ** + FP8 KV + dense + torch.compile(max-bs=8) + mixed-chunk | **77.64%** | **97.05%** | **0.92** | **50.00%** | 79.33% | 98.89% | 100% | 60.00% | 3059s | — | **FAILED**: Dense calibration made accuracy WORSE; mcq crashed to 50%; C=0.92 |
 | 25 | 2026-04-20 | 08fd86023 | 223.167.85.181 | **CHANGE_0120**: prefill-max-req=4, sched-cons=0.8, chunk=65536 | **79.00%** | **98.75%** | **0.96** | 53.33% | 85.00% | 100% | 100% | 56.67% | 2988s | 423.75 | mcq=53.33% (variance); cwe improved 85%; fwe/niah perfect; duration 2988s (vs 3171s Test 20); C=0.96 |
+| 27 | 2026-04-20 | 338989afe | 223.167.85.181 | **CHANGE_0125**: SM120 Marlin tile instantiations + rebuilt sgl-kernel | **77.18%** | ~96.5% | **0** | 56.67% | 83.67% | 98.89% | 100% | 46.67% | 3123s | 468.74 | New tiles compiled but NOT selected by scorer; accuracy drop is **test variance** (qa=46.67% anomaly); CHANGE_0125 is NEUTRAL |
 
 ---
 
@@ -72,6 +73,7 @@ Every test run should be logged here with its configuration, commit, date, and r
 | 25B-spd | 2026-04-20 | (local) | prefill-max-req=4, sched-cons=0.8, **chunk=65K** | **110.54s** | 40.54s | 33.59s | — | Chunk=65K: same as 32K on old data (inputs too short to matter) |
 | 25C-spd | 2026-04-20 | (local) | prefill-max-req=8, sched-cons=0.5, chunk=65K | **110.53s** | 40.54s | 33.54s | — | More aggressive: no further gain, plateau at ~110.5s |
 | 26-prof | 2026-04-20 | 08fd86023 | **PROFILING**: torch profiler, stage-separated, 3 steps each | — | — | — | — | GEMM=85.3% prefill, FLA=12.4%. See CHANGE_0120_profiling_analysis |
+| 27-spd | 2026-04-20 | 338989afe | CHANGE_0125: SM120 Marlin tile instantiations (rebuilt sgl-kernel) | **111.48s** | **40.42s** | **33.53s** | — | vs Test 25B: S1 +0.9%, S8 -0.3%, Smax -0.2%; **NEUTRAL** — new tiles compiled but never selected by scorer |
 
 ---
 

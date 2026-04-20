@@ -233,20 +233,32 @@ When CUDA kernel code in `sgl-kernel/` is modified (e.g., Marlin GEMM changes), 
    cd /root/sglang-minicpm && git pull
    ```
 
-2. **Build the wheel**:
+2. **First-time build setup** (once per fcloud instance):
    ```bash
    cd /root/sglang-minicpm/sgl-kernel
-   rm -rf build dist
+   export CXX=g++ CC=gcc                    # Required — fcloud has no default CXX
+   apt install -y ccache                     # Enable compilation cache
+   export CCACHE_DIR=/root/.ccache CCACHE_MAXSIZE=10G
    python -m pip install -U uv scikit-build-core ninja
    make build MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
    ```
 
-3. **Copy the built wheel to submission_sim**:
+3. **Incremental rebuild** (after editing .cu/.cc files):
+   ```bash
+   cd /root/sglang-minicpm/sgl-kernel
+   export CXX=g++ CC=gcc
+   export CCACHE_DIR=/root/.ccache CCACHE_MAXSIZE=10G
+   # DO NOT run `rm -rf build` — this destroys incremental build cache!
+   make build MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
+   ```
+   Ninja detects changed files and only recompiles those + relinks.
+
+4. **Copy the built wheel to submission_sim**:
    ```bash
    cp /root/sglang-minicpm/sgl-kernel/dist/sgl_kernel-*.whl /root/submission_sim/
    ```
 
-4. **Install and test**:
+5. **Install and test**:
    ```bash
    cd /root/submission_sim
    source prepare_env.sh   # This installs the local sgl-kernel wheel
@@ -254,7 +266,12 @@ When CUDA kernel code in `sgl-kernel/` is modified (e.g., Marlin GEMM changes), 
 
 **IMPORTANT**: There is NO `sgl-kernel` source directory under `/root/submission_sim`. The submission directory installs sgl-kernel from a pre-built `.whl` file only. Do NOT attempt `pip install -e sgl-kernel/` inside `/root/submission_sim`.
 
-**Build time**: ~20-40 minutes with `MAX_JOBS=2` on fcloud. The `CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"` limits per-file parallelism to avoid OOM.
+**Build time notes**:
+- **Full build** (first time): ~4 hours with `MAX_JOBS=2` on fcloud (413 object files, 550MB wheel)
+- **Incremental build** (1-file change, `build/` preserved): ~1-3 minutes
+- **ccache warm rebuild** (even after `rm -rf build`): ~5-8 minutes
+- The `CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"` limits per-file parallelism to avoid OOM
+- **NEVER run `rm -rf build`** unless you need a completely clean rebuild (e.g., CMake config changes). Use `make rebuild` only for that case.
 
 ## Optimization catalog (must reference)
 

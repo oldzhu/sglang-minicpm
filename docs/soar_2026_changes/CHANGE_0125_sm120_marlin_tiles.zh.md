@@ -49,3 +49,12 @@ Decode降级到第3优先级。Prefill降级到第2优先级。最高优先级`{
 ```bash
 git revert 338989afe
 ```
+
+## 后续调查
+
+参见 [CHANGE_0125_sm120_marlin_tiles_001.zh.md](CHANGE_0125_sm120_marlin_tiles_001.zh.md)：
+- Test 27 结果（精度 + 速度）：**中性** — 新瓦片编译成功但从未被选中
+- 评分函数行为根因分析
+- MiniCPM-SALA 权重形状分析（每次前向 153 次 GEMM）
+- SM120 瓦片改动从根本上无法帮助的原因（SM80 MMA 指令集）
+- SM120 原生内核优化路径建议

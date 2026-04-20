@@ -69,3 +69,12 @@ Revert commit 338989afe:
 ```bash
 git revert 338989afe
 ```
+
+## Follow-up Investigation
+
+See [CHANGE_0125_sm120_marlin_tiles_001.en.md](CHANGE_0125_sm120_marlin_tiles_001.en.md) for:
+- Test 27 results (accuracy + speed): **NEUTRAL** — new tiles compiled but never selected
+- Root cause analysis of scoring function behavior
+- MiniCPM-SALA weight shape analysis (153 GEMMs/forward)
+- Why SM120 tile changes fundamentally cannot help (SM80 MMA instruction set)
+- Recommendations for SM120-native kernel optimization paths
