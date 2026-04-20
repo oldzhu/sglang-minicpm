@@ -2,6 +2,13 @@
 
 This repository is used for SOAR 2026 optimization work on MiniCPM-SALA.
 
+## Git push rule (CRITICAL — must enforce)
+
+- **ALWAYS push to `minicpm-src` remote**, NEVER to `origin`.
+- fcloud pulls from `oldzhu/sglang-minicpm` (`minicpm-src`), NOT from `oldzhu/sglang` (`origin`).
+- Correct: `git push minicpm-src mixed_minicpm_cudagraph`
+- Wrong: `git push origin mixed_minicpm_cudagraph` ← fcloud won't see changes
+
 ## Mandatory workflow for every optimization
 
 1. **Proposal first, no direct code changes**
