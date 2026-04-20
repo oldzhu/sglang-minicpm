@@ -224,6 +224,38 @@ python3 scripts/fcloud/fcloud_workflow.py setup --force   # re-setup everything
 
 **IMPORTANT**: Always ask the user for explicit approval before running setup on any fcloud instance.
 
+## sgl-kernel build & test on fcloud (must enforce)
+
+When CUDA kernel code in `sgl-kernel/` is modified (e.g., Marlin GEMM changes), rebuild and test on fcloud using:
+
+1. **Sync changes to fcloud repo**:
+   ```bash
+   cd /root/sglang-minicpm && git pull
+   ```
+
+2. **Build the wheel**:
+   ```bash
+   cd /root/sglang-minicpm/sgl-kernel
+   rm -rf build dist
+   python -m pip install -U uv scikit-build-core ninja
+   make build MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
+   ```
+
+3. **Copy the built wheel to submission_sim**:
+   ```bash
+   cp /root/sglang-minicpm/sgl-kernel/dist/sgl_kernel-*.whl /root/submission_sim/
+   ```
+
+4. **Install and test**:
+   ```bash
+   cd /root/submission_sim
+   source prepare_env.sh   # This installs the local sgl-kernel wheel
+   ```
+
+**IMPORTANT**: There is NO `sgl-kernel` source directory under `/root/submission_sim`. The submission directory installs sgl-kernel from a pre-built `.whl` file only. Do NOT attempt `pip install -e sgl-kernel/` inside `/root/submission_sim`.
+
+**Build time**: ~20-40 minutes with `MAX_JOBS=2` on fcloud. The `CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"` limits per-file parallelism to avoid OOM.
+
 ## Optimization catalog (must reference)
 
 - The complete top-to-bottom optimization catalog for the baseline GPTQ + FP8 KV + dense config is maintained at:
