@@ -27,6 +27,7 @@
 #include <limits>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #include "kernel.h"
 #include "marlin_template.h"
@@ -284,14 +285,33 @@ void log_sm120_exec_config_once(
     bool from_cache,
     int occupancy_blocks_per_sm,
     double score) {
-  static bool logged = false;
-  if (logged) {
-    return;
+  // Log each unique (N, K, thread_m_blocks) combination to show all
+  // Marlin tile configs selected for the model's different linear layers.
+  struct config_key {
+    int n, k, m_blocks;
+    bool operator==(config_key const& o) const {
+      return n == o.n && k == o.k && m_blocks == o.m_blocks;
+    }
+  };
+  static std::mutex log_mutex;
+  static std::vector<config_key> logged_keys;
+  static constexpr int max_log_entries = 20;
+
+  config_key key{prob_n, prob_k, thread_m_blocks};
+  {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    for (auto const& k : logged_keys) {
+      if (k == key) return;
+    }
+    if (static_cast<int>(logged_keys.size()) >= max_log_entries) return;
+    logged_keys.push_back(key);
   }
 
   std::fprintf(
       stderr,
-      "[sgl-kernel] SM120 Marlin auto-config enabled: M=%d N=%d K=%d thread_m_blocks=%d thread_n=%d thread_k=%d num_threads=%d source=%s occupancy_blocks_per_sm=%d score=%.2f\n",
+      "[sgl-kernel] SM120 Marlin auto-config: M=%d N=%d K=%d "
+      "thread_m_blocks=%d thread_n=%d thread_k=%d num_threads=%d "
+      "source=%s occupancy=%d score=%.2f\n",
       prob_m,
       prob_n,
       prob_k,
@@ -303,7 +323,6 @@ void log_sm120_exec_config_once(
       occupancy_blocks_per_sm,
       score);
   std::fflush(stderr);
-  logged = true;
 }
 
 int get_occupancy_blocks_per_sm(
@@ -531,10 +550,14 @@ bool is_valid_config(
   _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 8, NUM_THREADS, false)
 
 #define COMMON_GET_IF(W_TYPE)            \
+  COMMON_GET_IF_M1(W_TYPE, 16, 8, 256)   \
+  COMMON_GET_IF_M1(W_TYPE, 16, 4, 256)   \
   COMMON_GET_IF_M1(W_TYPE, 8, 8, 256)    \
   COMMON_GET_IF_M1(W_TYPE, 8, 4, 128)    \
   COMMON_GET_IF_M1(W_TYPE, 4, 8, 128)    \
+  COMMON_GET_IF_M234(W_TYPE, 16, 8, 256) \
   COMMON_GET_IF_M234(W_TYPE, 16, 4, 256) \
+  COMMON_GET_IF_M234(W_TYPE, 8, 8, 256)  \
   COMMON_GET_IF_M234(W_TYPE, 8, 4, 128)  \
   COMMON_GET_IF_M234(W_TYPE, 4, 8, 128)
 
