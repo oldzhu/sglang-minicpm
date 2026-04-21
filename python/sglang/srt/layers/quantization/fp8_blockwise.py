@@ -4,10 +4,21 @@ This module provides FP8 blockwise quantization using the existing SM120 FP8 ker
 from sgl-kernel (fp8_blockwise_scaled_mm).
 
 Key properties:
-- Weights: Pre-quantized offline to FP8 blockwise format
+- Weights: Pre-quantized offline to (N, K) float8_e4m3fn with (N/128, K/128) scales
+- At inference: weight.t() gives col-major (K, N) required by the kernel (zero-copy)
 - Activations: Quantized per-row per-128-K-block at inference time
 - Kernel: Uses SM120 UMMA tcgen05.mma.ws.sync (already in sgl-kernel)
 - No new CUDA code needed
+
+Kernel requirements (fp8_blockwise_scaled_mm):
+  mat_a: (M, K) row-major float8_e4m3fn
+  mat_b: (K, N) col-major float8_e4m3fn  [stride(0)==1]
+  scales_a: (M, K/128) col-major float32  [stride(0)==1, or 1D vector for M=1]
+  scales_b: (K/128, N/128) col-major float32  [stride(0)==1]
+
+To satisfy col-major requirement without memory copy:
+  weight saved as (N, K) row-major  →  weight.t() is (K, N) with stride(0)=1  ✓
+  weight_scale saved as (N/128, K/128)  →  weight_scale.t() is (K/128, N/128) with stride(0)=1  ✓
 """
 
 from __future__ import annotations
@@ -18,6 +29,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.layers.quantization.base_config import LinearMethodBase, QuantizationConfig
+from sglang.srt.model_loader.weight_utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -30,32 +42,21 @@ except ImportError:
 
 
 class FP8BlockwiseConfig(QuantizationConfig):
-    """Configuration for FP8 blockwise quantization (SM120 UMMA).
-    
-    This quantization uses 8-bit FP8 E4M3 weights with blockwise scaling (128×128 blocks),
-    matching the SM120 UMMA tile size.
-    """
+    """Configuration for FP8 blockwise quantization (SM120 UMMA)."""
 
-    def __init__(
-        self,
-        block_size: int = 128,
-        fp8_dtype: str = "float8_e4m3fn",
-    ):
+    def __init__(self, block_size: int = 128, fp8_dtype: str = "float8_e4m3fn"):
         self.block_size = block_size
         self.fp8_dtype = fp8_dtype
 
     @classmethod
-    def from_config(cls, config: dict) -> FP8BlockwiseConfig:
-        """Load from quantization_config dict."""
+    def from_config(cls, config: dict) -> "FP8BlockwiseConfig":
         return cls(
             block_size=config.get("block_size", 128),
             fp8_dtype=config.get("fp8_dtype", "float8_e4m3fn"),
         )
 
     def get_quant_method(self, layer: nn.Module, prefix: str = "") -> Optional[LinearMethodBase]:
-        """Get the quantization method for this layer."""
         from sglang.srt.layers.linear import LinearBase
-        
         if isinstance(layer, LinearBase):
             return FP8BlockwiseLinearMethod(self)
         return None
@@ -66,9 +67,9 @@ class FP8BlockwiseConfig(QuantizationConfig):
 
 class FP8BlockwiseLinearMethod(LinearMethodBase):
     """FP8 blockwise linear layer using SM120 UMMA.
-    
-    Weights are pre-quantized to FP8 (shape N×K, col-major) with blockwise scales.
-    Activations are quantized per-row per-128-K-elements at inference time.
+
+    Weight (N, K) float8_e4m3fn is stored in standard PyTorch layout.
+    At forward time, weight.t() creates a col-major (K, N) view (zero-copy).
     """
 
     def __init__(self, config: FP8BlockwiseConfig):
@@ -85,24 +86,38 @@ class FP8BlockwiseLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        """Create FP8 blockwise weights for the layer.
-        
-        Expected to find pre-quantized weights:
-        - layer.weight_fp8: (N, K) float8_e4m3fn
-        - layer.weight_fp8_scale: (N/128, K/128) float32
-        
-        These are loaded from the preprocessed model (preprocess_model.py).
+        """Register FP8 weight and scale parameters.
+
+        Checkpoint stores:
+          <prefix>.weight       (N, K) float8_e4m3fn   — standard PyTorch layout
+          <prefix>.weight_scale (N/128, K/128) float32
         """
-        # Weights should already be loaded from model files
-        # Just validate they exist
-        if not hasattr(layer, "weight_fp8"):
-            raise ValueError(
-                f"Layer {layer} missing weight_fp8 (expected from FP8 blockwise model)"
-            )
-        if not hasattr(layer, "weight_fp8_scale"):
-            raise ValueError(
-                f"Layer {layer} missing weight_fp8_scale (expected from FP8 blockwise model)"
-            )
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        # FP8 weight: (N, K) = (out, in) — same shape as plain nn.Linear
+        weight = nn.Parameter(
+            torch.empty(
+                output_size_per_partition,
+                input_size_per_partition,
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight, {"weight_loader": weight_loader})
+        layer.register_parameter("weight", weight)
+
+        # Block scales: (N/128, K/128)
+        weight_scale = nn.Parameter(
+            torch.empty(
+                (output_size_per_partition + self.block_size - 1) // self.block_size,
+                (input_size_per_partition + self.block_size - 1) // self.block_size,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight_scale, {"weight_loader": weight_loader})
+        layer.register_parameter("weight_scale", weight_scale)
 
     def apply(
         self,
@@ -110,69 +125,71 @@ class FP8BlockwiseLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Apply FP8 blockwise GEMM.
-        
-        Args:
-            layer: Linear layer with weight_fp8 and weight_fp8_scale attributes
-            x: Input tensor (M, K) float16 or bfloat16
-            bias: Optional bias tensor
-        
-        Returns:
-            Output tensor (M, N) bfloat16
+        """FP8 blockwise GEMM via SM120 UMMA kernel.
+
+        weight is (N, K) row-major; .t() creates (K, N) col-major view (stride[0]=1).
+        weight_scale is (N/128, K/128); .t() creates (K/128, N/128) col-major view.
+        Both transposes are zero-copy strided views.
         """
         if fp8_blockwise_scaled_mm is None:
             raise RuntimeError(
                 "sgl_kernel.fp8_blockwise_scaled_mm not available. "
-                "Make sure sgl-kernel is compiled with SM120 support."
+                "Ensure sgl-kernel is compiled with SM120 support."
             )
 
-        # Quantize activation to FP8 blockwise
         scales_a, x_fp8 = _quantize_activation_fp8_blockwise(x)
 
-        # Call SM120 FP8 GEMM kernel
+        # Zero-copy col-major views required by the kernel
+        mat_b = layer.weight.t()          # (K, N) col-major, stride[0]=1
+        scales_b = layer.weight_scale.t() # (K/128, N/128) col-major, stride[0]=1
+
         out = fp8_blockwise_scaled_mm(
-            x_fp8,                    # (M, K) float8_e4m3fn
-            layer.weight_fp8,         # (N, K) float8_e4m3fn, col-major
-            scales_a,                 # (M, K/128) float32
-            layer.weight_fp8_scale,   # (N/128, K/128) float32
+            x_fp8,           # (M, K) float8_e4m3fn, row-major
+            mat_b,           # (K, N) float8_e4m3fn, col-major
+            scales_a,        # (M, K/128) float32, col-major (or vector for M=1)
+            scales_b,        # (K/128, N/128) float32, col-major
             out_dtype=torch.bfloat16,
         )
 
         if bias is not None:
             out = out + bias
-
         return out
 
 
-def _quantize_activation_fp8_blockwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize activation to FP8 blockwise format.
-    
-    Args:
-        x: Activation tensor (M, K) float16 or bfloat16
-    
+def _quantize_activation_fp8_blockwise(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize activation to FP8 blockwise format for kernel input.
+
     Returns:
-        scales_a: (M, K/128) float32 scales
-        x_fp8: (M, K) float8_e4m3fn quantized activation
+        scales_a: (M, K/128) float32, col-major for M>1 (required by kernel)
+        x_fp8:   (M, K) float8_e4m3fn, row-major
     """
     M, K = x.shape
     block_size = 128
     FP8_MAX = 448.0
-    
+
     if K % block_size != 0:
         raise ValueError(f"Activation K={K} not divisible by block_size={block_size}")
-    
-    # Reshape to (M, K/128, 128) for blockwise max
+
+    # Reshape for blockwise max: (M, K/128, 128)
     x_blocks = x.reshape(M, K // block_size, block_size)
-    
-    # Compute max absolute value per block
-    max_abs = x_blocks.abs().amax(dim=2)  # (M, K/128)
-    
-    # Compute scales
-    scales_a = (max_abs / FP8_MAX).clamp(min=1e-12).to(torch.float32)
-    
-    # Quantize
-    scale_expanded = scales_a.unsqueeze(2)  # (M, K/128, 1)
+
+    # Per-block max → row-major scales (M, K/128)
+    max_abs = x_blocks.abs().amax(dim=2)
+    scales_row = (max_abs / FP8_MAX).clamp(min=1e-12).to(torch.float32)
+
+    # Kernel requires scales_a.stride(0)==1 (col-major) for M>1.
+    # For M=1 the kernel accepts any contiguous 1-D-like tensor.
+    if M > 1:
+        # .t().contiguous().t() converts (M, K/128) row-major → col-major
+        scales_a = scales_row.t().contiguous().t()
+    else:
+        scales_a = scales_row  # (1, K/128): is_contiguous_vector → passes kernel check
+
+    # Quantize activations
+    scale_expanded = scales_row.unsqueeze(2)  # (M, K/128, 1)
     x_scaled = (x_blocks / scale_expanded).clamp(-FP8_MAX, FP8_MAX)
     x_fp8 = x_scaled.reshape(M, K).to(torch.float8_e4m3fn)
-    
+
     return scales_a, x_fp8

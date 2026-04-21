@@ -1122,42 +1122,42 @@ def _quantize_fp8_blockwise(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor
     """Quantize weight matrix to FP8 blockwise format.
     
     Args:
-        w: Weight tensor (K, N) in float16 or bfloat16
+        w: Weight tensor (N, K) = (out_features, in_features) — standard PyTorch convention
     
     Returns:
-        w_fp8_col: (N, K) float8_e4m3fn in column-major format (contiguous)
+        w_fp8: (N, K) float8_e4m3fn — same shape as input (standard PyTorch)
         scale_b: (N/128, K/128) float32 scales
+    
+    Note: In apply(), pass w_fp8.t() and scale_b.t() to fp8_blockwise_scaled_mm
+          to get col-major (K, N) and col-major (K/128, N/128) as required by kernel.
+          weight.t() is a zero-copy op (creates a strided view with stride[0]=1).
     """
     import torch
     
-    K, N = w.shape
+    N, K = w.shape  # N=out_features, K=in_features (standard PyTorch)
     block_size = 128
     FP8_MAX = 448.0
     
-    if K % block_size != 0 or N % block_size != 0:
+    if N % block_size != 0 or K % block_size != 0:
         raise ValueError(f"Weight shape {w.shape} not divisible by block_size {block_size}")
     
-    # Reshape to (K/128, 128, N/128, 128) for blockwise max computation
-    w_blocks = w.reshape(K // block_size, block_size, N // block_size, block_size)
+    # Reshape to (N/128, 128, K/128, 128) for blockwise max computation
+    w_blocks = w.reshape(N // block_size, block_size, K // block_size, block_size)
     
-    # Compute max absolute value per block
-    max_abs = w_blocks.abs().amax(dim=(1, 3))  # (K/128, N/128)
+    # Compute max absolute value per block: (N/128, K/128)
+    max_abs = w_blocks.abs().amax(dim=(1, 3))
     
     # Compute scales: scale = max_abs / FP8_MAX
-    scales = (max_abs / FP8_MAX).clamp(min=1e-12).to(torch.float32)
+    scales = (max_abs / FP8_MAX).clamp(min=1e-12).to(torch.float32)  # (N/128, K/128)
     
     # Quantize each block
     scale_expanded = scales.unsqueeze(1).unsqueeze(3).expand_as(w_blocks)
     w_scaled = (w_blocks / scale_expanded).clamp(-FP8_MAX, FP8_MAX)
-    w_fp8 = w_scaled.reshape(K, N).to(torch.float8_e4m3fn)
+    w_fp8 = w_scaled.reshape(N, K).to(torch.float8_e4m3fn)  # (N, K) standard
     
-    # Convert to column-major format for kernel (transpose to get (N, K) C-contiguous)
-    w_fp8_col = w_fp8.t().contiguous()
-    
-    # Transpose scales to match kernel expectations: (N/128, K/128)
-    scale_b = scales.t().contiguous()
-    
-    return w_fp8_col, scale_b
+    # Return in standard (N, K) format — NO transpose here.
+    # apply() will call weight.t() to get col-major (K, N) required by fp8_blockwise_scaled_mm.
+    return w_fp8, scales  # (N, K), (N/128, K/128)
 
 
 def main() -> None:
