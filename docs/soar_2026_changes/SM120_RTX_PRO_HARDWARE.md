@@ -15,6 +15,8 @@
 | L2 Cache | **112 MB** |
 | SM Count | 96 SMs |
 
+Note: Verified mapping from the official event hardware table is FP8=296 TFLOPS and FP4=593 TFLOPS.
+
 ## Key CUDA Programming Differences vs Prior Generations
 
 ### vs Hopper (SM90)

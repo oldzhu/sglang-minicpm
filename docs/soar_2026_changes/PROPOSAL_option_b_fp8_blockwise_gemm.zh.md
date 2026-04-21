@@ -4,7 +4,7 @@
 **状态**: 等待批准  
 **优先级**: 高 — 利用现有 SM120 内核实现 30-50% 加速的直接路径  
 **基准**: S1=121.71s, S8=44.09s, Smax=35.86s（测试12）  
-**预期结果**: S1 ~85-100s, S8 ~30-35s, Smax ~25-30s（估计）
+**预期结果**: S1 ~95-110s, S8 ~34-40s, Smax ~28-33s（估计）
 
 ---
 
@@ -21,10 +21,10 @@ sgl-kernel 已经有一个完全可用的 SM120 FP8 blockwise GEMM（`fp8_blockw
 当前 Marlin GPTQ W4 内核：
 - 使用 SM80 `mma.sync.aligned.m16n8k16` 指令
 - 有效算力约 ~100-140 TFLOPS（BF16 路径）
-- SM120 FP8 硬件（593 TFLOPS）在 GEMM 期间完全闲置
+- SM120 FP8 硬件（296 TFLOPS）在 GEMM 期间利用不足
 
 选项B目标后：
-- 通过 `fp8_blockwise_scaled_mm` 使用 SM120 UMMA → 350-450 TFLOPS FP8
+- 通过 `fp8_blockwise_scaled_mm` 使用 SM120 UMMA → ~200-260 TFLOPS FP8（估计）
 - 保持归一化精度 > 99%，C=1.0
 - 无新 CUDA 依赖
 
@@ -340,9 +340,9 @@ python3 scripts/fcloud/fcloud_workflow.py speed --variant all
 
 | 指标 | 基准（测试12） | 选项B后 | 目标 |
 |------|--------------|---------|------|
-| S1 时长 | 121.71s | ~85-100s | <90s |
-| S8 时长 | 44.09s | ~30-35s | <32s |
-| Smax 时长 | 35.86s | ~25-30s | <28s |
+| S1 时长 | 121.71s | ~95-110s | <100s |
+| S8 时长 | 44.09s | ~34-40s | <36s |
+| Smax 时 长 | 35.86s | ~28-33s | <30s |
 | 归一化精度 | 99.11% | >99% | >99% |
 | 正确性系数 C | 1.0 | 1.0 | 1.0 |
 

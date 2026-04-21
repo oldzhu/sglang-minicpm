@@ -4,7 +4,7 @@
 **Status**: AWAITING APPROVAL  
 **Priority**: High — direct path to 30-50% speedup using existing SM120 kernel  
 **Baseline**: S1=121.71s, S8=44.09s, Smax=35.86s (Test 12)  
-**Expected result**: S1 ~85-100s, S8 ~30-35s, Smax ~25-30s (estimated)
+**Expected result**: S1 ~95-110s, S8 ~34-40s, Smax ~28-33s (estimated)
 
 ---
 
@@ -21,10 +21,10 @@ sgl-kernel already has a fully functional SM120 FP8 blockwise GEMM (`fp8_blockwi
 Current Marlin GPTQ W4 kernel:
 - Uses SM80 `mma.sync.aligned.m16n8k16` instruction 
 - Achieves ~100-140 TFLOPS effective (BF16 path)
-- SM120 FP8 hardware (593 TFLOPS) is completely idle during GEMM
+- SM120 FP8 hardware (296 TFLOPS) is underutilized during GEMM
 
 Target after Option B:
-- Use SM120 UMMA via `fp8_blockwise_scaled_mm` → 350-450 TFLOPS FP8
+- Use SM120 UMMA via `fp8_blockwise_scaled_mm` → ~200-260 TFLOPS FP8 (estimated)
 - Keep accuracy > 99% normalized for C=1.0
 - No new CUDA dependencies
 
@@ -366,9 +366,9 @@ python3 scripts/fcloud/fcloud_workflow.py speed --variant all
 
 | Metric | Baseline (Test 12) | After Option B | Target |
 |--------|-------------------|----------------|--------|
-| S1 duration | 121.71s | ~85-100s | <90s |
-| S8 duration | 44.09s | ~30-35s | <32s |
-| Smax duration | 35.86s | ~25-30s | <28s |
+| S1 duration | 121.71s | ~95-110s | <100s |
+| S8 duration | 44.09s | ~34-40s | <36s |
+| Smax duration | 35.86s | ~28-33s | <30s |
 | Normalized accuracy | 99.11% | >99% | >99% |
 | Correctness C | 1.0 | 1.0 | 1.0 |
 

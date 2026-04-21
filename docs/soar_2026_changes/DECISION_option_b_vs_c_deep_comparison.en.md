@@ -4,7 +4,7 @@
 **Date**: 2026-04-21  
 **Status**: Option B selected for immediate work; Option C documented for future deep optimization  
 **Baseline**: GPTQ (sparse_qkv_w8) + FP8 KV cache + dense mode — S1=121.71s, S8=44.09s, Smax=35.86s  
-**Reference Hardware**: SM120 RTX PRO 6000 — 593 TFLOPS FP8, 296 TFLOPS BF16, 1398 GB/s
+**Reference Hardware**: SM120 RTX PRO 6000 — 296 TFLOPS FP8, 148 TFLOPS BF16, 593 TFLOPS FP4, 1398 GB/s
 
 ---
 
@@ -14,7 +14,7 @@ Profiling (CHANGE_0120) revealed:
 - **GEMM = 85.3% of prefill time, 63.5% of decode time**
 - Current Marlin GPTQ W4 kernel uses SM80 `mma.sync.aligned.m16n8k16` — cannot access SM120 FP8/FP4 TFLOPs
 - SM120 FP8 hardware offers **2× more TFLOPS** than BF16, **4× more** than INT8-emulated paths
-- Key bottleneck: compute-bound prefill is leaving 400+ TFLOPS of SM120 hardware idle
+- Key bottleneck: compute-bound prefill is leaving major SM120 FP8 headroom idle
 
 Phase 1 investigation (PROPOSAL_fp8_w4_dequant_gemm.md) surveyed TRT-LLM and confirmed the CUTLASS path is viable. Decision matrix (DECISION_fp8_w4_implementation_options.md) rejected Option A (TRT-LLM wheel, too large) and selected Options B and C.
 
@@ -78,10 +78,10 @@ This means Option B requires **zero CUDA kernel writing** — only weight conver
 **Expected performance**:
 | Metric | Current (Marlin W4) | After Option B | Gain |
 |--------|---------------------|----------------|------|
-| TFLOPS utilized | ~100-140 BF16 effective | ~350-450 FP8 | 2.5-3.5× |
+| TFLOPS utilized | ~100-140 BF16 effective | ~200-260 FP8 | 1.6-2.0× |
 | Prefill GEMM time | baseline | 25-35% reduction | ↑ |
-| End-to-end S1 | 121.71s | ~85-100s est. | ↑ |
-| End-to-end S8 | 44.09s | ~30-35s est. | ↑ |
+| End-to-end S1 | 121.71s | ~95-110s est. | ↑ |
+| End-to-end S8 | 44.09s | ~34-40s est. | ↑ |
 | Weight memory | ~4.5GB (W4 9B model) | ~9GB (FP8 9B model) | 2× more |
 
 Note: decode gain limited by memory bandwidth (1398 GB/s ceiling). Prefill is compute-bound and benefits most.
@@ -145,11 +145,11 @@ This retains W4 memory footprint while gaining SM120 FP8 compute throughput.
 **Expected performance**:
 | Metric | Current (Marlin W4) | After Option C | Gain |
 |--------|---------------------|----------------|------|
-| TFLOPS utilized | ~100-140 BF16 effective | ~400-500 FP8 | 3-4× |
+| TFLOPS utilized | ~100-140 BF16 effective | ~220-280 FP8 | 1.8-2.2× |
 | Prefill GEMM time | baseline | 30-45% reduction | ↑ |
 | Weight memory | ~4.5GB W4 | ~4.5GB W4 (unchanged!) | same |
-| End-to-end S1 | 121.71s | ~75-95s est. | ↑ |
-| End-to-end S8 | 44.09s | ~28-33s est. | ↑ |
+| End-to-end S1 | 121.71s | ~90-105s est. | ↑ |
+| End-to-end S8 | 44.09s | ~32-38s est. | ↑ |
 
 **Timeline**: 4-8 weeks (depending on SM120 expertise and debugging time)  
 **Risk**: High
@@ -163,8 +163,8 @@ This retains W4 memory footprint while gaining SM120 FP8 compute throughput.
 | **Kernel writing** | None (existing kernel) | ~2000-3000 lines CUDA |
 | **Timeline** | 3-5 days | 4-8 weeks |
 | **Weight memory** | 2× (W4 → FP8) | Same (stays W4) |
-| **Prefill TFLOPS** | 350-450 FP8 | 400-500 FP8 |
-| **Prefill speedup** | ~2.5-3.5× on GEMM | ~3-4× on GEMM |
+| **Prefill TFLOPS** | ~200-260 FP8 | ~220-280 FP8 |
+| **Prefill speedup** | ~1.6-2.0× on GEMM | ~1.8-2.2× on GEMM |
 | **Decode speedup** | <10% (BW-bound) | <10% (BW-bound) |
 | **Accuracy risk** | Low (FP8 well-tested) | Medium (new dequant path) |
 | **Build risk** | None | High (UMMA, TMA, pipeline) |
@@ -182,9 +182,9 @@ This retains W4 memory footprint while gaining SM120 FP8 compute throughput.
 
 **Prefill phase** (dominant for long prompts):
 - Compute-bound for large batch/sequence lengths
-- Option B: ~2.5-3× speedup on GEMM component (85% of time) → 50-60% overall prefill reduction
-- Option C: ~3-4× speedup on GEMM → 60-70% overall prefill reduction
-- Δ (C vs B): +10-15% better prefill for C
+- Option B: ~1.6-2.0× speedup on GEMM component (85% of time) → 30-45% overall prefill reduction
+- Option C: ~1.8-2.2× speedup on GEMM → 35-50% overall prefill reduction
+- Δ (C vs B): +5-10% better prefill for C
 
 **Decode phase** (dominant for short prompts / streaming):
 - Memory-bandwidth bound: 1398 GB/s ceiling
@@ -196,8 +196,8 @@ This retains W4 memory footprint while gaining SM120 FP8 compute throughput.
 ### S8 (8 concurrent requests) — 30% weight
 
 **Prefill phase**: larger effective batch → more compute-bound
-- Option B: ~55-65% prefill reduction
-- Option C: ~65-75% prefill reduction
+- Option B: ~35-45% prefill reduction
+- Option C: ~40-50% prefill reduction
 
 **Decode phase**: 8 requests × decode steps → bandwidth × 8
 - Option B: each request's decode loads FP8 weights → still BW-bound but 2× more per step

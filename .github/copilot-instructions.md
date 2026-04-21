@@ -6,7 +6,7 @@ This repository is used for SOAR 2026 optimization work on MiniCPM-SALA.
 
 - Full hardware specs, CUDA programming notes, and optimization opportunities for the competition GPU:
   **`docs/soar_2026_changes/SM120_RTX_PRO_HARDWARE.md`**
-- Key facts: SM120 (Blackwell), 96 SMs, 148/296/593 TFLOPS BF16/FP8/FP4, 84GB GDDR7, 1398 GB/s, 112MB L2
+- Key facts: SM120 (Blackwell), 96 SMs, BF16/FP16=148 TFLOPS, FP8=296 TFLOPS, FP4=593 TFLOPS, 84GB GDDR7, 1398 GB/s, 112MB L2
 - MMA is **warp-level** (not warpgroup); TMA and QMMA (mxfp8) are supported
 - Before proposing any kernel or GEMM optimization, **consult this file** to verify SM120 compatibility and estimate realistic throughput gain
 

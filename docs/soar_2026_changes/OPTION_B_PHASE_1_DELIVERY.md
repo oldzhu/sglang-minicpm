@@ -104,24 +104,24 @@ python3 preprocess_model.py \
 | Metric | GPTQ (Current) | FP8 Blockwise | Ratio |
 |--------|---|---|---|
 | Precision | 4-bit | 8-bit | 2× higher bits |
-| TFLOPS (SM120) | 100-140 | 350-450 | **2.5-3.5×** |
+| TFLOPS (SM120) | 100-140 | ~200-260 | **1.6-2.0×** |
 | Memory BW | 1 B/cycle (packed) | 1 B/cycle | Same |
 
-**Why 3.5× speedup on SM120**:
-- SM120 UMMA (Blackwell): 593 TFLOPS FP8 (warp-level, 593 ops/cycle per warp)
+**Why speedup on SM120 is still meaningful**:
+- SM120 UMMA (Blackwell): 296 TFLOPS FP8 (warp-level)
 - GPTQ Marlin kernel (SM80 mma): ~100-140 TFLOPS realized (stalls, cache conflicts)
-- FP8 blockwise: 350-450 TFLOPS (better SM120 utilization + no dequant overhead)
+- FP8 blockwise: ~200-260 TFLOPS target range (better SM120 utilization + no dequant overhead)
 
 ### End-to-End Model Performance
 - **Prefill time breakdown**: GEMM=85%, FLA=12%, overhead=3%
-- **GEMM speedup**: 2.5-3.5× → saves 70-100 ms per 2K prefill
-- **Prefill speedup**: 50-70% reduction (70 ms / 140-200 ms baseline)
-- **S1 estimate**: 121.71s → 85-100s (50% reduction)
+- **GEMM speedup**: ~1.6-2.0× → meaningful prefill reduction
+- **Prefill speedup**: ~30-45% reduction (estimate)
+- **S1 estimate**: 121.71s → 95-110s
 
 | Config | S1 | S8 | Smax | Notes |
 |--------|-----|-----|-----|-------|
 | GPTQ+FP8 (Baseline Test 12) | 121.71s | 44.09s | 35.86s | Reference |
-| **FP8 blockwise (Est.)** | **85-100s** | **30-35s** | **25-30s** | Conservative; includes decode overhead |
+| **FP8 blockwise (Est.)** | **95-110s** | **34-40s** | **28-33s** | Conservative; includes decode overhead |
 
 ### Accuracy Impact
 - **Quantization**: FP8 E4M3 (8-bit mantissa) vs W4 (4-bit)
@@ -163,7 +163,7 @@ python3 preprocess_model.py \
   ```bash
   python3 scripts/fcloud/fcloud_workflow.py speed --variant all
   ```
-- **Expected**: S1 ~85-100s, S8 ~30-35s, Smax ~25-30s
+- **Expected**: S1 ~95-110s, S8 ~34-40s, Smax ~28-33s
 - **Success criteria**: At least 40% S1 reduction (vs Test 12 baseline 121.71s)
 
 ---
@@ -302,7 +302,7 @@ The implementation provides:
 4. ✅ Performance path verified (SM120 UMMA kernel exists in sgl-kernel)
 5. ✅ Code quality checks passed (syntax, imports, structure)
 
-**Expected outcome**: 50-70% prefill speedup + maintained accuracy (99%+ normalized).
+**Expected outcome**: 30-45% prefill speedup + maintained accuracy (99%+ normalized).
 
 **Timeline**: Days 2-5 for fcloud testing and validation. User approval required to proceed.
 
