@@ -135,6 +135,15 @@ if [[ "$QUANT_MODE" == "gptq" ]]; then
 		FUSED_QK_NORM_ROPE_ARG=" --enable-fused-qk-norm-rope"
 	fi
 	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 65536 --max-prefill-tokens 65536 --prefill-max-requests 4 --max-running-requests 24 --mem-fraction-static 0.84 --schedule-conservativeness 0.8 --dense-as-sparse --quantization gptq_marlin --force-dense-minicpm --kv-cache-dtype fp8_e5m2${FUSED_QK_NORM_ROPE_ARG} --enable-torch-compile --torch-compile-max-bs 8 --enable-mixed-chunk"
+elif [[ "$QUANT_MODE" == "fp8_blockwise" ]]; then
+	# FP8 blockwise: pre-quantized offline weights (N,K) float8_e4m3fn + blockwise scales
+	# Uses SM120 UMMA kernel (fp8_blockwise_scaled_mm) via weight.t() col-major zero-copy
+	# No --dense-as-sparse (model is not sparse), no --enable-torch-compile (initial gate test)
+	FUSED_QK_NORM_ROPE_ARG=""
+	if [[ "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "1" || "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "true" || "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "TRUE" ]]; then
+		FUSED_QK_NORM_ROPE_ARG=" --enable-fused-qk-norm-rope"
+	fi
+	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 65536 --max-prefill-tokens 65536 --prefill-max-requests 4 --max-running-requests 24 --mem-fraction-static 0.84 --schedule-conservativeness 0.8 --quantization fp8_blockwise --force-dense-minicpm --kv-cache-dtype fp8_e5m2${FUSED_QK_NORM_ROPE_ARG} --enable-torch-compile --torch-compile-max-bs 8 --enable-mixed-chunk"
 fi
 
 # export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --log-level info"
