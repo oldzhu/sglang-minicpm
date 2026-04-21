@@ -63,6 +63,21 @@ class FP8BlockwiseConfig(QuantizationConfig):
     def get_name(self) -> str:
         return "fp8_blockwise"
 
+    def get_supported_act_dtypes(self) -> List[torch.dtype]:
+        return [torch.bfloat16, torch.float16]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        # SM120 (Blackwell); FP8 blockwise requires Hopper (SM90+) at minimum
+        return 90
+
+    @staticmethod
+    def get_config_filenames() -> List[str]:
+        return ["config.json"]
+
+    def get_scaled_act_names(self) -> List[str]:
+        return []
+
 
 class FP8BlockwiseLinearMethod(LinearMethodBase):
     """FP8 blockwise linear layer using SM120 UMMA.
