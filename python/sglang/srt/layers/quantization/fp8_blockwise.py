@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.layers.quantization.base_config import LinearMethodBase, QuantizationConfig
+from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -108,10 +109,6 @@ class FP8BlockwiseLinearMethod(LinearMethodBase):
         """
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
-
-        # Deferred to avoid circular import chain:
-        # model_config → quantization/__init__ → fp8_blockwise → model_loader → model_config
-        from sglang.srt.model_loader.weight_utils import set_weight_attrs
 
         # FP8 weight: (N, K) = (out, in) — same shape as plain nn.Linear
         weight = nn.Parameter(
