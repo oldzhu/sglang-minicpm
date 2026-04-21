@@ -17,19 +17,20 @@ Kernel requirements (fp8_blockwise_scaled_mm):
   scales_b: (K/128, N/128) col-major float32  [stride(0)==1]
 
 To satisfy col-major requirement without memory copy:
-  weight saved as (N, K) row-major  →  weight.t() is (K, N) with stride(0)=1  ✓
-  weight_scale saved as (N/128, K/128)  →  weight_scale.t() is (K/128, N/128) with stride(0)=1  ✓
+  weight saved as (N, K) row-major  ->  weight.t() is (K, N) with stride(0)=1  OK
+  weight_scale saved as (N/128, K/128)  ->  weight_scale.t() is (K/128, N/128) with stride(0)=1  OK
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+from torch.nn import Module
 
+from sglang.srt.layers.parameter import BlockQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import LinearMethodBase, QuantizationConfig
-from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -47,6 +48,9 @@ class FP8BlockwiseConfig(QuantizationConfig):
     def __init__(self, block_size: int = 128, fp8_dtype: str = "float8_e4m3fn"):
         self.block_size = block_size
         self.fp8_dtype = fp8_dtype
+        # Required by linear.py BlockQuantScaleParameter handling in
+        # MergedColumnParallelLinear and QKVParallelLinear weight_loaders
+        self.weight_block_size = [block_size, block_size]
 
     @classmethod
     def from_config(cls, config: dict) -> "FP8BlockwiseConfig":
@@ -69,8 +73,7 @@ class FP8BlockwiseConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # SM120 (Blackwell); FP8 blockwise requires Hopper (SM90+) at minimum
-        return 90
+        return 90  # Hopper+; SM120 (Blackwell) is SM120 > 90
 
     @staticmethod
     def get_config_filenames() -> List[str]:
@@ -89,6 +92,8 @@ class FP8BlockwiseLinearMethod(LinearMethodBase):
 
     def __init__(self, config: FP8BlockwiseConfig):
         self.config = config
+        # Alias so linear.py BlockQuantScaleParameter path can access weight_block_size
+        self.quant_config = config
         self.block_size = config.block_size
 
     def create_weights(
@@ -101,38 +106,53 @@ class FP8BlockwiseLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        """Register FP8 weight and scale parameters.
+        """Register FP8 weight and blockwise scale parameters.
+
+        Uses ModelWeightParameter and BlockQuantScaleParameter so that
+        sglang's ColumnParallel / RowParallel / QKV weight loaders correctly
+        handle sharding and merged-column loading.
 
         Checkpoint stores:
-          <prefix>.weight       (N, K) float8_e4m3fn   — standard PyTorch layout
+          <prefix>.weight       (N, K) float8_e4m3fn   - standard PyTorch layout
           <prefix>.weight_scale (N/128, K/128) float32
         """
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        # FP8 weight: (N, K) = (out, in) — same shape as plain nn.Linear
-        weight = nn.Parameter(
-            torch.empty(
+        # Set logical_widths so MergedColumnParallelLinear weight_loader can
+        # correctly shard gate_proj + up_proj.
+        layer.logical_widths = output_partition_sizes
+
+        # FP8 weight: (N, K) - input_dim=1 (K/input), output_dim=0 (N/output)
+        weight = ModelWeightParameter(
+            data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition,
                 dtype=torch.float8_e4m3fn,
             ),
-            requires_grad=False,
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
         )
-        set_weight_attrs(weight, {"weight_loader": weight_loader})
         layer.register_parameter("weight", weight)
 
-        # Block scales: (N/128, K/128)
-        weight_scale = nn.Parameter(
-            torch.empty(
+        # Blockwise scale: (N/128, K/128) - mirrors weight sharding dimensions
+        scale = BlockQuantScaleParameter(
+            data=torch.empty(
                 (output_size_per_partition + self.block_size - 1) // self.block_size,
                 (input_size_per_partition + self.block_size - 1) // self.block_size,
                 dtype=torch.float32,
             ),
-            requires_grad=False,
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
         )
-        set_weight_attrs(weight_scale, {"weight_loader": weight_loader})
-        layer.register_parameter("weight_scale", weight_scale)
+        layer.register_parameter("weight_scale", scale)
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        """Convert to plain nn.Parameter to avoid cuda-graph capture issues."""
+        layer.weight = nn.Parameter(layer.weight.data, requires_grad=False)
+        layer.weight_scale = nn.Parameter(layer.weight_scale.data, requires_grad=False)
 
     def apply(
         self,
@@ -190,17 +210,17 @@ def _quantize_activation_fp8_blockwise(
     # Reshape for blockwise max: (M, K/128, 128)
     x_blocks = x.reshape(M, K // block_size, block_size)
 
-    # Per-block max → row-major scales (M, K/128)
+    # Per-block max -> row-major scales (M, K/128)
     max_abs = x_blocks.abs().amax(dim=2)
     scales_row = (max_abs / FP8_MAX).clamp(min=1e-12).to(torch.float32)
 
     # Kernel requires scales_a.stride(0)==1 (col-major) for M>1.
     # For M=1 the kernel accepts any contiguous 1-D-like tensor.
     if M > 1:
-        # .t().contiguous().t() converts (M, K/128) row-major → col-major
+        # .t().contiguous().t() converts (M, K/128) row-major -> col-major
         scales_a = scales_row.t().contiguous().t()
     else:
-        scales_a = scales_row  # (1, K/128): is_contiguous_vector → passes kernel check
+        scales_a = scales_row  # (1, K/128): is_contiguous_vector -> passes kernel check
 
     # Quantize activations
     scale_expanded = scales_row.unsqueeze(2)  # (M, K/128, 1)
