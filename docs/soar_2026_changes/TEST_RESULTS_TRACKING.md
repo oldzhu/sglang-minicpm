@@ -42,6 +42,7 @@ Every test run should be logged here with its configuration, commit, date, and r
 | 24 | 2026-04-18 | 96304f9cd | 223.167.85.181 | CHANGE_0110: **dense-calibrated GPTQ** + FP8 KV + dense + torch.compile(max-bs=8) + mixed-chunk | **77.64%** | **97.05%** | **0.92** | **50.00%** | 79.33% | 98.89% | 100% | 60.00% | 3059s | — | **FAILED**: Dense calibration made accuracy WORSE; mcq crashed to 50%; C=0.92 |
 | 25 | 2026-04-20 | 08fd86023 | 223.167.85.181 | **CHANGE_0120**: prefill-max-req=4, sched-cons=0.8, chunk=65536 | **79.00%** | **98.75%** | **0.96** | 53.33% | 85.00% | 100% | 100% | 56.67% | 2988s | 423.75 | mcq=53.33% (variance); cwe improved 85%; fwe/niah perfect; duration 2988s (vs 3171s Test 20); C=0.96 |
 | 27 | 2026-04-20 | 338989afe | 223.167.85.181 | **CHANGE_0125**: SM120 Marlin tile instantiations + rebuilt sgl-kernel | **77.18%** | ~96.5% | **0** | 56.67% | 83.67% | 98.89% | 100% | 46.67% | 3123s | 468.74 | New tiles compiled but NOT selected by scorer; accuracy drop is **test variance** (qa=46.67% anomaly); CHANGE_0125 is NEUTRAL |
+| **OPTION_B** | 2026-04-21 | **b794b692d** | N/A | **Option B Phase 1**: FP8 blockwise GEMM implementation (code ready for testing) | — | — | — | — | — | — | — | — | — | — | **IMPLEMENTATION COMPLETE**: preprocess_model.py + FP8BlockwiseLinearMethod ready. Awaiting fcloud test. Expected: S1 ~85-100s (50% prefill reduction) |
 
 ---
 
