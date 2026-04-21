@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Tuple
 
 
 def copy_model(src: Path, dst: Path) -> int:
@@ -1032,13 +1032,141 @@ def run_gptq_quantization(
         )
 
 
+def run_fp8_blockwise_quantization(src: Path, dst: Path) -> None:
+    """Convert FP16/BF16 model to FP8 blockwise quantization for SM120 UMMA.
+    
+    This function:
+    1. Loads model weights from src (FP16/BF16 or GPTQ)
+    2. For each linear layer weight, quantizes to FP8 blockwise (128×128 blocks)
+    3. Saves quantized weights and scales to dst
+    4. Updates config.json with quantization metadata
+    """
+    import torch
+    from safetensors.torch import load_file, save_file
+    
+    print("[fp8_blockwise] Starting FP8 blockwise quantization...")
+    
+    # Load config
+    config_path = src / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"config.json not found in {src}")
+    
+    with config_path.open("r") as f:
+        config = json.load(f)
+    
+    dst.mkdir(parents=True, exist_ok=True)
+    
+    # Copy config and other non-weight files
+    for item in src.iterdir():
+        if item.name == "config.json":
+            continue  # Will update and write later
+        if item.name.startswith(".") or item.name.startswith("__pycache__"):
+            continue
+        target = dst / item.name
+        if target.exists():
+            continue
+        if item.is_dir():
+            shutil.copytree(item, target)
+        else:
+            shutil.copy2(item, target)
+    
+    # Process all safetensors files
+    shard_files = sorted(src.glob("*.safetensors"))
+    if not shard_files:
+        raise FileNotFoundError(f"No .safetensors files found in {src}")
+    
+    print(f"[fp8_blockwise] Found {len(shard_files)} shard(s) to convert")
+    
+    for shard_idx, shard_file in enumerate(shard_files):
+        print(f"[fp8_blockwise] Processing shard {shard_idx+1}/{len(shard_files)}: {shard_file.name}")
+        
+        tensors = load_file(shard_file)
+        new_tensors = {}
+        
+        for key, tensor in tensors.items():
+            # Check if this is a weight matrix that should be quantized
+            # Linear layer weights: ndim==2, shape divisible by 128
+            if (tensor.dtype in (torch.float16, torch.bfloat16) and 
+                tensor.ndim == 2 and 
+                tensor.shape[0] % 128 == 0 and tensor.shape[1] % 128 == 0):
+                
+                # Quantize to FP8 blockwise
+                w_fp8_col, scale_b = _quantize_fp8_blockwise(tensor)
+                new_tensors[key] = w_fp8_col
+                new_tensors[key + "_scale"] = scale_b
+                print(f"  ✓ {key}: {tensor.shape} -> FP8 blockwise")
+            else:
+                # Pass through non-weight tensors (embeddings, norms, etc.)
+                new_tensors[key] = tensor
+        
+        # Save converted shard
+        save_file(new_tensors, dst / shard_file.name)
+        print(f"[fp8_blockwise] Saved {shard_file.name}")
+    
+    # Update config with quantization metadata
+    config["quantization_config"] = {
+        "quant_method": "fp8_blockwise",
+        "quant_type": "fp8_blockwise",  # Alternative naming for clarity
+        "block_size": 128,
+        "fp8_dtype": "float8_e4m3fn"
+    }
+    
+    with (dst / "config.json").open("w") as f:
+        json.dump(config, f, indent=2)
+    
+    print("[fp8_blockwise] Quantization complete!")
+    print(f"[fp8_blockwise] Model saved to {dst}")
+
+
+def _quantize_fp8_blockwise(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize weight matrix to FP8 blockwise format.
+    
+    Args:
+        w: Weight tensor (K, N) in float16 or bfloat16
+    
+    Returns:
+        w_fp8_col: (N, K) float8_e4m3fn in column-major format (contiguous)
+        scale_b: (N/128, K/128) float32 scales
+    """
+    import torch
+    
+    K, N = w.shape
+    block_size = 128
+    FP8_MAX = 448.0
+    
+    if K % block_size != 0 or N % block_size != 0:
+        raise ValueError(f"Weight shape {w.shape} not divisible by block_size {block_size}")
+    
+    # Reshape to (K/128, 128, N/128, 128) for blockwise max computation
+    w_blocks = w.reshape(K // block_size, block_size, N // block_size, block_size)
+    
+    # Compute max absolute value per block
+    max_abs = w_blocks.abs().amax(dim=(1, 3))  # (K/128, N/128)
+    
+    # Compute scales: scale = max_abs / FP8_MAX
+    scales = (max_abs / FP8_MAX).clamp(min=1e-12).to(torch.float32)
+    
+    # Quantize each block
+    scale_expanded = scales.unsqueeze(1).unsqueeze(3).expand_as(w_blocks)
+    w_scaled = (w_blocks / scale_expanded).clamp(-FP8_MAX, FP8_MAX)
+    w_fp8 = w_scaled.reshape(K, N).to(torch.float8_e4m3fn)
+    
+    # Convert to column-major format for kernel (transpose to get (N, K) C-contiguous)
+    w_fp8_col = w_fp8.t().contiguous()
+    
+    # Transpose scales to match kernel expectations: (N/128, K/128)
+    scale_b = scales.t().contiguous()
+    
+    return w_fp8_col, scale_b
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument(
         "--mode",
-        choices=["copy", "gptq"],
+        choices=["copy", "gptq", "fp8_blockwise"],
         default=None,
         help="Preprocess mode. If unset, reads SOAR_QUANT_MODE (default: copy).",
     )
@@ -1089,7 +1217,7 @@ def main() -> None:
 
     mode = args.mode or os.environ.get("SOAR_QUANT_MODE", "copy")
     mode = mode.strip().lower()
-    if mode not in {"copy", "gptq"}:
+    if mode not in {"copy", "gptq", "fp8_blockwise"}:
         raise ValueError(f"Unsupported preprocess mode: {mode}")
 
     if mode == "gptq":
@@ -1109,6 +1237,11 @@ def main() -> None:
             batch_size=args.gptq_batch_size,
         )
         print(f"[preprocess] mode={mode} done - quantized model saved to {dst}")
+        return
+    
+    if mode == "fp8_blockwise":
+        run_fp8_blockwise_quantization(src=src, dst=dst)
+        print(f"[preprocess] mode={mode} done - FP8 blockwise model saved to {dst}")
         return
 
     count = copy_model(src, dst)
