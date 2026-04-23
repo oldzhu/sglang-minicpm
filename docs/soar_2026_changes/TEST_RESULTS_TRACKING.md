@@ -125,6 +125,17 @@ Speed is slightly better than Test 20 reference, but accuracy disqualifies (C=0)
 | v18-B (resub) | 2026-04-15 | same package as v18-A | 80.51 | 100.0% | 1.0 | 429.28s | 624.24s | 1171.49s | 51.08 | #18 | C=1.0 but score dropped (other teams improved Duration_best) |
 | **v18-C (resub)** | **2026-04-23** | **same package as v18-A/B** | **76.64** | **95.81%** | **0** | **586.56s** | **1089.21s** | **2864.47s** | **0.0** | — | **ELIMINATED**: acc below 97% threshold (C=0). Speed TIMES ARE 2-5× v18-A/B despite identical package — suggests either fcloud hardware contention at submission time OR eval harness difference OR runaway generation hitting KV cache pressure harder. mcq runaway (per Test 34a avg_out=10,946) is the likely root cause of both accuracy drop (chains get truncated) and Smax blowup (queue stall). **Triggers pivot to Iteration A-0: mcq runaway fix.** |
 
+### Package diff v1_007 → v18 (attribution of regression)
+Local file-level diff (2026-04-23) shows **ONLY** the following v18 deltas matter in dense+FP8-KV mode (we run `--force-dense-minicpm`, so sparse-kernel fixes are dead code):
+
+1. **`--enable-torch-compile --torch-compile-max-bs 8`** added to `prepare_env.sh` (line 133); `--skip-server-warmup` removed
+2. **FP32 cast around `fused_qk_norm_rope` removed** in `python/sglang/srt/models/minicpm.py` (2 call sites; v1_007 did `q,k = q.float(),k.float()` ... `to(orig_dtype)`, v18 runs QK-norm in BF16 directly)
+
+All other diffs (`preprocess_model.py` preset refactor, `minicpm_sparse_kernels.py` int32→int64 + k_scale, `minicpm_sparse_utils.py` cu_seqlens GQA fix, `minicpm_backend.py`/`server_args.py` `--sparse-topk-scale` addition) only affect sparse-mode code paths, which v18's submission config does NOT use.
+
+**Primary regression suspect**: removed FP32 cast around qk-norm-rope under FP8 KV cache → loses ~8 mantissa bits in Q@K score accumulation on long-context (QA/CWE/FWE/NIAH all use 70K+ tokens).
+**Secondary suspect**: torch.compile's known ±1-2pt accuracy drift (v18-A/B/C: 78.71/80.51/76.64 pattern) and compile-graph mismatch under high concurrency contributing to Smax blowup.
+
 **Key insight**: Same package gives different accuracy across submissions (78.71→80.51). Official accuracy has variance — likely related to submission time (morning vs afternoon per user observation). Speed times are very similar (~0.5% variance). Score declined despite better C because competing teams improved their speeds (lowering Duration_best in formula).
 
 ## Notes
