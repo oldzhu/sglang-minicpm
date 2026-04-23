@@ -196,6 +196,14 @@ Whenever analyzing/comparing local fcloud vs official submission results, keep t
 - After every accuracy or speed test completes, update the corresponding table in that file with the test number, date, commit, config, and all result metrics.
 - This file is the single source of truth for comparing configurations across test runs.
 
+## Eval script integrity (must enforce)
+
+- `benchmark/soar/demo_sala/eval_model_001.py` (and `eval_model.py`) is a **local copy of the official evaluation harness**. It is NOT part of the submission package and is NOT executed by the official evaluator — the competition runs its own unmodified copy.
+- **Never modify the eval script** (no per-task `max_out_len` caps, no extra stop words, no sampling/chat-template tweaks). Modifying it breaks our local↔official signal correlation: a passing local test would no longer predict official behavior.
+- **All "fixes" must live on the server/model side** (in files that ARE in the submission tarball): `prepare_env.sh` (`SGLANG_SERVER_ARGS`), `preprocess_model.py` (chat_template, `generation_config.json`), sglang source. Validate them against the pristine eval script — that's the same thing official will run.
+- If you need to debug predictions, write a separate scratch script that reads `outputs/<timestamp>/predictions.jsonl` after the harness finishes. Do not touch the harness itself.
+- If the organizer publishes a newer `eval_model*.py`, replace ours byte-for-byte; do not merge local edits.
+
 ## fcloud automated testing
 
 The workspace includes automation scripts for remote testing on the fcloud instance:
