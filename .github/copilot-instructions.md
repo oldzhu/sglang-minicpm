@@ -102,6 +102,30 @@ S_N = (Duration_best / Duration_player) × 100
 - Respect fixed concurrency evaluation settings (`--flush-cache`, fixed `--max-concurrent`).
 - Keep submission package constraints in mind (≤ 2GB, on-site quantization, ≤ 5h total).
 
+## Local vs Official evaluation — dataset & benchmark differences (must always remember)
+
+Whenever analyzing/comparing local fcloud vs official submission results, keep these facts in mind:
+
+1. **Accuracy datasets differ**:
+   - Local fcloud uses the **public** `perf_public_set.jsonl` only.
+   - Official eval uses **public + private** accuracy datasets. The private set is not disclosed; content is unknown.
+   - Expectation: format and task distribution of private set are **likely similar** to the public set (same 5 task types: mcq/qa/niah/cwe/fwe), but specific samples differ. Our model may perform worse on the private set, which contributes to local-vs-official accuracy gap.
+   - **Consequence**: we should aim for a **safety margin** in local accuracy (e.g., ≥ 80% local to stay above 77% official). Do not treat "local ≥ 77%" as safe.
+
+2. **Speed benchmark datasets differ**:
+   - Local `speed_{s1,s8,smax}.jsonl` files were **hand-built by us** — NOT the official speed dataset.
+   - Official speed dataset is not public, and the organizers announced it was **updated to include more long-context samples** (while the accuracy dataset was said to be unchanged).
+   - **Consequence**: local S1/S8/Smax numbers do NOT predict official numbers. Ratio inversions (e.g., local Smax < local S1 but official Smax ≫ official S1) are expected because the official speed set has much longer inputs/outputs.
+   - **Implication**: optimizations that only help on our short local speed set may not help officially. Prioritize optimizations that help at LONG context and HIGH concurrency (prefill throughput, sparse attention, KV cache efficiency).
+
+3. **Accuracy-gap anomaly to watch**:
+   - Official announcement: accuracy dataset unchanged across submissions.
+   - But our v18-A (78.71%) → v18-B resubmit (80.51%) → v18-C resubmit (76.64%) shows large drift on the same package. Probable sources:
+     - Private-set variance at different submission batches (different random sub-sampling?)
+     - Fcloud hardware / concurrency contention during official eval causing timeouts → empty answers → 0 score
+     - Runaway thinking generation (Iteration A-0 root cause): when mcq hits max_tokens mid-thinking, the final answer is truncated; this hits harder when the eval harness is under load
+   - **Rule**: never assume a single official accuracy number is the true accuracy. Require ≥ 2 submissions of the same package before drawing conclusions, and assume the WORST of the batch for safety margin planning.
+
 ## Baseline config (must enforce)
 
 - The **current best config** is: **GPTQ (sparse_qkv_w8) + FP8 KV cache + dense mode** (`--force-dense-minicpm --kv-cache-dtype fp8_e5m2`).
