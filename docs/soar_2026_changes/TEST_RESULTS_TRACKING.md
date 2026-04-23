@@ -122,6 +122,7 @@ Speed is slightly better than Test 20 reference, but accuracy disqualifies (C=0)
 |------------|------|----------------|---------|------------------|---|----|----|------|-------------|------|-------|
 | v18-A | 2026-04-15 | torch.compile(max-bs=8)+GPTQ+FP8+dense | 78.71 | 98.39% | 0.96 | 426.06s | 620.73s | 1169.84s | 52.94 | #19 | C=0.96 penalty |
 | v18-B (resub) | 2026-04-15 | same package as v18-A | 80.51 | 100.0% | 1.0 | 429.28s | 624.24s | 1171.49s | 51.08 | #18 | C=1.0 but score dropped (other teams improved Duration_best) |
+| **v18-C (resub)** | **2026-04-23** | **same package as v18-A/B** | **76.64** | **95.81%** | **0** | **586.56s** | **1089.21s** | **2864.47s** | **0.0** | — | **ELIMINATED**: acc below 97% threshold (C=0). Speed TIMES ARE 2-5× v18-A/B despite identical package — suggests either fcloud hardware contention at submission time OR eval harness difference OR runaway generation hitting KV cache pressure harder. mcq runaway (per Test 34a avg_out=10,946) is the likely root cause of both accuracy drop (chains get truncated) and Smax blowup (queue stall). **Triggers pivot to Iteration A-0: mcq runaway fix.** |
 
 **Key insight**: Same package gives different accuracy across submissions (78.71→80.51). Official accuracy has variance — likely related to submission time (morning vs afternoon per user observation). Speed times are very similar (~0.5% variance). Score declined despite better C because competing teams improved their speeds (lowering Duration_best in formula).
 
