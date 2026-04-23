@@ -138,6 +138,28 @@ All other diffs (`preprocess_model.py` preset refactor, `minicpm_sparse_kernels.
 
 **Key insight**: Same package gives different accuracy across submissions (78.71→80.51). Official accuracy has variance — likely related to submission time (morning vs afternoon per user observation). Speed times are very similar (~0.5% variance). Score declined despite better C because competing teams improved their speeds (lowering Duration_best in formula).
 
+### Variant A+B direct test on fcloud (2026-04-23) — Option 3 confirmation
+
+Extracted both tarballs side-by-side into `/root/submission_sim_A` (v1_007) and `/root/submission_sim_B` (v18); swapped `/root/submission_sim` symlink between runs; identical preprocessed GPTQ model at `/root/models/openbmb/MiniCPM-SALA-90-qa-cwe-mcq-sparse_qkv_w8` was shared. Accuracy @ concurrency 32, speed via `bench_serving.sh`.
+
+| Variant | Config | Accuracy (public set) | S1 | S8 | Smax | Server ready |
+|---|---|---|---|---|---|---|
+| **A** (v1_007) | torch.compile OFF, FP32 qk-norm cast ON, `--skip-server-warmup` | **79.51%** (norm 99.39%, C=1.0) | 119.64s | 43.49s | 35.52s | 46s |
+| **B** (v18) | torch.compile ON `--torch-compile-max-bs 8`, FP32 qk-norm cast OFF, warmup ON | **79.51%** (norm 99.39%, C=1.0) | 111.19s | 40.79s | 35.06s | 225s |
+
+**Per-task accuracy breakdown** (A vs B): cwe 85.33 vs 82.00, fwe 98.89 vs 98.89, mcq 53.33 vs 53.33, niah 96.67 vs 100.00, qa 63.33 vs 63.33 — net accuracy identical but different distribution (B does NIAH better, A does CWE better).
+
+**Findings**:
+1. **Local accuracy is a wash**: both 79.51%. Neither the FP32 cast nor torch.compile changes the local-public-set score.
+2. **Speed favors B**: S1 −7.1%, S8 −6.2%, Smax −1.3% — v18 really is faster. The speed gain comes from torch.compile + FP32-cast removal combined (cannot separate yet without variants C/D).
+3. **The v18 official regression is NOT from local-measurable accuracy loss**. Sources remaining:
+   - private-set sensitivity (unknown questions may expose torch.compile or FP8-KV precision differently)
+   - hardware/concurrency contention at submission time (v18-C saw Smax 2864s locally-equivalent-package was 35s)
+   - pure per-submission variance in private-set sampling
+4. **mcq output length dropped**: v18 `avg_out=12267` vs v1_007 `avg_out=8505` in mcq — v18 generates ~44% more tokens per mcq even though both get same 53.33% correct. This is symptomatic of Iteration A-0 mcq runaway (early-answer-then-continue).
+
+**Recommendation**: Keep v18 code path (B is 7% faster locally for free) and layer Iteration A-0 (mcq runaway fix) on top for v19 submission. Do NOT revert to v1_007 — it's slower with no accuracy benefit on local eval. The "regression" observed officially is most likely private-set variance + harness contention, which v19 should absorb naturally once mcq runaway (root cause of Smax blowup) is fixed.
+
 ## Notes
 - Tests 1-7 were on old fcloud instance with potentially different GPTQ model preparation
 - Tests 8+ are on new fcloud instance with freshly prepared GPTQ model
