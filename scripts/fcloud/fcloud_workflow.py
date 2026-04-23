@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -49,9 +50,11 @@ FCLOUD_REPO = "/root/sglang-minicpm"
 FCLOUD_SIM = "/root/submission_sim"
 FCLOUD_DATA = "/root/data"
 MODEL_PATH = "/root/models/openbmb/MiniCPM-SALA-90-qa-cwe-mcq-sparse_qkv_w8"
+FP8_MODEL_PATH = "/root/models/minicpm_fp8_blockwise"
 HOST = "0.0.0.0"
 PORT = 30000
 API_BASE = f"http://127.0.0.1:{PORT}"
+LOCAL_REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 # Server terminal name (stable, so we can reconnect)
 SERVER_TERMINAL = None  # Will be set when starting server
@@ -71,54 +74,154 @@ def print_section(title):
     print(f"{'='*60}\n")
 
 
+def get_local_changed_files(path_prefix):
+    """Return local modified/tracked/untracked files under a prefix.
+
+    This catches local uncommitted kernel edits that remote `git pull` cannot see.
+    """
+    changed = set()
+    commands = [
+        ["git", "-C", LOCAL_REPO, "diff", "--name-only", "HEAD", "--", path_prefix],
+        ["git", "-C", LOCAL_REPO, "diff", "--cached", "--name-only", "--", path_prefix],
+        ["git", "-C", LOCAL_REPO, "ls-files", "--others", "--exclude-standard", "--", path_prefix],
+    ]
+    for cmd in commands:
+        try:
+            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            continue
+        for line in out.splitlines():
+            line = line.strip()
+            if line:
+                changed.add(line)
+    return sorted(changed)
+
+
 # ---------------------------------------------------------------------------
 # Workflow steps
 # ---------------------------------------------------------------------------
 def step_sync(base_url, token):
-    """Git pull and copy changed files to submission_sim."""
+    """Git pull and copy changed files to submission_sim.
+
+    Captures pre-pull HEAD SHA, then diffs against post-pull HEAD so that ALL
+    commits pulled (not just the last one) are reflected in the copy list.
+    This is important when syncing to a fcloud instance whose repo is many
+    commits behind (e.g., after a fresh setup or instance switch).
+    """
     print_section("SYNC: git pull + copy files")
+
+    # Capture pre-pull SHA so we can compute the full changed-file set after pull
+    _, pre_sha = fcloud_run(
+        base_url, token,
+        "cd /root/sglang-minicpm && git rev-parse HEAD 2>&1",
+        timeout=15,
+    )
+    pre_sha = pre_sha.strip().split("\n")[-1].strip()
+    print(f"[pre-pull sha] {pre_sha}")
 
     # Git pull with auto-merge message
     _, out = fcloud_run(
         base_url, token,
         "cd /root/sglang-minicpm && git pull --no-edit 2>&1",
-        timeout=60,
+        timeout=120,
     )
     print(f"[git pull] {out}")
 
-    # Find which files changed in the last pull
-    _, changed = fcloud_run(
+    _, post_sha = fcloud_run(
         base_url, token,
-        "cd /root/sglang-minicpm && git diff --name-only HEAD~1 HEAD 2>/dev/null || git diff --name-only @{1} HEAD 2>/dev/null || echo 'DIFF_FAILED'",
-        timeout=30,
+        "cd /root/sglang-minicpm && git rev-parse HEAD 2>&1",
+        timeout=15,
     )
+    post_sha = post_sha.strip().split("\n")[-1].strip()
+    print(f"[post-pull sha] {post_sha}")
+
+    # Diff against the pre-pull SHA so we see every file changed across ALL
+    # commits that were just pulled, not only the most recent commit.
+    if pre_sha and post_sha and pre_sha != post_sha and len(pre_sha) >= 7:
+        diff_cmd = (
+            f"cd /root/sglang-minicpm && "
+            f"git diff --name-only {pre_sha} {post_sha} 2>/dev/null || echo 'DIFF_FAILED'"
+        )
+    else:
+        # No pull advance — still compute last-commit diff as a safety net
+        diff_cmd = (
+            "cd /root/sglang-minicpm && "
+            "git diff --name-only HEAD~1 HEAD 2>/dev/null || echo 'DIFF_FAILED'"
+        )
+
+    _, changed = fcloud_run(base_url, token, diff_cmd, timeout=30)
     print(f"[changed files]\n{changed}")
 
     if "DIFF_FAILED" in changed or not changed.strip():
-        print("[sync] Could not determine changed files, copying all known paths")
-        changed_files = []
+        print("[sync] Could not determine changed files via diff; falling back to "
+              "force-copy of python/ and benchmark/soar/demo_sala/ trees")
+        changed_files = None  # sentinel for fallback
     else:
         changed_files = [f.strip() for f in changed.strip().split("\n") if f.strip()]
+
+    local_sgl_kernel_changes = get_local_changed_files("sgl-kernel/")
+    if local_sgl_kernel_changes:
+        print("[local sgl-kernel changes]")
+        for path in local_sgl_kernel_changes:
+            print(path)
 
     # Copy files based on path mapping
     copy_cmds = []
     sgl_kernel_changed = False
 
-    for f in changed_files:
-        if not f:
-            continue
-        if f.startswith("benchmark/soar/demo_sala/"):
-            # Copy to /root/submission_sim (flat)
-            src = f"{FCLOUD_REPO}/{f}"
-            dst = f"{FCLOUD_SIM}/{f.replace('benchmark/soar/demo_sala/', '')}"
-            copy_cmds.append(f"cp -v {src} {dst}")
-        elif f.startswith("python/"):
-            # Copy to /root/submission_sim/sglang/python/...
-            src = f"{FCLOUD_REPO}/{f}"
-            dst = f"{FCLOUD_SIM}/sglang/{f}"
-            copy_cmds.append(f"mkdir -p $(dirname {dst}) && cp -v {src} {dst}")
-        elif f.startswith("sgl-kernel/"):
-            sgl_kernel_changed = True
+    if changed_files is None:
+        # Fallback: force-copy entire python/ tree and demo_sala flat files.
+        # Used when the pre/post-pull diff fails (e.g., shallow clone).
+        copy_cmds.append(
+            f"cp -r {FCLOUD_REPO}/python/sglang {FCLOUD_SIM}/sglang/python/"
+        )
+        copy_cmds.append(
+            f"cd {FCLOUD_REPO}/benchmark/soar/demo_sala && "
+            f"cp -v gptqmodel_minicpm_sala.py preprocess_model.py prepare_env.sh "
+            f"prepare_model.sh {FCLOUD_SIM}/ 2>&1 | tail -10"
+        )
+        # eval scripts -> /root/data
+        copy_cmds.append(
+            f"cp -v {FCLOUD_REPO}/benchmark/soar/demo_sala/eval_model.py "
+            f"{FCLOUD_REPO}/benchmark/soar/demo_sala/eval_model_001.py "
+            f"{FCLOUD_DATA}/ 2>&1 | tail -5"
+        )
+        # Assume sgl-kernel may have changed when we lose the diff
+        sgl_kernel_changed = True
+    else:
+        eval_script_changed = False
+        for f in changed_files:
+            if not f:
+                continue
+            if f.startswith("benchmark/soar/demo_sala/"):
+                rel = f.replace("benchmark/soar/demo_sala/", "")
+                src = f"{FCLOUD_REPO}/{f}"
+                # eval_model*.py live in /root/data, everything else in /root/submission_sim
+                if rel.startswith("eval_model"):
+                    dst = f"{FCLOUD_DATA}/{rel}"
+                    eval_script_changed = True
+                else:
+                    dst = f"{FCLOUD_SIM}/{rel}"
+                copy_cmds.append(f"cp -v {src} {dst}")
+            elif f.startswith("python/"):
+                # Copy to /root/submission_sim/sglang/python/...
+                src = f"{FCLOUD_REPO}/{f}"
+                dst = f"{FCLOUD_SIM}/sglang/{f}"
+                copy_cmds.append(f"mkdir -p $(dirname {dst}) && cp -v {src} {dst}")
+            elif f.startswith("sgl-kernel/"):
+                sgl_kernel_changed = True
+        if eval_script_changed:
+            print("[sync] eval_model*.py changes detected → copying to /root/data")
+
+    if local_sgl_kernel_changes:
+        sgl_kernel_changed = True
+        for rel_path in local_sgl_kernel_changes:
+            local_path = os.path.join(LOCAL_REPO, rel_path)
+            remote_path = f"{FCLOUD_REPO}/{rel_path}"
+            ok = fcloud_exec.upload_file(base_url, token, local_path, remote_path)
+            if not ok:
+                raise RuntimeError(f"Failed to upload local sgl-kernel change: {rel_path}")
+        print(f"[sync] Uploaded {len(local_sgl_kernel_changes)} local sgl-kernel file(s)")
 
     if copy_cmds:
         cmd = " && ".join(copy_cmds)
@@ -145,9 +248,21 @@ def step_sync(base_url, token):
     print("[sync] Done")
 
 
-def step_restart_server(base_url, token):
-    """Kill existing sglang server and start a new one."""
+def step_restart_server(base_url, token, quant_mode="gptq", model_path=None):
+    """Kill existing sglang server and start a new one.
+
+    Args:
+        quant_mode: "gptq" (default) or "fp8_blockwise".
+                    Controls SOAR_QUANT_MODE passed to prepare_env.sh.
+        model_path: Override model path. Defaults to MODEL_PATH for gptq,
+                    FP8_MODEL_PATH for fp8_blockwise.
+    """
     print_section("RESTART SERVER")
+
+    if model_path is None:
+        model_path = FP8_MODEL_PATH if quant_mode == "fp8_blockwise" else MODEL_PATH
+
+    print(f"[restart-server] quant_mode={quant_mode}, model_path={model_path}")
 
     # Kill existing
     _, out = fcloud_run(
@@ -157,9 +272,10 @@ def step_restart_server(base_url, token):
     )
     print(f"[kill] {out}")
 
-    # Source prepare_env.sh and start server in background
-    server_cmd = f"""cd {FCLOUD_SIM} && source ./prepare_env.sh && \\
-MODEL_PATH={MODEL_PATH} && \\
+    # Source prepare_env.sh and start server in background.
+    # Export SOAR_QUANT_MODE before sourcing so prepare_env.sh picks up the right branch.
+    server_cmd = f"""cd {FCLOUD_SIM} && export SOAR_QUANT_MODE={quant_mode} && source ./prepare_env.sh && \\
+MODEL_PATH={model_path} && \\
 HOST={HOST} && \\
 PORT={PORT} && \\
 read -r -a EXTRA_ARGS <<< "${{SGLANG_SERVER_ARGS:-}}" && \\
@@ -543,7 +659,11 @@ def main():
 
     sub.add_parser("full", help="Full workflow: sync → restart → accuracy")
     sub.add_parser("sync", help="Git pull and copy changed files")
-    sub.add_parser("restart-server", help="Restart sglang server")
+    p_restart = sub.add_parser("restart-server", help="Restart sglang server")
+    p_restart.add_argument("--quant-mode", choices=["gptq", "fp8_blockwise"], default="gptq",
+                           help="Quantization mode (default: gptq)")
+    p_restart.add_argument("--model-path", type=str, default=None,
+                           help="Override model path (default: auto from quant-mode)")
     sub.add_parser("wait-server", help="Wait for server to be ready")
     sub.add_parser("accuracy", help="Run accuracy test")
 
@@ -570,7 +690,9 @@ def main():
     elif args.action == "sync":
         step_sync(base_url, token)
     elif args.action == "restart-server":
-        step_restart_server(base_url, token)
+        step_restart_server(base_url, token,
+                            quant_mode=args.quant_mode,
+                            model_path=args.model_path)
     elif args.action == "wait-server":
         step_wait_server(base_url, token)
     elif args.action == "accuracy":
