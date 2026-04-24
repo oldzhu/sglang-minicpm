@@ -160,6 +160,29 @@ Extracted both tarballs side-by-side into `/root/submission_sim_A` (v1_007) and 
 
 **Recommendation**: Keep v18 code path (B is 7% faster locally for free) and layer Iteration A-0 (mcq runaway fix) on top for v19 submission. Do NOT revert to v1_007 — it's slower with no accuracy benefit on local eval. The "regression" observed officially is most likely private-set variance + harness contention, which v19 should absorb naturally once mcq runaway (root cause of Smax blowup) is fixed.
 
+### v19 isolation tests on fcloud (2026-04-24)
+
+v19 tarball (uploaded earlier, Apr-20) extracted to `/root/submission_sim_C`; same preprocessed GPTQ model shared with A/B. Package-level diff vs v18:
+
+- **`prepare_env.sh`**: `chunked-prefill-size 32768→65536`, `max-prefill-tokens 32768→65536`, `prefill-max-requests 1→4`, `max-running-requests 20→24`, `schedule-conservativeness 1.0→0.8`, added `--enable-mixed-chunk`, new env `SGLANG_FLA_CHUNK_SIZE=64`, new env `SOAR_GPTQ_FORCE_DENSE=1` / `SOAR_GPTQ_DAMP_PERCENT=0.05` / `SOAR_GPTQ_MSE=0.0`.
+- **`preprocess_model.py`**: under `SOAR_GPTQ_FORCE_DENSE=1`, sets `sparse_config=null` so GPTQ calibration matches dense inference. (No effect on this run — reused v18 preprocessed model.)
+- **sglang source** (excl. `__pycache__`): modified `srt/layers/attention/fla/chunk.py`, `fla/chunk_delta_h.py`, `fla/fused_recurrent.py`, `srt/layers/attention/hybrid_linear_attn_backend.py`, `srt/models/minicpm.py`, `srt/models/minicpm3.py`, `srt/speculative/eagle_worker.py`; new file `srt/models/minicpm_eagle3.py`.
+
+| Variant | Config | acc_ori | acc_norm | C | mcq | cwe | fwe | niah | qa | Duration | Timeouts |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| **v19** | v19 source + v19 aggressive server args (chunk=65K, prefill-max-req=4, mixed-chunk, running=24, sched-cons=0.8) | **73.76%** | 93.03% | **0** | 40.00% | 81.00% | 97.78% | 96.67% | 53.33% | 3226.52s | 1× 3000s |
+| **v19-a** | v19 source + **v18 server args** (chunk=32K, prefill-max-req=1, running=20, sched-cons=1.0, no mixed-chunk); kept `SGLANG_FLA_CHUNK_SIZE=64` | **78.04%** | 98.42% | **0.96** | 53.33% | 81.33% | 98.89% | 100.00% | 56.67% | 3032.90s | 1× 3000s |
+| **v19-c-FLA** | v19-a **with v18 FLA+hybrid_linear_attn backend restored** (kept v19 minicpm.py/minicpm3.py/minicpm_eagle3.py/eagle_worker.py) | **76.29%** | 96.22% | **0** | 46.67% | 77.00% | 97.78% | 100.00% | 60.00% | 2880.01s | 1× (sample 138) |
+
+**Findings**:
+1. **v19's server args alone caused ~4pt regression** on mcq (40→53.33 fully recovered in v19-a). Aggressive prefill/mixed-chunk + `SGLANG_FLA_CHUNK_SIZE=64` is unstable on short mcq.
+2. **v19 source still costs ~1.5pt vs v18** (v19-a=78.04% vs v18=79.51%). Distribution shifted: qa improved (+3.34) but cwe/fwe worsened slightly.
+3. **Hang bug (3000s timeout)** reproduces in ALL three v19 runs — not a server-arg artifact and not FLA. A real concurrency-load-triggered hang lives in v19's non-FLA source (most likely `srt/models/minicpm.py`, since minicpm3.py / eagle_worker / minicpm_eagle3 are unused in this dense-FP8 submission path).
+4. **v19 FLA changes are beneficial, not harmful** — reverting FLA to v18 DROPPED accuracy by −1.75pt (v19-a=78.04 → v19-c-FLA=76.29). Previous hypothesis "FLA is the culprit" was **wrong**. v19's FLA kernels and `hybrid_linear_attn_backend.py` improvements help on this config.
+5. **v19-a is submission-viable in C=0.96 tier**, but still dominated by v18 (which is C=1.0). No reason to ship v19 or v19-a.
+
+**Conclusion**: Keep **v18 as baseline**. If we cherry-pick from v19: the FLA files are SAFE and actually beneficial, but `srt/models/minicpm.py` is the prime suspect for the concurrency hang and should NOT be cherry-picked without further bisect. Do not use v19's aggressive `SGLANG_SERVER_ARGS` either.
+
 ## Notes
 - Tests 1-7 were on old fcloud instance with potentially different GPTQ model preparation
 - Tests 8+ are on new fcloud instance with freshly prepared GPTQ model
