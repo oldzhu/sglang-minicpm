@@ -88,11 +88,29 @@ MiniCPM-SALA 的 chat template 内部很可能用 Jinja 变量控制 `enable_thi
 
 具体做法需要先检查 fcloud 上模型的 chat_template 字符串。
 
-**Fix 2.2 — 服务端 `--reasoning-parser qwen3`**（可靠性 MEDIUM，风险 LOW）
+**Fix 2.2 — 服务端 `--reasoning-parser qwen3`** ❌ **已验证无效（2026-04-26）**
 
-SGLang 自带 `Qwen3Detector` 推理解析器。在 `SGLANG_SERVER_ARGS` 中加入 `--reasoning-parser qwen3` 后，server 会**将思考内容从最终输出中分离**。这本身不会让模型停止生成，但如果官方打分器使用 OpenAI 风格 API 并区分 `reasoning_content` vs `content`，这一步可能帮它拿到干净的答案部分。
+通过审查 `benchmark/soar/demo_sala/eval_model_001.py` 确认：
 
-是否奏效取决于官方评测是否遵守这个协议。不是银弹，但尝试成本很低。
+1. 评测脚本只读取 `choices[0].message.content`（第 40 行），完全不读 `reasoning_content`。
+2. 评测脚本自己在客户端调用 `extract_final_answer`（第 176-178 行），用 `pred.split('</think>')[-1]` 取最后一段：
+   ```python
+   def extract_final_answer(pred):
+       parts = pred.split('</think>')
+       return parts[-1].strip() if len(parts) > 1 else pred
+   ```
+3. 所有 scorer（`score_mcq` / `score_exact_match` 等）都已经做了思考剥离。
+
+**结论**：开启 `--reasoning-parser qwen3` 在两种情形下的影响：
+
+| 情形 | 不开（当前） | 开启 reasoning-parser |
+|---|---|---|
+| 正常输出（含 `</think>`） | content 含完整文本 → split → 取答案 ✅ | content 已被 parser 剥离 → 直接取答案 ✅（等价） |
+| **mcq runaway**（思考阶段被 max_tokens 截断，无 `</think>`） | content 是思考残段，正则有时**仍能**抓到中途出现的 `ANSWER: X` → 偶尔得分 | content 变为**空字符串**（全部塞进 reasoning_content），正则一定抓不到 → **必丢分** |
+
+由于官方评测使用同一份 harness（按 copilot-instructions 规则禁止修改 eval 脚本即为此对齐信号），上述结论同样适用于线上。
+
+**因此 Fix 2.2 对准确率净期望为 0 或负，从行动列表中删除，不再尝试。**
 
 **Fix 2.3 — 服务端 max-tokens 截断带按请求采样覆盖**（风险 HIGH）
 
@@ -132,7 +150,7 @@ SGLang 没有 per-task max_tokens 覆盖机制；任何 server-side 截断都会
 |---|---|
 | 关掉思考损害 cwe/fwe/qa 精度 | 条件关（只在短 prompt 时关），或保留思考但加硬性 max_tokens 上限 |
 | 改过的 chat_template 破坏官方 eval loader | 在 `preprocess_model.py` 保留原始 chat_template 作为备选；用环境变量 feature-flag |
-| `--reasoning-parser qwen3` 与 MiniCPM token 格式不匹配 | 本地先比对 token 字符串与 `reasoning_parser.py` 再启用 |
+| ~~`--reasoning-parser qwen3` 与 MiniCPM token 格式不匹配~~ | ~~本地先比对 token 字符串与 `reasoning_parser.py` 再启用~~ — Fix 2.2 已撤销（见上） |
 | 评测侧 Fix（Layer 1）让本地好看但官方仍失败 | Layer 2 明确承担"可迁移"职责；Layer 2 本地复现通过前不重新提交 |
 | 官方 eval 脚本与我们的完全不同 | 概率低——local 与 official 精度差距只有 1pt 左右，说明协议相似 |
 

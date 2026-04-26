@@ -88,11 +88,29 @@ The MiniCPM-SALA chat template likely has `enable_thinking` controlled by a Jinj
 
 Actual behavior must be confirmed by inspecting the model's chat_template string on fcloud.
 
-**Fix 2.2 — Server `--reasoning-parser qwen3`** (MEDIUM reliability, LOW risk)
+**Fix 2.2 — Server `--reasoning-parser qwen3`** ❌ **VERIFIED INEFFECTIVE (2026-04-26)**
 
-SGLang has a `Qwen3Detector` reasoning parser. Adding `--reasoning-parser qwen3` to `SGLANG_SERVER_ARGS` would make the server **separate thinking output from final output** in the response stream. This alone doesn't stop generation, but could give the official scorer better access to the final answer if it respects `reasoning_content` vs `content` split.
+Review of `benchmark/soar/demo_sala/eval_model_001.py` confirms:
 
-Reliability depends on whether official eval uses OpenAI-style API with reasoning_content parsing. Likely not a silver bullet, but nearly free to test.
+1. The eval reads only `choices[0].message.content` (line 40); it never reads `reasoning_content`.
+2. The eval performs the `</think>` split client-side itself in `extract_final_answer` (lines 176-178):
+   ```python
+   def extract_final_answer(pred):
+       parts = pred.split('</think>')
+       return parts[-1].strip() if len(parts) > 1 else pred
+   ```
+3. All scorers (`score_mcq`, `score_exact_match`, …) already strip thinking via that helper.
+
+**Therefore enabling `--reasoning-parser qwen3` would have these effects**:
+
+| Case | Without (current) | With reasoning-parser |
+|---|---|---|
+| Healthy output (contains `</think>`) | content has full text → split → answer extracted ✅ | content already stripped by parser → answer extracted ✅ (equivalent) |
+| **mcq runaway** (max_tokens hit mid-thinking, no `</think>`) | content is thinking blob; regex still occasionally catches a stray `ANSWER: X` mention inside reasoning → partial credit | content becomes **empty string** (everything routed to `reasoning_content`); regex matches nothing → **guaranteed 0** |
+
+Official scoring uses the same harness (the copilot-instructions ban on modifying the eval script exists precisely to preserve this signal alignment), so the conclusion holds online too.
+
+**Net expected accuracy change ≤ 0. Fix 2.2 is removed from the action list.**
 
 **Fix 2.3 — Server-side max-tokens clamp with per-request sampler override** (HIGH risk)
 
@@ -132,7 +150,7 @@ Uncertain — SGLang may not expose a server-side default max_tokens cap. Skip u
 |---|---|
 | Disabling thinking hurts cwe/fwe/qa accuracy | Apply conditionally (only when short prompt) OR keep thinking but add hard `max_tokens` cap |
 | Modified chat_template breaks official eval loader | Keep original chat_template as a backup in `preprocess_model.py`; feature-flag with env var |
-| `--reasoning-parser qwen3` doesn't match MiniCPM token format | Verify token strings locally against reasoning_parser.py before enabling |
+| ~~`--reasoning-parser qwen3` doesn't match MiniCPM token format~~ | ~~Verify token strings locally against reasoning_parser.py before enabling~~ — Fix 2.2 withdrawn (see above) |
 | Eval-side fix (Layer 1) makes local results look great but official still fails | Layer 2 is explicitly designed to transfer; we won't resubmit until Layer 2 passes local reproduction |
 | Official eval script is totally different from ours | Low probability given the ~1pt local↔official accuracy alignment |
 
