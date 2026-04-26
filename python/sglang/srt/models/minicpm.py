@@ -13,9 +13,7 @@
 # ==============================================================================
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
 
-import logging
 import math
-import os
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -51,7 +49,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var
 
-logger = logging.getLogger(__name__)
 
 _is_cuda = torch.cuda.is_available()
 
@@ -594,7 +591,6 @@ class MiniCPMDecoderLayer(nn.Module):
         self.residual_scale = config.scale_depth / math.sqrt(
             config.num_hidden_layers
         )
-        self.scaling_folded = False
 
     def _compute_topk(self, forward_batch, base_metadata, sparse_metadata):
         """Compute TopK indices for sparse attention.
@@ -636,16 +632,14 @@ class MiniCPMDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        if not self.scaling_folded:
-            hidden_states *= self.residual_scale
+        hidden_states *= self.residual_scale
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual
         )
         hidden_states = self.mlp(hidden_states)
-        if not self.scaling_folded:
-            hidden_states *= self.residual_scale
+        hidden_states *= self.residual_scale
 
         return hidden_states, residual
 
@@ -679,7 +673,6 @@ class MiniCPMModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self._scaling_folded = False
 
     def forward(
         self,
@@ -689,10 +682,7 @@ class MiniCPMModel(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if input_embeds is None:
-            if self._scaling_folded:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = self.embed_tokens(input_ids) * self.config.scale_emb
+            hidden_states = self.embed_tokens(input_ids) * self.config.scale_emb
         else:
             hidden_states = input_embeds
         residual = None
@@ -737,7 +727,6 @@ class MiniCPMForCausalLM(nn.Module):
             )
 
         self.scale_width = self.config.hidden_size / self.config.dim_model_base
-        self._scaling_folded = False
 
         self.logits_processor = LogitsProcessor(config)
 
@@ -752,8 +741,7 @@ class MiniCPMForCausalLM(nn.Module):
         if input_embeds is not None:
             input_embeds = input_embeds * self.config.scale_emb
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        if not self._scaling_folded:
-            hidden_states = hidden_states / self.scale_width
+        hidden_states = hidden_states / self.scale_width
         if self.config.tie_word_embeddings:
             lm_head = self.model.embed_tokens
         else:
@@ -821,50 +809,6 @@ class MiniCPMForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-
-        if os.environ.get("SGLANG_MINICPM_FOLD_SCALING", "0") in ("1", "true", "True"):
-            self._fold_scaling_factors()
-
-    def _fold_scaling_factors(self):
-        """Fold residual_scale, scale_emb, and scale_width into weights at load
-        time to eliminate per-token scalar multiply kernels at runtime.
-
-        For GPTQ Marlin layers, residual_scale is folded into the dequantization
-        scales of o_proj and down_proj.  For full-precision layers (embed_tokens,
-        lm_head), the weight tensors are scaled directly.
-
-        Called at the end of load_weights(), before process_weights_after_loading.
-        This is safe because scalar multiplication commutes with all Marlin
-        kernel transformations (permutation, repacking, dequantization)."""
-        residual_scale = self.config.scale_depth / math.sqrt(
-            self.config.num_hidden_layers
-        )
-        scale_emb = self.config.scale_emb
-        scale_width = self.config.hidden_size / self.config.dim_model_base
-
-        # Fold residual_scale into o_proj and down_proj GPTQ scales
-        for layer in self.model.layers:
-            for proj_name in ["self_attn.o_proj", "mlp.down_proj"]:
-                proj = layer.get_submodule(proj_name)
-                if hasattr(proj, "scales"):
-                    proj.scales.data.mul_(residual_scale)
-                elif hasattr(proj, "weight"):
-                    proj.weight.data.mul_(residual_scale)
-            layer.scaling_folded = True
-
-        # Fold scale_emb into embed_tokens
-        self.model.embed_tokens.weight.data.mul_(scale_emb)
-        self.model._scaling_folded = True
-
-        # Fold 1/scale_width into lm_head
-        if not self.config.tie_word_embeddings:
-            self.lm_head.weight.data.div_(scale_width)
-        self._scaling_folded = True
-
-        logger.info(
-            f"Folded scaling factors: residual_scale={residual_scale:.6f}, "
-            f"scale_emb={scale_emb}, scale_width={scale_width}"
-        )
 
 class MiniCPMSALAForCausalLM(MiniCPMForCausalLM):
     pass

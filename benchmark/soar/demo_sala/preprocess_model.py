@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 
 def copy_model(src: Path, dst: Path) -> int:
@@ -89,16 +89,6 @@ def _parse_int_env(name: str, default: int) -> int:
         return int(value.strip())
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer, got: {value}") from exc
-
-
-def _parse_float_env(name: str, default: float) -> float:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        return float(value.strip())
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a float, got: {value}") from exc
 
 
 def _parse_optional_int_list_env(name: str) -> Optional[List[int]]:
@@ -780,14 +770,6 @@ def _sanitize_model_config_for_gptq(config: dict) -> Tuple[dict, List[str], dict
         sanitized.pop("rope_type", None)
         changes.append("removed top-level rope_type from GPTQ temp config")
 
-    force_dense = _env_truthy("SOAR_GPTQ_FORCE_DENSE", default=True)
-    if force_dense and sanitized.get("sparse_config") is not None:
-        sanitized["sparse_config"] = None
-        changes.append(
-            "set sparse_config=null to force dense attention during GPTQ calibration "
-            "(matches --force-dense-minicpm inference mode)"
-        )
-
     sanitized_snapshot = _rope_debug_snapshot(sanitized)
     return sanitized, changes, raw_snapshot, sanitized_snapshot
 
@@ -898,13 +880,7 @@ def run_gptq_quantization(
         if layer_aware
         else None
     )
-    quant_config = QuantizeConfig(
-        bits=bits,
-        group_size=group_size,
-        dynamic=dynamic_rules,
-        damp_percent=_parse_float_env("SOAR_GPTQ_DAMP_PERCENT", 0.05),
-        mse=_parse_float_env("SOAR_GPTQ_MSE", 0.0),
-    )
+    quant_config = QuantizeConfig(bits=bits, group_size=group_size, dynamic=dynamic_rules)
 
     trust_remote_code = _env_truthy("SOAR_TRUST_REMOTE_CODE", default=True)
     attn_impl = os.environ.get("SOAR_GPTQ_ATTN_IMPL", "flash_attention_2").strip()
@@ -915,7 +891,6 @@ def run_gptq_quantization(
         f"calibration_sampling={json.dumps(calibration_summary, sort_keys=True)} "
         f"trust_remote_code={trust_remote_code} attn_impl={attn_impl} "
         f"layer_aware={layer_aware} include={include_modules} exclude={exclude_modules} "
-        f"damp_percent={quant_config.damp_percent} mse={quant_config.mse} "
         f"dynamic_rules={dynamic_rules}"
     )
     print("[preprocess] GPTQ custom model support enabled for model_type=minicpm_sala")
@@ -1032,141 +1007,13 @@ def run_gptq_quantization(
         )
 
 
-def run_fp8_blockwise_quantization(src: Path, dst: Path) -> None:
-    """Convert FP16/BF16 model to FP8 blockwise quantization for SM120 UMMA.
-    
-    This function:
-    1. Loads model weights from src (FP16/BF16 or GPTQ)
-    2. For each linear layer weight, quantizes to FP8 blockwise (128×128 blocks)
-    3. Saves quantized weights and scales to dst
-    4. Updates config.json with quantization metadata
-    """
-    import torch
-    from safetensors.torch import load_file, save_file
-    
-    print("[fp8_blockwise] Starting FP8 blockwise quantization...")
-    
-    # Load config
-    config_path = src / "config.json"
-    if not config_path.exists():
-        raise FileNotFoundError(f"config.json not found in {src}")
-    
-    with config_path.open("r") as f:
-        config = json.load(f)
-    
-    dst.mkdir(parents=True, exist_ok=True)
-    
-    # Copy config and other non-weight files
-    for item in src.iterdir():
-        if item.name == "config.json":
-            continue  # Will update and write later
-        if item.name.startswith(".") or item.name.startswith("__pycache__"):
-            continue
-        target = dst / item.name
-        if target.exists():
-            continue
-        if item.is_dir():
-            shutil.copytree(item, target)
-        else:
-            shutil.copy2(item, target)
-    
-    # Process all safetensors files
-    shard_files = sorted(src.glob("*.safetensors"))
-    if not shard_files:
-        raise FileNotFoundError(f"No .safetensors files found in {src}")
-    
-    print(f"[fp8_blockwise] Found {len(shard_files)} shard(s) to convert")
-    
-    for shard_idx, shard_file in enumerate(shard_files):
-        print(f"[fp8_blockwise] Processing shard {shard_idx+1}/{len(shard_files)}: {shard_file.name}")
-        
-        tensors = load_file(shard_file)
-        new_tensors = {}
-        
-        for key, tensor in tensors.items():
-            # Check if this is a weight matrix that should be quantized
-            # Linear layer weights: ndim==2, shape divisible by 128
-            if (tensor.dtype in (torch.float16, torch.bfloat16) and 
-                tensor.ndim == 2 and 
-                tensor.shape[0] % 128 == 0 and tensor.shape[1] % 128 == 0):
-                
-                # Quantize to FP8 blockwise
-                w_fp8_col, scale_b = _quantize_fp8_blockwise(tensor)
-                new_tensors[key] = w_fp8_col
-                new_tensors[key + "_scale"] = scale_b
-                print(f"  ✓ {key}: {tensor.shape} -> FP8 blockwise")
-            else:
-                # Pass through non-weight tensors (embeddings, norms, etc.)
-                new_tensors[key] = tensor
-        
-        # Save converted shard
-        save_file(new_tensors, dst / shard_file.name)
-        print(f"[fp8_blockwise] Saved {shard_file.name}")
-    
-    # Update config with quantization metadata
-    config["quantization_config"] = {
-        "quant_method": "fp8_blockwise",
-        "quant_type": "fp8_blockwise",  # Alternative naming for clarity
-        "block_size": 128,
-        "fp8_dtype": "float8_e4m3fn"
-    }
-    
-    with (dst / "config.json").open("w") as f:
-        json.dump(config, f, indent=2)
-    
-    print("[fp8_blockwise] Quantization complete!")
-    print(f"[fp8_blockwise] Model saved to {dst}")
-
-
-def _quantize_fp8_blockwise(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize weight matrix to FP8 blockwise format.
-    
-    Args:
-        w: Weight tensor (N, K) = (out_features, in_features) — standard PyTorch convention
-    
-    Returns:
-        w_fp8: (N, K) float8_e4m3fn — same shape as input (standard PyTorch)
-        scale_b: (N/128, K/128) float32 scales
-    
-    Note: In apply(), pass w_fp8.t() and scale_b.t() to fp8_blockwise_scaled_mm
-          to get col-major (K, N) and col-major (K/128, N/128) as required by kernel.
-          weight.t() is a zero-copy op (creates a strided view with stride[0]=1).
-    """
-    import torch
-    
-    N, K = w.shape  # N=out_features, K=in_features (standard PyTorch)
-    block_size = 128
-    FP8_MAX = 448.0
-    
-    if N % block_size != 0 or K % block_size != 0:
-        raise ValueError(f"Weight shape {w.shape} not divisible by block_size {block_size}")
-    
-    # Reshape to (N/128, 128, K/128, 128) for blockwise max computation
-    w_blocks = w.reshape(N // block_size, block_size, K // block_size, block_size)
-    
-    # Compute max absolute value per block: (N/128, K/128)
-    max_abs = w_blocks.abs().amax(dim=(1, 3))
-    
-    # Compute scales: scale = max_abs / FP8_MAX
-    scales = (max_abs / FP8_MAX).clamp(min=1e-12).to(torch.float32)  # (N/128, K/128)
-    
-    # Quantize each block
-    scale_expanded = scales.unsqueeze(1).unsqueeze(3).expand_as(w_blocks)
-    w_scaled = (w_blocks / scale_expanded).clamp(-FP8_MAX, FP8_MAX)
-    w_fp8 = w_scaled.reshape(N, K).to(torch.float8_e4m3fn)  # (N, K) standard
-    
-    # Return in standard (N, K) format — NO transpose here.
-    # apply() will call weight.t() to get col-major (K, N) required by fp8_blockwise_scaled_mm.
-    return w_fp8, scales  # (N, K), (N/128, K/128)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument(
         "--mode",
-        choices=["copy", "gptq", "fp8_blockwise"],
+        choices=["copy", "gptq"],
         default=None,
         help="Preprocess mode. If unset, reads SOAR_QUANT_MODE (default: copy).",
     )
@@ -1217,7 +1064,7 @@ def main() -> None:
 
     mode = args.mode or os.environ.get("SOAR_QUANT_MODE", "copy")
     mode = mode.strip().lower()
-    if mode not in {"copy", "gptq", "fp8_blockwise"}:
+    if mode not in {"copy", "gptq"}:
         raise ValueError(f"Unsupported preprocess mode: {mode}")
 
     if mode == "gptq":
@@ -1237,11 +1084,6 @@ def main() -> None:
             batch_size=args.gptq_batch_size,
         )
         print(f"[preprocess] mode={mode} done - quantized model saved to {dst}")
-        return
-    
-    if mode == "fp8_blockwise":
-        run_fp8_blockwise_quantization(src=src, dst=dst)
-        print(f"[preprocess] mode={mode} done - FP8 blockwise model saved to {dst}")
         return
 
     count = copy_model(src, dst)
