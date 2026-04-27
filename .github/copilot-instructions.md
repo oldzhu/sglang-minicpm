@@ -196,6 +196,23 @@ Whenever analyzing/comparing local fcloud vs official submission results, keep t
 - After every accuracy or speed test completes, update the corresponding table in that file with the test number, date, commit, config, and all result metrics.
 - This file is the single source of truth for comparing configurations across test runs.
 
+## Conversation tracking (mandatory)
+
+- **Every round of substantive interaction** (any session that produces analysis, decisions, code changes, test runs, or research notes — i.e. anything beyond a one-line clarification) must be captured in a chat log document under:
+  `docs/soar_2026_changes/chat/`
+- Filename format: `CHAT_<topic-slug>_<YYYYMMDD_HHMM>.en.md` (and a matching `.zh.md`).
+  - Use start time of the session (or close-to-start) as the timestamp.
+  - `<topic-slug>` should be a short kebab-case label (e.g. `w4a8-mislabel-fix`, `nvfp4-kv-scoping`).
+- A chat log captures, in order:
+  1. **User questions / asks** for that round (verbatim or condensed)
+  2. **Agent answers / actions** (key conclusions, decisions, files touched, commits made)
+  3. **Outcomes** (results, follow-ups, open questions)
+  4. **Cross-references** to all created/modified docs, commits, and any TEST_RESULTS_TRACKING rows
+- Bilingual: keep `.en.md` and `.zh.md` in sync (same suffix timestamp). Use the same numeric suffix scheme (`_001`, `_002`, …) if a single conversation grows beyond one document.
+- Chat docs are **for review/audit only** — they do not replace the existing CHANGE_/PROPOSAL_/RESEARCH_/PHASE0_/etc documents. Each chat log links to those, not duplicates them.
+- One chat doc may cover multiple rounds within the same session/topic; create a new chat doc when the session/topic changes.
+- The agent must commit chat docs to `minicpm-src` together with the substantive work they describe (or, for chat-only sessions, as a standalone commit).
+
 ## Eval script integrity (must enforce)
 
 - `benchmark/soar/demo_sala/eval_model_001.py` (and `eval_model.py`) is a **local copy of the official evaluation harness**. It is NOT part of the submission package and is NOT executed by the official evaluator — the competition runs its own unmodified copy.
