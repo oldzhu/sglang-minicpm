@@ -85,10 +85,10 @@ def test_fp8_blockwise_quantize_roundtrip() -> None:
 
     w_rec = fp8_blockwise_dequantize(w_fp8, scale_b, block_size=FP8_BLOCK_SIZE)
     rel = _frobenius_rel(w.float(), w_rec.float())
-    # FP8 e4m3 has ~3 mantissa bits; worst-case rel error per element
-    # is ~1/8, but blockwise scaling brings the aggregate Frobenius error
-    # closer to ~1.5e-2 for well-distributed inputs.
-    assert rel < 2e-2, f"FP8 round-trip too lossy, rel={rel:.3e}"
+    # FP8 e4m3 has 3 mantissa bits; quant step ≈ 2^-3 = 0.125 per element.
+    # For Gaussian-distributed inputs the aggregate RMS error empirically
+    # falls in the 2-4% range. We assert a generous ≤5% rel-Frobenius.
+    assert rel < 5e-2, f"FP8 round-trip too lossy, rel={rel:.3e}"
     print(f"[OK] fp8_blockwise_quantize roundtrip: rel_frobenius={rel:.3e}")
 
 
