@@ -1,7 +1,7 @@
 # 提案 — Iteration W4A8 (#1)：通过 TRT-LLM 启用 FP8 in-kernel GEMM（基于 v18 基线）
 
-**日期**: 2026-04-27 09:05
-**状态**: ⏳ 等待用户批准 — 暂未做任何代码改动
+**日期**: 2026-04-27 09:05  
+**状态**: ✅ 2026-04-27 已批准（含修订：选 Option B，不引入 TRT-LLM wheel，软性精度守门）— 可开始实施
 **优先级**: 后 v18 优化清单 #1
 **基线 (v18-revert，等价 Test 25)**: S1=110.51s, S8=40.46s, Smax=33.61s, 归一化精度 77.44 % → C=0.92
 **前置文档**: `PROPOSAL_fp8_w4_dequant_gemm.md` (Phase 1 调研, 2026-04-21)、`PROPOSAL_option_b_fp8_blockwise_gemm.en.md` (sgl-kernel 内置替代方案)。
@@ -39,7 +39,7 @@
 3. **fcloud 环境的 TRT-LLM wheel 兼容性**：第 1 步先验证可 pip 安装。
 4. **Scale 转换正确性**：GPTQ group_size=128 的 BF16 scale 必须折成 per-row FP8 scale。缓解：写单元测试，比较转换前后反量化权重的 Frobenius 差 < 1e-3。
 
-**警戒点**：启用后立刻在 `perf_public_set.jsonl` 上重测精度。如归一化精度跌破 79 %（v18 是 77.44 %，留 ~1.5 pt 安全垫），通过环境变量关闭 FP8 path，按失败处理。
+**警戒点**：启用后立刻在 `perf_public_set.jsonl` 上重测精度。如归一化精度跌破 79 %（v18 是 77.44 %，留 ~1.5 pt 安全垫），**不**自动放弃：要把精度损失与实测的 S1/S8/Smax 提速放在一起评估，由用户共同决定保留 / 调参 / 回退。硬底线仍是 97 % 规则（C=0），永远不主动跨过。
 
 ## 4. 改动文件
 
@@ -47,10 +47,10 @@
 
 | 文件 | 改动 |
 |---|---|
-| `python/sglang/srt/layers/quantization/gptq_marlin.py` | forward 里加分支：若 `os.environ.get("SOAR_W4A8_FP8_GEMM") == "1"` 且 TRT-LLM 可用且层在白名单（std-attn QKV/O + MLP gate/up/down）→ 调 TRT-LLM kernel；否则走原 Marlin |
+| `python/sglang/srt/layers/quantization/gptq_marlin.py` | forward 里加分支：若 `os.environ.get("SOAR_W4A8_FP8_GEMM") == "1"` 且 `sgl_kernel.fp8_blockwise_scaled_mm` 可导入且层在白名单（std-attn QKV/O + MLP gate/up/down）→ 调 sgl-kernel FP8 blockwise GEMM；否则走原 Marlin |
 | `python/sglang/srt/models/minicpm.py` | 构造时给可用层打标签（linear forward 里读这个属性）— v1 排除 lightning Q/K/V/O |
-| `benchmark/soar/demo_sala/preprocess_model.py` | GPTQ 量化后，把 per-group BF16 scale 折成 per-row FP8 scale 并写入 safetensors（新增 `weight_fp8_scale` tensor）。环境变量关闭则跳过 |
-| `benchmark/soar/demo_sala/prepare_env.sh` | 追加 `export SOAR_W4A8_FP8_GEMM=1` 与 `pip install tensorrt-llm-blackwell-min==<version>`（具体 wheel 名第 1 步确定后填入） |
+| `benchmark/soar/demo_sala/preprocess_model.py` | GPTQ 量化后，把 INT4 反量化到 BF16，再做 128×128 block FP8 e4m3 量化，存为 `weight_fp8` + `weight_fp8_scale`。环境变量关闭则跳过 |
+| `benchmark/soar/demo_sala/prepare_env.sh` | 追加 `export SOAR_W4A8_FP8_GEMM=1`。**不新增 pip install** — 直接用我们已经打包的 sgl-kernel wheel |
 
 ### 4.2 不需改动
 
@@ -62,25 +62,29 @@
 ## 5. 详细实施计划（改动前 — 供 review）
 
 ```
-Step 1: 验证 fcloud 上 TRT-LLM wheel 可用
-   └─ ssh fcloud → pip install tensorrt-llm... (仅测试，不提交)
-   └─ python -c "import torch; torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell"
-   └─ 报告 wheel 大小 + 启动 import 开销
-   └─ 不可用则放弃此 iteration，回退到 Option B (sgl-kernel 内置)
+Step 1: 找到 sgl-kernel FP8 blockwise op + 确认 SM120 dispatch
+   └─ 在 sgl-kernel 中 grep `fp8_blockwise_scaled_mm` 与 `sm120_fp8_blockwise_dispatch_shape`
+   └─ 确认 op 签名：weight (K,N) FP8 e4m3 列主序 + 每 128x128 block scale
+   └─ 确认激活契约：per-token 或 per-128 动态 FP8 量化
+   └─ 不需要 fcloud — sgl-kernel 已在我们构建管线里
 
-Step 2: 写 scale 转换工具 (preprocess_model.py)
-   └─ 对每个有 .qweight + .scales (group=128, BF16) 的 linear:
-        per_row_max = scales.float().amax(dim=group_dim)
-        per_row_fp8_scale = per_row_max / 448.0
-        weight_fp8_scale = per_row_fp8_scale (per output row)
-   └─ 单元测试：用原 BF16 scale 与新 FP8 scale 各反量化一次 INT4，Frobenius 差 < 1e-3。
+Step 2: 写 FP8-blockwise 权重转换 (preprocess_model.py)
+   └─ 对每个白名单 linear 层：
+        w_bf16 = gptq_dequantize(qweight, scales, qzeros, group_size=128)
+        每 128x128 block:
+            block_amax = block.abs().amax()
+            scale_b   = block_amax / 448.0
+            w_fp8_blk = (block / scale_b).clamp(-448, 448).to(torch.float8_e4m3fn)
+        保存 weight_fp8 (K,N 列主序) + weight_fp8_scale ((K/128, N/128) fp32)
+   └─ 单元测试：w_bf16_recovered = w_fp8.float() * scale_b_broadcast；与原 w_bf16 的 Frobenius 差 < 1e-3。
 
 Step 3: Linear forward 分支 (gptq_marlin.py)
-   └─ if SOAR_W4A8_FP8_GEMM and self.allow_fp8 and trtllm_available:
-          input_fp8, input_scale = quantize_per_token_fp8(input)
-          out = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-              input_fp8, self.weight_fp8, input_scale, self.weight_fp8_scale,
-              output_dtype=torch.bfloat16, use_tvm_ffi=True)
+   └─ if SOAR_W4A8_FP8_GEMM and self.allow_fp8 and sgl_kernel_fp8_available:
+          input_fp8, input_scale = per_token_fp8_quantize(input)   # 也来自 sgl-kernel
+          out = sgl_kernel.fp8_blockwise_scaled_mm(
+              input_fp8, self.weight_fp8,
+              input_scale, self.weight_fp8_scale,
+              out_dtype=torch.bfloat16)
       else:
           out = existing_marlin_path(...)
 
@@ -110,7 +114,7 @@ python3 scripts/fcloud/fcloud_workflow.py speed --variant smax
 ```
 
 ### 运行时验证（CLARIFICATION 文档里的方法）
-- **V4 (必跑)**：`ncu --section ComputeWorkloadAnalysis ...` 现在应能在 GEMM kernel 上看到**非零的 `sm__inst_executed_pipe_tensor_op_qmma`**。这是最关键的运行时信号——若依然为 0，就说明并未真正用上 FP8 硬件。
+- **V4 (必跑)**：`ncu --section ComputeWorkloadAnalysis ...` 现在应能在新的 `fp8_blockwise_scaled_mm` kernel 上看到**非零的 `sm__inst_executed_pipe_tensor_op_qmma`**。这是最关键的运行时信号——若依然为 0，就说明并未真正用上 FP8 硬件。
 - **V1 (便宜)**：确认白名单层加载了 `weight_fp8` 与 `weight_fp8_scale` tensor。
 
 ## 7. 预期结果（baseline vs 新）
@@ -155,17 +159,17 @@ unset SOAR_W4A8_FP8_GEMM   # 在 prepare_env.sh 里
 
 测试通过后，以上各自单独立项。
 
-## 10. 批准合约 — 改代码前请确认
+## 10. 批准记录（2026-04-27 已落实）
 
-请确认或修订：
+| # | 项目 | 用户决议 |
+|---|---|---|
+| 1 | 范围：v1 仅限标准注意力 + MLP | ✅ 同意 |
+| 2 | 路径选择（Option A TRT-LLM wheel vs Option B sgl-kernel 内置） | ✅ **选 Option B** — 担忧：额外 wheel 可能破坏既有依赖且增加 2 GB 提交包体积 |
+| 3 | 环境变量 gate `SOAR_W4A8_FP8_GEMM=1`，默认关闭 | ✅ 同意 |
+| 4 | 精度保险：跌破 79 % 即硬中止 | ⚠️ 修订为软保险。要结合实测速度提升一起判断。硬底线仍是 97 % 规则 (C=0) |
+| 5 | Step 1 = 验证 TRT-LLM wheel | ❌ 跳过 — Option B 用 sgl-kernel 内置 op，无需 wheel |
 
-1. **范围**：是否同意 v1 仅限标准注意力 + MLP（lightning Q/K/V/O 仍 BF16）？（推荐）
-2. **路径选择**：TRT-LLM wheel (Option A，低工作量) 还是 sgl-kernel 内置 `fp8_blockwise_scaled_mm` (Option B，无额外 wheel)？（推荐 A）
-3. **环境变量 gate**：`SOAR_W4A8_FP8_GEMM=1` 启用，验证前默认关闭？（推荐）
-4. **精度保险**：本地 public set 归一化精度跌破 79 % 即终止？（推荐）
-5. **先做 Step 1**：在改本仓库代码之前，先在 fcloud 上验证 TRT-LLM wheel 可装？（推荐）
-
-确认（或修订）后，计划是**仅执行 Step 1**，把 wheel 可用性结果汇报回来，再继续。
+**实施顺序更新**：跳过 wheel 验证。从 Step 1（确认 sgl-kernel op 签名）开始，依次走完 Step 4。
 
 ## 11. 交叉引用
 
@@ -174,3 +178,42 @@ unset SOAR_W4A8_FP8_GEMM   # 在 prepare_env.sh 里
 - `PROPOSAL_fp8_w4_dequant_gemm.md` — 原 Phase-1 TRT-LLM 调研 (kernel API、scale 转换草图)
 - `PROPOSAL_option_b_fp8_blockwise_gemm.en.md` — Fallback (无额外 wheel) 用 sgl-kernel
 - `ANALYSIS_nvfp4_offline_quant_20260427_0857.{en,zh}.md` — 解释为什么本步**不**走 FP4 权重
+
+---
+
+## 12. Step 1 调研结果 (2026-04-27)
+
+按计划调研 sgl-kernel + sglang 的 FP8 栈，发现**upstream sglang 里集成已经大部分完成**：
+
+| 发现 | 位置 | 含义 |
+|---|---|---|
+| SM120 上 `fp8_blockwise_scaled_mm` op 已存在 | `sgl-kernel/csrc/gemm/fp8_blockwise_gemm_kernel.cu:368, 453`（经 `sm120_fp8_blockwise_dispatch_shape` 分发） | 不需写 kernel；我们的构建里已打进 wheel |
+| op 签名 | `(a: (M,K) e4m3 行主序, b: (N,K) e4m3 调用 .t() 后为列主序, scales_a: (M, K/128) fp32, scales_b: (N/128, K/128) fp32, out_dtype) -> bf16/fp16` | 激活 = per-token 且沿 K 分 128 一组 |
+| 已有高层包装 | `python/sglang/srt/layers/quantization/fp8_utils.py:342` `cutlass_w8a8_block_fp8_linear_with_fallback` | 已经做了 `per_token_group_quant_fp8(input, 128) → fp8_blockwise_scaled_mm(q_input, weight.T, x_scale, weight_scale.T)`。**可直接调用**。 |
+| 激活量化 op | `sglang_per_token_group_quant_fp8`（来自 `sglang.srt.layers.quantization.fp8_kernel` 的 Triton kernel） | FP8 path 已在用，不需写 |
+| 分支 gate 点 | `python/sglang/srt/layers/quantization/gptq.py:787` `GPTQMarlinLinearMethod.apply()` | 单一函数，一个 if/else 即可 |
+
+**含义**：本迭代的运行时部分 ≈ 30 行分支代码 + 在权重 post-processing 里一次性设一个 `weight_fp8` 属性。大头在 `preprocess_model.py`（离线转换）。
+
+**运行时分支草图**（取代 §5 Step 3）：
+
+```python
+# GPTQMarlinLinearMethod.apply() 内
+if (
+    os.environ.get("SOAR_W4A8_FP8_GEMM") == "1"
+    and getattr(layer, "_soar_w4a8_eligible", False)
+    and hasattr(layer, "weight_fp8")
+):
+    return cutlass_w8a8_block_fp8_linear_with_fallback(
+        input=x,
+        weight=layer.weight_fp8,            # (N, K) e4m3
+        block_size=[128, 128],
+        weight_scale=layer.weight_fp8_scale,  # (N/128, K/128) fp32
+        bias=bias,
+    )
+# 否则：原 Marlin path（不变）
+```
+
+**`_soar_w4a8_eligible`** 是在 `minicpm.py` 构造时设的白名单标签 — 仅限 std-attn QKV/O + MLP gate/up/down。
+
+**下一步（等用户发令）**：实施 Step 2 — `preprocess_model.py` 中从 GPTQ INT4 权重产生 `weight_fp8` + `weight_fp8_scale`。之后 Step 3 (gptq.py 分支) 与 Step 4 (minicpm.py 白名单标签) 都是轻量改动。

@@ -1,7 +1,7 @@
 # PROPOSAL — Iteration W4A8 (#1): FP8 in-kernel GEMM via TRT-LLM (post-v18 baseline)
 
-**Date**: 2026-04-27 09:05
-**Status**: ⏳ AWAITING USER APPROVAL — no code change yet
+**Date**: 2026-04-27 09:05  
+**Status**: ✅ APPROVED 2026-04-27 with amendments (Option B chosen, no TRT-LLM wheel, soft accuracy guardrail) — implementation can start
 **Priority**: #1 in the post-v18 optimization list
 **Baseline (v18-revert, Test 25-equivalent)**: S1=110.51s, S8=40.46s, Smax=33.61s, normalized accuracy 77.44 % → C=0.92
 **Predecessors**: `PROPOSAL_fp8_w4_dequant_gemm.md` (Phase 1 investigation, 2026-04-21), `PROPOSAL_option_b_fp8_blockwise_gemm.en.md` (sgl-kernel-internal alternative).
@@ -39,7 +39,7 @@ This is "**W4A8**": W = 4-bit storage, A = 8-bit activations, with FP8 multiply-
 3. **TRT-LLM wheel compatibility on fcloud**: Need to verify pip-install on the SM120 environment in step 1 of execution.
 4. **Scale conversion correctness**: GPTQ group_size=128 BF16 scales must be folded into per-row FP8 scales. Mitigation: write unit test comparing dequantized weights pre- and post-conversion (Frobenius diff < 1e-3).
 
-**Watchpoint**: re-run accuracy on `perf_public_set.jsonl` immediately after enabling. If normalized accuracy drops below 79 % (current 77.44 % v18 + ~1.5 % safety), gate FP8 off via env var and treat as failure.
+**Watchpoint**: re-run accuracy on `perf_public_set.jsonl` immediately after enabling. If normalized accuracy drops below 79 % (current 77.44 % v18 + ~1.5 % safety), do NOT auto-abort: weigh the accuracy delta against the measured speed gains and decide jointly with the user whether to keep, tune, or revert. Hard floor remains the 97 % rule (C=0); we never knowingly cross that.
 
 ## 4. Files to change
 
@@ -47,10 +47,10 @@ This is "**W4A8**": W = 4-bit storage, A = 8-bit activations, with FP8 multiply-
 
 | File | Change |
 |---|---|
-| `python/sglang/srt/layers/quantization/gptq_marlin.py` | Add forward-path branch: if `os.environ.get("SOAR_W4A8_FP8_GEMM") == "1"` AND TRT-LLM available AND layer is in eligible set (std-attn QKV/O + MLP gate/up/down) → call TRT-LLM kernel; else → existing Marlin path |
+| `python/sglang/srt/layers/quantization/gptq_marlin.py` | Add forward-path branch: if `os.environ.get("SOAR_W4A8_FP8_GEMM") == "1"` AND `sgl_kernel.fp8_blockwise_scaled_mm` is importable AND layer is in eligible set (std-attn QKV/O + MLP gate/up/down) → call sgl-kernel FP8 blockwise GEMM; else → existing Marlin path |
 | `python/sglang/srt/models/minicpm.py` | Tag eligible layers at construction (an attribute the linear forward checks) — exclude lightning Q/K/V/O for safety in v1 |
-| `benchmark/soar/demo_sala/preprocess_model.py` | After GPTQ quantization, fold per-group BF16 scales into per-row FP8 scales and save alongside `.qweight`. Add `weight_fp8_scale` tensors to safetensors. Skipped if env flag off. |
-| `benchmark/soar/demo_sala/prepare_env.sh` | Append `export SOAR_W4A8_FP8_GEMM=1` and `pip install tensorrt-llm-blackwell-min==<version>` (or whatever wheel name we settle on after step 1) |
+| `benchmark/soar/demo_sala/preprocess_model.py` | After GPTQ quantization, dequantize INT4 → BF16 once, then re-quantize to FP8 e4m3 with 128×128 block-scale and save as `weight_fp8` + `weight_fp8_scale`. Skipped if env flag off |
+| `benchmark/soar/demo_sala/prepare_env.sh` | Append `export SOAR_W4A8_FP8_GEMM=1`. **No new pip install** — reusing the sgl-kernel wheel we already ship |
 
 ### 4.2 No change required
 
@@ -62,25 +62,29 @@ This is "**W4A8**": W = 4-bit storage, A = 8-bit activations, with FP8 multiply-
 ## 5. Detailed implementation plan (before change — for review)
 
 ```
-Step 1: Verify TRT-LLM wheel availability on fcloud
-   └─ ssh fcloud → pip install tensorrt-llm... (test only, no commit)
-   └─ python -c "import torch; torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell"
-   └─ Report wheel size and import-time overhead
-   └─ If unavailable, abort this iteration and fall back to Option B (sgl-kernel internal)
+Step 1: Locate the sgl-kernel FP8 blockwise op + confirm SM120 dispatch
+   └─ grep sgl-kernel for `fp8_blockwise_scaled_mm` and `sm120_fp8_blockwise_dispatch_shape`
+   └─ Confirm op signature: weight (K,N) FP8 e4m3 col-major + per-128x128 block scales
+   └─ Confirm activation contract: per-token or per-128 dynamic FP8 quantize
+   └─ No fcloud step needed — sgl-kernel is already in our build pipeline
 
-Step 2: Write scale-conversion utility (preprocess_model.py)
-   └─ For each linear layer with .qweight + .scales (group=128, BF16):
-        per_row_max = scales.float().amax(dim=group_dim)
-        per_row_fp8_scale = per_row_max / 448.0
-        weight_fp8_scale = per_row_fp8_scale (per output row)
-   └─ Unit test: dequantize INT4 with original BF16 scale, then with new FP8 scale; Frobenius diff < 1e-3.
+Step 2: Write FP8-blockwise weight conversion (preprocess_model.py)
+   └─ For each whitelisted linear layer:
+        w_bf16 = gptq_dequantize(qweight, scales, qzeros, group_size=128)
+        per 128x128 block of w_bf16:
+            block_amax = block.abs().amax()
+            scale_b   = block_amax / 448.0
+            w_fp8_blk = (block / scale_b).clamp(-448, 448).to(torch.float8_e4m3fn)
+        save weight_fp8 (K,N col-major) + weight_fp8_scale ((K/128, N/128) fp32)
+   └─ Unit test: w_bf16_recovered = w_fp8.float() * scale_b_broadcast; Frobenius diff < 1e-3 vs original w_bf16.
 
 Step 3: Linear forward branch (gptq_marlin.py)
-   └─ if SOAR_W4A8_FP8_GEMM and self.allow_fp8 and trtllm_available:
-          input_fp8, input_scale = quantize_per_token_fp8(input)
-          out = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-              input_fp8, self.weight_fp8, input_scale, self.weight_fp8_scale,
-              output_dtype=torch.bfloat16, use_tvm_ffi=True)
+   └─ if SOAR_W4A8_FP8_GEMM and self.allow_fp8 and sgl_kernel_fp8_available:
+          input_fp8, input_scale = per_token_fp8_quantize(input)   # also from sgl-kernel
+          out = sgl_kernel.fp8_blockwise_scaled_mm(
+              input_fp8, self.weight_fp8,
+              input_scale, self.weight_fp8_scale,
+              out_dtype=torch.bfloat16)
       else:
           out = existing_marlin_path(...)
 
@@ -110,7 +114,7 @@ python3 scripts/fcloud/fcloud_workflow.py speed --variant smax
 ```
 
 ### Runtime verification (from CLARIFICATION doc)
-- **V4 (must)**: `ncu --section ComputeWorkloadAnalysis ... ` should now show **non-zero `sm__inst_executed_pipe_tensor_op_qmma`** on the GEMM kernels. This is the single most important runtime signal — without it, we are not actually using FP8 hardware.
+- **V4 (must)**: `ncu --section ComputeWorkloadAnalysis ... ` should now show **non-zero `sm__inst_executed_pipe_tensor_op_qmma`** on the new `fp8_blockwise_scaled_mm` kernel. This is the single most important runtime signal — without it, we are not actually using FP8 hardware.
 - **V1 (cheap)**: Confirm `weight_fp8` and `weight_fp8_scale` tensors loaded for whitelisted layers.
 
 ## 7. Expected results (baseline vs new)
@@ -155,17 +159,17 @@ It does NOT include:
 
 If tests pass, those follow as separate iterations.
 
-## 10. Approval contract — to be answered before code edits
+## 10. Approval record (resolved 2026-04-27)
 
-Please confirm or amend:
+| # | Item | User decision |
+|---|---|---|
+| 1 | Scope: v1 limited to std-attn + MLP only | ✅ Approved |
+| 2 | Path choice (Option A TRT-LLM wheel vs Option B sgl-kernel built-in) | ✅ **Option B chosen** — concern: extra wheel risks dependency conflicts and inflates 2 GB submission package |
+| 3 | Env-flag gate `SOAR_W4A8_FP8_GEMM=1`, default off | ✅ Approved |
+| 4 | Accuracy guardrail: hard-abort below 79 % normalized | ⚠️ Amended — soft guardrail. Decide based on observed speed/accuracy trade-off. Hard floor stays the 97 % rule (C=0) |
+| 5 | Step 1 = verify TRT-LLM wheel | ❌ Skipped — Option B uses sgl-kernel built-in op, no wheel needed |
 
-1. **Scope**: agree to limit v1 to std-attn + MLP only (lightning Q/K/V/O stays BF16)? (recommended)
-2. **Path choice**: TRT-LLM wheel (Option A, low effort) vs sgl-kernel-internal `fp8_blockwise_scaled_mm` (Option B, no extra wheel)? (recommended A)
-3. **Env-flag gate**: `SOAR_W4A8_FP8_GEMM=1` to enable, default off until validated? (recommended)
-4. **Accuracy guardrail**: abort if normalized accuracy drops below 79 % on local public set? (recommended)
-5. **Step 1 first**: verify TRT-LLM wheel installs on fcloud before any code change in this repo? (recommended)
-
-Once you approve (or amend) these, the plan is to start with **Step 1 only** and report back the wheel-availability result before continuing.
+**Implementation order updated**: skip the wheel-verification step. Begin at Step 1 (locate the sgl-kernel op signature) and proceed sequentially through Step 4.
 
 ## 11. Cross-reference
 
@@ -174,3 +178,42 @@ Once you approve (or amend) these, the plan is to start with **Step 1 only** and
 - `PROPOSAL_fp8_w4_dequant_gemm.md` — original Phase-1 TRT-LLM investigation (kernel API, scale conversion sketch)
 - `PROPOSAL_option_b_fp8_blockwise_gemm.en.md` — fallback (no extra wheel) using sgl-kernel
 - `ANALYSIS_nvfp4_offline_quant_20260427_0857.{en,zh}.md` — explains why we are NOT going to FP4 weights at this step
+
+---
+
+## 12. Step 1 findings (2026-04-27)
+
+Reconnaissance of the sgl-kernel + sglang FP8 stack revealed that **most of the integration is already wired in upstream sglang**:
+
+| Discovery | Location | Implication |
+|---|---|---|
+| `fp8_blockwise_scaled_mm` op confirmed for SM120 | `sgl-kernel/csrc/gemm/fp8_blockwise_gemm_kernel.cu:368, 453` (SM120 dispatch via `sm120_fp8_blockwise_dispatch_shape`) | No kernel writing needed; we ship this in our build |
+| Op signature | `(a: (M,K) e4m3 row-major, b: (N,K) e4m3 col-major after .t(), scales_a: (M, K/128) fp32, scales_b: (N/128, K/128) fp32, out_dtype) -> bf16/fp16` | Activation = per-token + per-128-K groups |
+| Existing high-level wrapper | `python/sglang/srt/layers/quantization/fp8_utils.py:342` `cutlass_w8a8_block_fp8_linear_with_fallback` | Already does `per_token_group_quant_fp8(input, 128) → fp8_blockwise_scaled_mm(q_input, weight.T, x_scale, weight_scale.T)`. **We can call this directly.** |
+| Activation quantize op | `sglang_per_token_group_quant_fp8` (Triton kernel from `sglang.srt.layers.quantization.fp8_kernel`) | Already used by FP8 paths. No new kernel needed. |
+| Gate point for the branch | `python/sglang/srt/layers/quantization/gptq.py:787` `GPTQMarlinLinearMethod.apply()` | Single function, one if/else. |
+
+**Implication**: the runtime side of this iteration is ~30 lines of dispatch in `gptq.py` + a one-shot `weight_fp8` attribute set during weight post-processing. The bulk of the work is in `preprocess_model.py` (offline conversion).
+
+**Updated runtime branch sketch** (replaces what's in §5 Step 3):
+
+```python
+# Inside GPTQMarlinLinearMethod.apply()
+if (
+    os.environ.get("SOAR_W4A8_FP8_GEMM") == "1"
+    and getattr(layer, "_soar_w4a8_eligible", False)
+    and hasattr(layer, "weight_fp8")
+):
+    return cutlass_w8a8_block_fp8_linear_with_fallback(
+        input=x,
+        weight=layer.weight_fp8,            # (N, K) e4m3
+        block_size=[128, 128],
+        weight_scale=layer.weight_fp8_scale,  # (N/128, K/128) fp32
+        bias=bias,
+    )
+# else: original Marlin path below (unchanged)
+```
+
+**`_soar_w4a8_eligible`** is the whitelist tag set in `minicpm.py` model construction — std-attn QKV/O + MLP gate/up/down only.
+
+**Next step (pending user go-ahead)**: implement Step 2 — the preprocess_model.py conversion that produces `weight_fp8` + `weight_fp8_scale` from GPTQ INT4 weights. After that, Step 3 (the gptq.py dispatch above) and Step 4 (whitelist tag in minicpm.py) are straightforward.
