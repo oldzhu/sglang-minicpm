@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
@@ -694,6 +695,11 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         device = getattr(layer, "qweight").device
         c = self.kernel_config
 
+        # SOAR W4A8 #1: pre-compute FP8 blockwise weights from the original
+        # GPTQ INT4 representation BEFORE the in-place Marlin format transform.
+        # See docs/soar_2026_changes/PROPOSAL_iteration_W4A8_001.{en,zh}.md.
+        self._soar_maybe_setup_w4a8_fp8(layer)
+
         check_marlin_supports_shape(
             c.partition_weight_shape[1],  # out_features
             c.partition_weight_shape[0],  # in_features
@@ -784,6 +790,84 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         _transform_param(layer, self.w_q_name, transform_w_q)
         _transform_param(layer, self.w_s_name, transform_w_s)
 
+    # ------------------------------------------------------------------
+    # SOAR W4A8 #1 helpers
+    # ------------------------------------------------------------------
+    def _soar_maybe_setup_w4a8_fp8(self, layer: torch.nn.Module) -> None:
+        """Optionally cache FP8 blockwise weights for the W4A8 fast path.
+
+        Activates only when ALL of the following hold:
+        - ``SOAR_W4A8_FP8_GEMM=1`` is set in the environment.
+        - ``layer._soar_w4a8_eligible`` is ``True`` (set by ``minicpm.py`` on
+          standard-attention QKV/O and MLP linears only).
+        - The Marlin kernel config matches our supported recipe: 4-bit,
+          ``group_size=128``, ``desc_act=False``.
+        - Both partitioned dims are multiples of 128 (cutlass blockwise FP8
+          GEMM requirement).
+
+        On any failure the helper logs and returns silently; the standard
+        Marlin path remains in place.
+        """
+        if os.environ.get("SOAR_W4A8_FP8_GEMM") != "1":
+            return
+        if not getattr(layer, "_soar_w4a8_eligible", False):
+            return
+
+        c = self.kernel_config
+        if c.weight_type.size_bits != 4:
+            return
+        if c.group_size != 128:
+            return
+        if c.has_g_idx:
+            return
+
+        in_features, out_features = c.partition_weight_shape
+        if in_features % 128 != 0 or out_features % 128 != 0:
+            return
+
+        try:
+            from sglang.srt.layers.quantization.utils_w4a8_fp8 import (
+                fp8_blockwise_quantize,
+                gptq_int4_dequantize,
+            )
+
+            qweight = layer.qweight.data
+            qzeros = layer.qzeros.data
+            scales = layer.scales.data
+            # (K, N) in scales.dtype (BF16 typically).
+            w_kn = gptq_int4_dequantize(
+                qweight, qzeros, scales, group_size=c.group_size
+            )
+            # cutlass_w8a8_block_fp8_linear_with_fallback expects
+            # weight in (N, K) layout.
+            w_nk = w_kn.t().contiguous()
+            w_fp8, w_fp8_scale = fp8_blockwise_quantize(w_nk, block_size=128)
+
+            device = qweight.device
+            layer.register_buffer(
+                "weight_fp8", w_fp8.to(device=device), persistent=False
+            )
+            layer.register_buffer(
+                "weight_fp8_scale",
+                w_fp8_scale.to(device=device),
+                persistent=False,
+            )
+            layer._soar_w4a8_active = True
+            logger.info(
+                "[SOAR W4A8] enabled FP8 blockwise GEMM for layer prefix=%s "
+                "shape=(N=%d, K=%d)",
+                getattr(layer, "prefix", "?"),
+                out_features,
+                in_features,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            layer._soar_w4a8_active = False
+            logger.warning(
+                "[SOAR W4A8] disabled for layer prefix=%s: %s",
+                getattr(layer, "prefix", "?"),
+                exc,
+            )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -791,6 +875,29 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         c = self.kernel_config
+
+        # SOAR W4A8 #1: dispatch to FP8 blockwise GEMM when the cached
+        # FP8 weights are present. Falls back to Marlin path on any error.
+        if getattr(layer, "_soar_w4a8_active", False):
+            try:
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    cutlass_w8a8_block_fp8_linear_with_fallback,
+                )
+                return cutlass_w8a8_block_fp8_linear_with_fallback(
+                    input=x,
+                    weight=layer.weight_fp8,
+                    block_size=[128, 128],
+                    weight_scale=layer.weight_fp8_scale,
+                    input_scale=None,
+                    bias=bias,
+                )
+            except Exception as exc:  # pragma: no cover - defensive guard
+                layer._soar_w4a8_active = False
+                logger.warning(
+                    "[SOAR W4A8] FP8 GEMM raised, reverting layer prefix=%s: %s",
+                    getattr(layer, "prefix", "?"),
+                    exc,
+                )
 
         def _get_weight_params(
             layer: torch.nn.Module,

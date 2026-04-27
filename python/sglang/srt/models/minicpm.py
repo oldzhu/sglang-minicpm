@@ -153,6 +153,10 @@ class MiniCPMMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
         )
+        # SOAR W4A8 #1: tag MLP linears as eligible for FP8 blockwise GEMM.
+        # See docs/soar_2026_changes/PROPOSAL_iteration_W4A8_001.{en,zh}.md.
+        self.gate_up_proj._soar_w4a8_eligible = True
+        self.down_proj._soar_w4a8_eligible = True
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -223,6 +227,13 @@ class MiniCPMAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
+
+        # SOAR W4A8 #1: tag std-attn linears as eligible for FP8 blockwise GEMM.
+        # Lightning-attn uses a separate class (MiniCPMLightningMixer) and is
+        # intentionally not tagged so it stays on the BF16 Marlin path.
+        # See docs/soar_2026_changes/PROPOSAL_iteration_W4A8_001.{en,zh}.md.
+        self.qkv_proj._soar_w4a8_eligible = True
+        self.o_proj._soar_w4a8_eligible = True
 
         if self.attn_use_rope:
             self.rotary_emb = get_rope(

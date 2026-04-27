@@ -129,6 +129,13 @@ export SGLANG_MINICPM_LIGHTNING_FAST_OUTPUT_GATE="${SGLANG_MINICPM_LIGHTNING_FAS
 export SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD="${SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD:-128}"
 export SGLANG_FLA_CHUNK_SIZE="${SGLANG_FLA_CHUNK_SIZE:-64}"
 
+# SOAR W4A8 #1: opt-in switch to route std-attn QKV/O + MLP linears through
+# the cutlass FP8 blockwise GEMM (SM120 QMMA, 296 TF) instead of BF16 Marlin
+# (148 TF). Lightning attention stays on the BF16 Marlin path. Default off
+# so the baseline build is unchanged. See
+# docs/soar_2026_changes/PROPOSAL_iteration_W4A8_001.{en,zh}.md.
+export SOAR_W4A8_FP8_GEMM="${SOAR_W4A8_FP8_GEMM:-0}"
+
 if [[ "$QUANT_MODE" == "gptq" ]]; then
 	FUSED_QK_NORM_ROPE_ARG=""
 	if [[ "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "1" || "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "true" || "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "TRUE" ]]; then
@@ -170,5 +177,6 @@ echo "[prepare_env] SGLANG_MINICPM_LIGHTNING_FAST_STATE_IO=${SGLANG_MINICPM_LIGH
 echo "[prepare_env] SGLANG_MINICPM_LIGHTNING_FAST_OUTPUT_GATE=${SGLANG_MINICPM_LIGHTNING_FAST_OUTPUT_GATE}"
 echo "[prepare_env] SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD=${SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD}"
 echo "[prepare_env] SGLANG_FLA_CHUNK_SIZE=${SGLANG_FLA_CHUNK_SIZE}"
+echo "[prepare_env] SOAR_W4A8_FP8_GEMM=${SOAR_W4A8_FP8_GEMM}"
 echo "[prepare_env] SGLANG_SERVER_ARGS=${SGLANG_SERVER_ARGS}"
 echo "[prepare_env] done"
