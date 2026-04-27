@@ -1,8 +1,19 @@
 # CHANGE_W4A8_001 — Iteration 002: Validation Results & Decision
 
-**Status: ABANDONED** — net speed regression on all concurrency tiers; keep `SOAR_W4A8_FP8_GEMM=0` (default).
+**Status: this specific path ABANDONED. True W4A8 NOT YET TESTED.**
 
-Companion to `CHANGE_W4A8_001_iteration_001.en.md` (implementation). This document records the fcloud validation results for the load-time GPTQ INT4 → FP8 blockwise GEMM path and the decision to abandon this optimization vector.
+> **CRITICAL MISLABEL NOTICE (added 2026-04-27 post-hoc):**
+>
+> What was actually implemented and tested in commit `7ce21c3f5` is **W8A8 FP8 blockwise**, NOT W4A8.
+> The code dequantizes GPTQ INT4 weights to BF16 at load time and then re-quantizes them to **FP8 (8-bit) storage**, so the runtime GEMM is FP8 weight × FP8 activation. The 4-bit bandwidth advantage of the original GPTQ INT4 weights was thrown away at load time.
+>
+> v18 baseline is **W4A16** (Marlin: 4-bit INT4 weight storage, BF16 in-register dequant, BF16 tensor cores at 148 TF). True W4A8 would keep INT4 storage AND use FP8 tensor cores at 296 TF, capturing both the 2× bandwidth win (vs FP8 weight) and the 2× compute win (vs BF16 MMA).
+>
+> The +118%/+56%/+30% S1/S8/Smax regressions documented below are the **predictable** result of doubling the weight memory footprint while running on a memory-bandwidth-bound workload (decode bs=1). They do **not** invalidate the real W4A8 hypothesis.
+>
+> **Real W4A8 (e.g., QQQ-style W4-INT8 Marlin or W4A8-Machete) is a separate optimization vector and should be evaluated independently** — see proposal `PROPOSAL_W4A8_REAL_001.en.md`.
+
+Companion to `CHANGE_W4A8_001_iteration_001.en.md` (implementation). This document records the fcloud validation results for the load-time GPTQ INT4 → FP8 blockwise GEMM path (mislabeled as W4A8) and the decision to abandon this specific implementation.
 
 ## Test setup
 
@@ -71,11 +82,12 @@ Why cutlass `fp8_blockwise_scaled_mm` lost to Marlin INT4 on every tier:
 
 This matches the SM120 hardware reference (`docs/soar_2026_changes/SM120_RTX_PRO_HARDWARE.md`): FP8 wins only when M is large enough that arithmetic intensity exceeds the bandwidth roofline crossover.
 
-## Decision: ABANDON W4A8 #1
+## Decision: ABANDON this specific path (W8A8 FP8 blockwise via cutlass), NOT the W4A8 hypothesis
 
 - Keep `SOAR_W4A8_FP8_GEMM=0` (the repo default).
 - Do **not** ship this path in any submission package.
-- Do **not** make it default-on under any heuristic — there is no observed regime where it wins on this model + this dataset + this hardware.
+- The flag and code remain env-gated for reuse of the dequant/quant utilities.
+- **The W4A8 hypothesis is NOT refuted by this experiment** — we tested W8A8 FP8, not W4A8. Real W4A8 (INT4 storage + FP8 MMA) requires a different kernel (QQQ-style W4-INT8 Marlin, W4A8-Machete, or custom CUTLASS mixed-input GEMM) and should be evaluated in a separate iteration.
 
 ## What is kept in the tree
 
@@ -119,12 +131,15 @@ git revert 7ce21c3f5
 
 ## Next steps
 
-1. **Move on**: pick the next item from `OPTIMIZATION_CATALOG_GPTQ_FP8_DENSE.md`. Candidates whose theoretical ceiling is **memory-bandwidth-bound or kernel-fusion-bound** rather than tensor-core-bound:
+1. **Real W4A8 evaluation** — see `PROPOSAL_W4A8_REAL_001.en.md`. Three candidate kernels:
+   - **QQQ-style W4-INT8 Marlin**: keeps INT4 weight, INT8 activation, INT8 tensor cores (296 TF on SM120). Mature open-source kernel.
+   - **W4A8-Machete (vllm/compressed-tensors)**: Hopper-first; SM120 backport effort unknown.
+   - **Custom CUTLASS mixed-input GEMM**: highest effort, full bring-up.
+2. **Other directions in parallel** (memory-bandwidth-bound or kernel-fusion-bound vectors that benefit decode):
    - Marlin INT4 SM120 tile retuning (lower per-call overhead)
    - QKV / O fusion with attention output projection
    - `fused_qk_norm_rope` variants
    - speculative decoding (lower M but more useful tokens per step)
-2. **Do NOT** revisit FP8 GEMM for this model unless we find a regime with M ≥ 512 sustained AND we have a kernel that reads weights once across multiple M-tiles (e.g., grouped-GEMM with prefix sharing).
 3. The companion ZH document is `CHANGE_W4A8_001_iteration_002.zh.md`.
 
 ## Files touched in this iteration

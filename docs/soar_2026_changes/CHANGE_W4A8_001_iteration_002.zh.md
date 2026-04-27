@@ -1,8 +1,19 @@
 # CHANGE_W4A8_001 — 第 002 轮迭代：验证结果与决策
 
-**状态：放弃** — 在所有并发档位上均出现速度净回退；保持 `SOAR_W4A8_FP8_GEMM=0`（默认）。
+**状态：本具体路径放弃。真正的 W4A8 尚未测试。**
 
-本文与 `CHANGE_W4A8_001_iteration_001.zh.md`（实现说明）配套。本文记录"加载期 GPTQ INT4 → FP8 块缩放 GEMM"路径的 fcloud 验证结果及放弃该优化方向的决定。
+> **关键命名错误更正（2026-04-27 事后补充）：**
+>
+> commit `7ce21c3f5` 实际实现并测试的是 **W8A8 FP8 blockwise**，**不是** W4A8。
+> 代码在加载期将 GPTQ INT4 权重反量化到 BF16，然后再量化为 **FP8（8 位）存储**，因此运行时 GEMM 是 FP8 权重 × FP8 激活。原 GPTQ INT4 权重的 4 位带宽优势在加载期就被丢掉了。
+>
+> v18 基线是 **W4A16**（Marlin：4 位 INT4 权重存储，寄存器内反量化到 BF16，BF16 张量核 148 TF）。真正的 W4A8 应当**同时保留 INT4 存储并使用 FP8 张量核 296 TF**，从而同时拿到 2× 带宽优势（vs FP8 权重）和 2× 算力优势（vs BF16 MMA）。
+>
+> 下文记录的 S1/S8/Smax +118%/+56%/+30% 回退，是在内存带宽受限的工作负载（decode bs=1）下把权重内存占用翻倍的**必然结果**。它**并不**否定真正 W4A8 的假设。
+>
+> **真正的 W4A8（如 QQQ 风格的 W4-INT8 Marlin，或 W4A8-Machete）是一个独立的优化方向，应当单独评估** — 见提案 `PROPOSAL_W4A8_REAL_001.zh.md`。
+
+本文与 `CHANGE_W4A8_001_iteration_001.zh.md`（实现说明）配套。本文记录"加载期 GPTQ INT4 → FP8 块缩放 GEMM"路径（被误标为 W4A8）的 fcloud 验证结果及放弃该具体实现的决定。
 
 ## 测试设置
 
@@ -71,11 +82,12 @@
 
 这与 SM120 硬件参考（`docs/soar_2026_changes/SM120_RTX_PRO_HARDWARE.md`）一致：FP8 只有在 M 大到算术强度跨过带宽 roofline 拐点之后才会赢。
 
-## 决策：放弃 W4A8 #1
+## 决策：放弃本具体路径（经 cutlass 的 W8A8 FP8 blockwise），但**不**反驳 W4A8 假设
 
 - 保持 `SOAR_W4A8_FP8_GEMM=0`（仓库默认值）。
 - **不**在任何提交包中携带此路径。
-- **不**在任何启发式条件下默认打开 — 在该模型 + 该数据集 + 该硬件上没有任何观察到的"赢"区间。
+- env flag 与代码保留，供反量化/量化工具函数复用。
+- **本实验并未反驳 W4A8 假设** — 我们测的是 W8A8 FP8，不是 W4A8。真正的 W4A8（INT4 存储 + FP8 MMA）需要不同的 kernel（QQQ 风格的 W4-INT8 Marlin、W4A8-Machete 或自定义 CUTLASS 混合输入 GEMM），应在独立的迭代中评估。
 
 ## 树中保留的内容
 
@@ -119,12 +131,15 @@ git revert 7ce21c3f5
 
 ## 下一步
 
-1. **继续向前**：从 `OPTIMIZATION_CATALOG_GPTQ_FP8_DENSE.md` 取下一项。优先选择**带宽受限或 kernel 融合受限**而非张量核心受限的方向：
-   - Marlin INT4 SM120 tile 重新调优（降低每次调用开销）
+1. **真正 W4A8 评估** — 见 `PROPOSAL_W4A8_REAL_001.zh.md`。三个候选 kernel：
+   - **QQQ 风格 W4-INT8 Marlin**：INT4 权重 + INT8 激活 + INT8 张量核（SM120 上 296 TF）。成熟开源 kernel。
+   - **W4A8-Machete（vllm/compressed-tensors）**：优先 Hopper；SM120 回移工作量未知。
+   - **自定义 CUTLASS 混合输入 GEMM**：最高成本，全量 bring-up。
+2. **同时推进其他方向**（股宝受限或 kernel 融合受限的向量，在 decode 上有收益）：
+   - Marlin INT4 SM120 tile 重调优（降低每次调用开销）
    - QKV / O 与 attention 输出投影融合
    - `fused_qk_norm_rope` 变体
    - 推测解码（小 M 但每步贡献更多有效 token）
-2. **不要**再针对此模型重做 FP8 GEMM，除非找到 M ≥ 512 持续区间且实现了"权重读一次跨多 M-tile 复用"的 kernel（如带前缀复用的 grouped-GEMM）。
 3. 英文配套文档 `CHANGE_W4A8_001_iteration_002.en.md`。
 
 ## 本轮触及文件
