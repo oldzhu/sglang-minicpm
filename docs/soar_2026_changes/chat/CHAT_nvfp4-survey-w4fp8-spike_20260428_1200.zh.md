@@ -275,3 +275,51 @@ W4A8 深度会话延续。
 - [model_config.py L238 / L248](../../../python/sglang/srt/configs/model_config.py#L238)
 - [minicpm.py L546-L590](../../../python/sglang/srt/models/minicpm.py#L546-L590)
 - [configs/minicpm.py L145-L167](../../../python/sglang/srt/configs/minicpm.py#L145-L167)
+
+---
+
+## 第 13d 轮结论 — sparse + FP8 KV 重测（2026-04-28 ~09:00 UTC fcloud）
+
+### 我们做了什么
+1. **在 fcloud 上检查 `MiniCPM-SALA-90-qa-cwe-mcq-sparse_qkv_w8/config.json`**：`mixer_types` = 8×`minicpm4` + 24×`lightning`（与用户预期一致）。但 `sparse_config: null` —— `preprocess_model.py` 已将其剥除，因为默认提交路径走 `--force-dense-minicpm`。
+2. **修补 quantized model 的 `config.json`** 恢复 `sparse_config`（kernel_size=32, kernel_stride=16, init_blocks=1, block_size=64, window_size=2048, topk=64, use_nope=False, dense_len=8192）—— `MiniCPMHybridReqToTokenPool` 必须要这个才会分配 `req_to_sparse_k1_token`。
+3. **`prepare_env.sh` 新增 `SOAR_SPARSE_MODE` 开关**（commit `85b52f3d2`）：`=1` 时从 `SGLANG_SERVER_ARGS` 中移除 `--force-dense-minicpm`。
+4. 第一次启动 server 崩溃：`AttributeError: 'HybridReqToTokenPool' object has no attribute 'req_to_sparse_k1_token'`，根因即第 2 步被剥除的 `sparse_config`。
+5. 第二次启动（修补 config 后）在 CUDA graph capture 阶段崩溃：`RuntimeError: Cannot call CUDAGeneratorImpl::current_seed during CUDA graph capture` —— torch.compile 与 sparse attention kernel 在 capture 时不兼容。
+6. **sparse 模式下移除 torch-compile**（commit `613ea54e4`）：`SOAR_SPARSE_MODE=1` ⇒ 去掉 `--enable-torch-compile --torch-compile-max-bs 8`。
+7. 第三次启动成功（35 秒就绪；KV 池 30.81 GB K + 30.81 GB V FP8 e5m2，mamba 1.17 GB，warmup 后剩余 12.92 GB）。
+8. **精度测试（concurrency 32）跑满 1 小时超时**，仅完成约 76/150 样本；样本 73 之后单条请求开始触发 harness 的 3000 s 读超时。tqdm 显示明显的延迟悬崖：
+
+   | 样本区间 | s/it |
+   |---|---|
+   |   0–10 | 5–13 |
+   |  20–30 | 18–37 |
+   |  31–34 | **115–325** ← 悬崖 |
+   |  35–55 | 25–55 |
+   |  73+   | 单条 3000 s 超时 |
+
+   长上下文样本（很可能是 niah / cwe 长输入）每条要 >50 分钟。已 kill。
+9. **按节省成本规则关闭 fcloud**。
+
+### 结论
+- **当前 HEAD 上 sparse + FP8 KV + GPTQ 不是可行的提交配置**。没有 torch.compile + CUDA graph，长上下文样本（niah / cwe，恰好是官评主导）路径慢得不可用。Test 8b 那个 2411 s "快"的精度评测耗时是误导 —— 那次跑的是 `--enable-torch-compile` 且很可能走的是已经 regression 的另一条 attention kernel 路径。
+- **30+ tokens 输出后的性能悬崖是主导信号**：不仅是"比 dense 慢"，而是长上下文请求慢约 20–50 倍。即便 mixed-precision KV 修复了精度，也救不了这么慢的 kernel 路径。
+- **CHANGE_0132 Option A（NVFP4 KV + sparse）依旧不可行** —— sparse 路径本身在当前 HEAD 上要么是 regression 要么就是设计缺陷，再叠 NVFP4 没意义。
+
+### 这一轮排除了什么
+- "冠军用 sparse + mixed KV"假说在我们当前 sglang 树上无法重现 —— 除非投入大量 kernel 工作（恢复历史上的 sparse+torch.compile 路径，或重写 sparse attention 让它 CUDA-graph-clean）。
+- 近期不再追 sparse 的其他变体（bf16 KV、mixed KV 等）。Dense GPTQ + FP8 KV + `--force-dense-minicpm` 仍是当前 HEAD 上**唯一**同时满足正确性 + 速度的配置。
+
+### 文件 / 提交
+- `benchmark/soar/demo_sala/prepare_env.sh`（commits `85b52f3d2`、`613ea54e4`）
+- 模型 config 在 fcloud 本地修补（未提交 —— 是模型文件；备份 `config.json.bak_no_sparse`）
+- TEST_RESULTS_TRACKING.md → Test 34（sparse 重测，INCOMPLETE / ABANDONED）
+
+### 交叉引用
+- [CHANGE_0132](../CHANGE_0132_nvfp4_kv_force_dense_compat.zh.md) §8 — Option A 不可行
+- [TEST_RESULTS_TRACKING.md](../TEST_RESULTS_TRACKING.md) Test 34
+- 历史 sparse 数据点：Test 8b（FP8 KV + sparse，76.07% acc，C=0），Test 9（bf16 KV + sparse，79.67% acc，C=1.0）
+
+### 后续（搁置）
+- 留在 dense 提交基线（v18）。在 dense 路径**内部**找加速（force-dense 下的 NVFP4 KV、kernel 融合、scheduler 调优）。
+- 如果将来再回头看 sparse，先要：(a) git-bisect 在 `9d3ecd168` 与当前 HEAD 之间找到 `req_to_sparse_k1_token` 分配的 regression 提交；(b) 修 torch.compile + sparse-attention 的 CUDA-graph 不兼容；(c) 然后才重跑精度。

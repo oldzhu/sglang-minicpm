@@ -275,3 +275,51 @@ User wants to **retest GPTQ + FP8 KV + sparse**:
 - [model_config.py L238 / L248](../../../python/sglang/srt/configs/model_config.py#L238)
 - [minicpm.py L546-L590](../../../python/sglang/srt/models/minicpm.py#L546-L590)
 - [configs/minicpm.py L145-L167](../../../python/sglang/srt/configs/minicpm.py#L145-L167)
+
+---
+
+## Round 13d outcome — sparse + FP8 KV retest (2026-04-28 ~09:00 UTC fcloud)
+
+### What we did
+1. **Inspected `MiniCPM-SALA-90-qa-cwe-mcq-sparse_qkv_w8/config.json` on fcloud**: `mixer_types` = 8×`minicpm4` + 24×`lightning` (matches user expectation). But `sparse_config: null` — `preprocess_model.py` had stripped it because the default submission path uses `--force-dense-minicpm`.
+2. **Patched the quantized model's `config.json`** to restore `sparse_config` (kernel_size=32, kernel_stride=16, init_blocks=1, block_size=64, window_size=2048, topk=64, use_nope=False, dense_len=8192) — required for `MiniCPMHybridReqToTokenPool` to allocate `req_to_sparse_k1_token`.
+3. **Added `SOAR_SPARSE_MODE` switch to `prepare_env.sh`** (commit `85b52f3d2`): when `=1`, drops `--force-dense-minicpm` from `SGLANG_SERVER_ARGS`.
+4. First server launch crashed: `AttributeError: 'HybridReqToTokenPool' object has no attribute 'req_to_sparse_k1_token'`. Root cause was the stripped `sparse_config` (step 2 fix).
+5. Second launch (after config patch) crashed during CUDA graph capture: `RuntimeError: Cannot call CUDAGeneratorImpl::current_seed during CUDA graph capture` — torch.compile + sparse attention kernels are incompatible during capture.
+6. **Added torch-compile drop in sparse mode** (commit `613ea54e4`): `SOAR_SPARSE_MODE=1` ⇒ `--enable-torch-compile --torch-compile-max-bs 8` removed.
+7. Third launch succeeded (server ready in 35 s, KV pool 30.81 GB K + 30.81 GB V FP8 e5m2, mamba 1.17 GB, avail mem 12.92 GB after warmup).
+8. **Accuracy run (concurrency 32) timed out at 1 h** with only ~76/150 samples completed; from sample ~73 onwards individual requests started hitting the harness's 3000 s read-timeout. Per-sample latency cliff visible in tqdm:
+
+   | Sample range | s/it |
+   |---|---|
+   |   0–10 | 5–13 |
+   |  20–30 | 18–37 |
+   |  31–34 | **115–325** ← cliff |
+   |  35–55 | 25–55 |
+   |  73+   | requests timing out at 3000 s |
+
+   Long-context samples (likely the niah / cwe long-input ones) are taking >50 minutes each. Killed.
+9. **Shut down fcloud** per cost-saving rule.
+
+### Conclusions
+- **Sparse + FP8 KV + GPTQ on current HEAD is not a viable submission config** with the current sglang code. Without torch.compile + CUDA graph, the path is unworkably slow on long-context samples (the niah / cwe regime that dominates official scoring). The Test 8b 2411 s "fast eval duration" was misleading — that run had `--enable-torch-compile` and presumably a different attention kernel path that has since regressed.
+- **The performance cliff at 30+ tokens output is the dominant signal**: not just "slower than dense" but ~20–50× slower per long-context request. Even a hypothetical accuracy fix (mixed-precision KV) cannot rescue this if the kernel path itself is this slow.
+- **CHANGE_0132 Option A (NVFP4 KV + sparse) remains infeasible** — the sparse path itself is broken-by-regression-or-design on current HEAD; layering NVFP4 on top makes no sense.
+
+### What this rules out
+- The "champion uses sparse + mixed KV" hypothesis cannot be reproduced by us using the current sglang tree without significant kernel work (recovering the historical sparse+torch.compile path, or rewriting the sparse attention to be CUDA-graph-clean).
+- We will not pursue sparse retest variants (bf16 KV, mixed KV, etc.) on this code base in the near term. The dense GPTQ + FP8 KV + `--force-dense-minicpm` path remains the **best known config** and the ONLY config that meets correctness + speed jointly on current HEAD.
+
+### Files / commits
+- `benchmark/soar/demo_sala/prepare_env.sh` (commits `85b52f3d2`, `613ea54e4`)
+- Model config patched on fcloud (not committed — it's a model file, fcloud-local only; backed up to `config.json.bak_no_sparse`)
+- TEST_RESULTS_TRACKING.md → Test 34 (sparse retest, INCOMPLETE / ABANDONED)
+
+### Cross-references
+- [CHANGE_0132](../CHANGE_0132_nvfp4_kv_force_dense_compat.en.md) §8 — Option A infeasible
+- [TEST_RESULTS_TRACKING.md](../TEST_RESULTS_TRACKING.md) Test 34
+- Prior sparse data points: Test 8b (FP8 KV + sparse, 76.07% acc, C=0), Test 9 (bf16 KV + sparse, 79.67% acc, C=1.0)
+
+### Next steps (deferred)
+- Stay on dense submission baseline (v18). Look for speedups *within* the dense path (NVFP4 KV under force-dense, fused kernels, scheduler tuning).
+- If we ever revisit sparse, first need to: (a) git-bisect the `req_to_sparse_k1_token` allocation regression between `9d3ecd168` and current HEAD; (b) fix the torch.compile + sparse-attention CUDA-graph incompatibility; (c) only then rerun accuracy.
