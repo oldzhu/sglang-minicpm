@@ -187,6 +187,10 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.use_fp8_sparse_scratch = self.kv_cache_dtype_str.startswith("fp8")
+        # MXFP4 KV cache flag (kv_cache_dtype = fp4_e2m1). Used to disable
+        # FP8-style per-tensor scaling (k_scale/v_scale) which would corrupt
+        # MXFP4's per-16-element block-scaled quantization.
+        self.use_fp4_kv_cache = self.kv_cache_dtype_str == "fp4_e2m1"
         self.page_size = model_runner.page_size
         # MiniCPM does not support local attention
         self.use_mla = False
@@ -829,9 +833,10 @@ class MiniCPMSparseBackend(AttentionBackend):
         fused_kernel=None
     ):
         # The sparse top-k scorer uses infllmv2/FlashAttention kernels that only
-        # accept fp16/bf16 inputs. Keep FP8 in the real KV cache, but bridge the
-        # sparse scoring path through bf16 when KV cache quantization is enabled.
-        if self.kv_cache_dtype_str.startswith("fp8"):
+        # accept fp16/bf16 inputs. Keep compressed (FP8 / MXFP4) data in the real
+        # KV cache, but bridge the sparse scoring path through bf16 when KV cache
+        # quantization is enabled.
+        if self.kv_cache_dtype_str.startswith("fp8") or self.use_fp4_kv_cache:
             if query_layer.dtype != torch.bfloat16:
                 query_layer = query_layer.to(torch.bfloat16)
             if compressed_k is not None and compressed_k.dtype != torch.bfloat16:
@@ -929,8 +934,13 @@ class MiniCPMSparseBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 cache_loc = forward_batch.out_cache_loc
+                # MXFP4 KV pool does its own per-block scaling; passing the
+                # FP8 per-tensor k_scale/v_scale would mis-scale K/V before
+                # MXFP4 quant. Force scales to None when storage dtype is FP4.
+                k_scale = None if self.use_fp4_kv_cache else layer.k_scale
+                v_scale = None if self.use_fp4_kv_cache else layer.v_scale
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer, cache_loc, k, v, k_scale, v_scale
                 )
 
         # Use precomputed metadata across all layers
@@ -948,8 +958,11 @@ class MiniCPMSparseBackend(AttentionBackend):
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
         # 4) fa_impl_ver != 4 since fa4 does not currently support fp8 queries and keys.
+        # MXFP4 KV pool returns already-dequanted BF16 from get_kv_buffer, so any
+        # k_descale here would double-scale; skip the descale path entirely.
         if (
             self.kv_cache_dtype_str != "auto"
+            and not self.use_fp4_kv_cache
             and layer.head_dim <= 256
             and self.fa_impl_ver != 4
         ):
@@ -1141,8 +1154,13 @@ class MiniCPMSparseBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 cache_loc = forward_batch.out_cache_loc
+                # MXFP4 KV pool does its own per-block scaling; passing the
+                # FP8 per-tensor k_scale/v_scale would mis-scale K/V before
+                # MXFP4 quant. Force scales to None when storage dtype is FP4.
+                k_scale = None if self.use_fp4_kv_cache else layer.k_scale
+                v_scale = None if self.use_fp4_kv_cache else layer.v_scale
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer, cache_loc, k, v, k_scale, v_scale
                 )
 
         # Use precomputed metadata across all layers
@@ -1170,7 +1188,13 @@ class MiniCPMSparseBackend(AttentionBackend):
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
-        if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
+        # MXFP4 KV pool returns already-dequanted BF16 from get_kv_buffer, so any
+        # k_descale here would double-scale; skip the descale path entirely.
+        if (
+            self.kv_cache_dtype_str != "auto"
+            and not self.use_fp4_kv_cache
+            and layer.head_dim <= 256
+        ):
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
