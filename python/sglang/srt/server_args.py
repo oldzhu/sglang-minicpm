@@ -1776,6 +1776,12 @@ class ServerArgs:
         if self.kv_cache_dtype != "fp4_e2m1":
             return
 
+        # SOAR CHANGE_0131: MiniCPM custom attention backend manages its own
+        # KV layout (incl. MXFP4 dequant via KVFP4QuantizeUtil). The stock
+        # KV4-MHA backend assertion does not apply.
+        if self.attention_backend and str(self.attention_backend).startswith("minicpm"):
+            return
+
         use_mla_backend = self.use_mla_backend()
         # self.attention_backend didn't overwrite self.prefill/decode_attention_backend yet
         self.prefill_attention_backend_str, self.decode_attention_backend_str = (
