@@ -1,6 +1,6 @@
 # Complete Optimization Catalog: GPTQ + FP8 KV + Dense Mode
 
-> **Created**: 2026-04-14 | **Updated**: 2026-04-20  
+> **Created**: 2026-04-14 | **Updated**: 2026-04-22  
 > **Baseline**: Test 12 — S1=121.71s, S8=44.09s, Smax=35.86s, ori_accuracy=79.29%, normalized=99.11%, C=1.0  
 > **Best config (2026-04-20)**: prefill-max-req=4, sched-cons=0.8, chunk=65536, torch.compile(max-bs=8), mixed-chunk  
 > **Official score**: 40.23 (#19) after new long-context dataset rerun  
@@ -153,7 +153,7 @@ This document catalogs **every known speed optimization vector** for our baselin
 ### Tier 3: Medium Code Changes (3-5 days, medium risk)
 | Priority | ID | Optimization | Expected Gain | Status |
 |----------|----|-------------|---------------|--------|
-| 9 | **G4** | **Marlin GEMM SM120 auto-config** | **5-15% prefill** | ⬜ Not started — **NEW #1 PRIORITY (85.3% of prefill)** |
+| 9 | **G4** | **Marlin GEMM SM120 auto-config** | **5-15% prefill** | ❌ Tested via CHANGE_0130: accuracy fell to 95.50% normalized, reverted |
 | 10 | **G5** | **FP8 W8A16 quantization** | **10-30% prefill** | ⬜ Not started — replace Marlin W4 with FP8 tensor cores |
 | 11 | A1 | SimpleGLA state contiguity guarantee | ~~5-8% decode~~ **<1% prefill, ~3% decode** | ⬜ Not started — **deprioritized by profiling** |
 | 12 | A2 | FLA chunk size tuning | ~~5-10%~~ **0%** | ❌ TESTED — no gain (Test 19) |
@@ -194,12 +194,18 @@ All Layer 1 (scheduling) optimizations have been tested:
 - S5 max-running-requests=24: included ✅
 - No further config-only gains available.
 
-### NVFP4 Status: NOT VIABLE
+### NVFP4 (W4A4) Status: NOT VIABLE
 Test 21 showed catastrophic accuracy failure (~12%) with W4A4 FP4 quantization. Model generates infinite `<think>` loops. FP4 is too aggressive for this reasoning architecture. Mixed-precision NVFP4 (per-layer exclusion) would require major engineering.
+
+### W4-FP8 dense GEMM Status: PARKED (RED, 2026-04-28)
+Lower-bound CUDA spike on SM120 measured **156 TFLOPS = 55.7% of FP8 ceiling (281 TF)** across 4 shapes (16384×14336×4096, 2048×4096×4096, 8192×8192×8192). Decode shape bandwidth-bound at 32 TF (no compute headroom). A tuned production kernel is plausible at 200–240 TF (75–85% of peak), translating to only ~5–12% end-to-end on prefill-heavy paths in exchange for 3–4 weeks of CUTLASS-class engineering. Parked indefinitely; revisit only if NVIDIA / CUTLASS ships a drop-in tuned SM120 kernel. See [RESULT_W4_FP8_CUTLASS_SPIKE_20260428_1300.en.md](RESULT_W4_FP8_CUTLASS_SPIKE_20260428_1300.en.md).
+
+### NVFP4 KV cache (MXFP4 KV, weights stay W4A16) Status: P2 NEXT
+Decoupled from W4A4 weights — only the KV cache uses FP4 (16-elem block + uint8 e8m0 scale, ~44% memory savings vs FP8). Survey ([SURVEY_NVFP4_KV_P1_20260428_1130.en.md](SURVEY_NVFP4_KV_P1_20260428_1130.en.md)) found ~80% of plumbing already in tree. Real gaps localized to 4 sparse-FP8 gates + set_kv_buffer interactions in `python/sglang/srt/layers/attention/minicpm_backend.py`. P2 plan: 3 days, dense-only smoke first (`--force-dense-minicpm`) to isolate plumbing from sparse-attention bugs, accuracy threshold ≥75%.
 
 ### Priority Paths Forward (REVISED per profiling data 2026-04-20)
 1. **Submit with best config v19** (immediate) — prefill-max-req=4, sched-cons=0.8, chunk=65536
-2. **Marlin GEMM profiling & tuning** (highest impact) — 85.3% of prefill; verify SM120 auto-config tile sizes, thread group selection
+2. **SM120 GEMM path investigation beyond heuristic dispatch biasing** (highest impact) — 85.3% of prefill; CHANGE_0130-style scoring tweaks are not accuracy-safe
 3. **FP8 weight quantization (W8A16)** (potentially transformative) — Replace Marlin W4 dequant+FP16 GEMM with native FP8 tensor cores (~2× GEMM throughput). Safe accuracy (8-bit)
 4. **FlashInfer attention optimization** (8 standard layers) — 8.8% of prefill (each `BatchPrefillWithRaggedKVCacheKernel` call ~55ms)
 5. **FLA chunk kernel optimization** (deprioritized) — only 1% of prefill (chunk_fwd_o + chunk_fwd_h = 50ms vs GEMM 4258ms)

@@ -88,13 +88,14 @@ __device__ __forceinline__ uint32_t mma_fp8_m16n8k32(
     return 0;
 }
 
-// Convert a bf16 register-pair to an FP8 e4m3 byte-pair via PTX cvt.
-// One PTX 'cvt.rn.satfinite.e4m3x2.bf16x2' produces 2 FP8 in a uint16.
-__device__ __forceinline__ uint16_t bf16x2_to_fp8e4m3x2(uint32_t bf16_pair) {
+// Convert two fp32 values to a packed e4m3x2 (uint16). Uses PTX
+// 'cvt.rn.satfinite.e4m3x2.f32' which is the supported form on SM120.
+// Layout: lower byte = first arg, upper byte = second arg.
+__device__ __forceinline__ uint16_t f32x2_to_fp8e4m3x2(float lo, float hi) {
     uint16_t result;
     asm volatile(
-        "{ cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1; }\n"
-        : "=h"(result) : "r"(bf16_pair));
+        "{ cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1; }\n"
+        : "=h"(result) : "f"(lo), "f"(hi));
     return result;
 }
 
@@ -195,25 +196,23 @@ __global__ void w4fp8_gemm_kernel(
         // Each thread "dequants" 8 int4 values and MMAs them.
         uint32_t b_packed = smemB_int4[(lane + it) & 0x3F];
 
-        // Unpack 8 int4 → 8 bf16 (subtract 8 zero-point, multiply by group scale)
-        // Build 4 bf16x2 pairs.
-        uint16_t bf16_vals[8];
+        // Unpack 8 int4 -> 8 fp32 (subtract 8 zero-point, multiply by group scale).
+        // Doing the dequant in fp32 lets us use the supported PTX cvt path
+        // (f32 -> e4m3x2). A real production kernel would fuse the scale into
+        // the int4 unpack via lop3.b32 + shift+sub, but for this spike the cost
+        // is bf16-equivalent (one fmul per value).
+        float fvals[8];
         #pragma unroll
         for (int i = 0; i < 8; i++) {
-            int4_t v = (int4_t)((b_packed >> (i * 4)) & 0xF) - 8;
-            __nv_bfloat16 bf = __float2bfloat16((float)v * 0.0625f);  // scalar fallback
-            bf16_vals[i] = *reinterpret_cast<uint16_t*>(&bf);
+            int v = (int)((b_packed >> (i * 4)) & 0xF) - 8;  // signed [-8, 7]
+            fvals[i] = (float)v * 0.0625f;
         }
-        uint32_t bf_pair0 = bf16_vals[0] | ((uint32_t)bf16_vals[1] << 16);
-        uint32_t bf_pair1 = bf16_vals[2] | ((uint32_t)bf16_vals[3] << 16);
-        uint32_t bf_pair2 = bf16_vals[4] | ((uint32_t)bf16_vals[5] << 16);
-        uint32_t bf_pair3 = bf16_vals[6] | ((uint32_t)bf16_vals[7] << 16);
 
-        // bf16 → FP8 e4m3 (2 values per cvt)
-        uint16_t fp8_p0 = bf16x2_to_fp8e4m3x2(bf_pair0);
-        uint16_t fp8_p1 = bf16x2_to_fp8e4m3x2(bf_pair1);
-        uint16_t fp8_p2 = bf16x2_to_fp8e4m3x2(bf_pair2);
-        uint16_t fp8_p3 = bf16x2_to_fp8e4m3x2(bf_pair3);
+        // fp32 pair -> FP8 e4m3 pair (2 values per cvt instruction)
+        uint16_t fp8_p0 = f32x2_to_fp8e4m3x2(fvals[0], fvals[1]);
+        uint16_t fp8_p1 = f32x2_to_fp8e4m3x2(fvals[2], fvals[3]);
+        uint16_t fp8_p2 = f32x2_to_fp8e4m3x2(fvals[4], fvals[5]);
+        uint16_t fp8_p3 = f32x2_to_fp8e4m3x2(fvals[6], fvals[7]);
         uint32_t b0 = fp8_p0 | ((uint32_t)fp8_p1 << 16);
         uint32_t b1 = fp8_p2 | ((uint32_t)fp8_p3 << 16);
 

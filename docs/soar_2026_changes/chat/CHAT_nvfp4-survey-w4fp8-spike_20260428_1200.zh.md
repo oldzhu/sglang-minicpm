@@ -52,3 +52,43 @@ W4A8 深度会话延续。
 - [spike_w4fp8/run_w4fp8_spike.sh](../spike_w4fp8/run_w4fp8_spike.sh)
 - [PROPOSAL_NVFP4_KV_CACHE_20260427_1730.zh.md](../PROPOSAL_NVFP4_KV_CACHE_20260427_1730.zh.md)
 - [PROPOSAL_W4_FP8_CUTLASS_SPIKE_20260427_1730.zh.md](../PROPOSAL_W4_FP8_CUTLASS_SPIKE_20260427_1730.zh.md)
+
+---
+
+## 第 11 轮 —— fcloud 执行 W4-FP8 spike（2026-04-28 13:00）
+
+### 用户提问
+1. "先批准 dense-only smoke 优先？ok"
+2. "可以解释一下什么是用 --force-dense-minicpm 起 smoke test 来把 plumbing 与 sparse 门控隔开吗？为什么需要把 plumbing 与 sparse 门控隔开？"
+3. "精度回归容忍度？>=75%"
+4. "我已经把 fcloud 启起来了，你可以 1. 检查 pytorch >> 2.8  2. 测 W4-FP8 spike scaffold"
+
+### 智能体回答 / 行动
+- **Q1 解释**：`prepare_env.sh` 的 SGLANG_SERVER_ARGS 中 `--force-dense-minicpm` 让 attention 走标准 FlashAttention（跳过 MiniCPM SALA 稀疏路径）。MXFP4 KV 触及 2 条独立代码路径：(1) plumbing —— FP4 池、quantize/dequantize、FA descale；(2) 稀疏注意力 —— top-k 打分、compressed-K bridge、infllmv2、scratch buffers。同时启两条会让 bug 归因不可能。先 dense-only → 仅 ~3 个 plumbing 门控，迭代快。绿后再当作单独迭代启用稀疏。
+- **Q3 记录**：NVFP4 KV P2 最低精度阈值 = 75%（基线 79.29% → 最多 4.3pp 回归）。
+- **fcloud 环境检查**：torch=2.9.1+cu128（✅ 有 `float4_e2m1fn_x2`），nvcc 12.8 支持 `-arch=sm_120`，RTX 6000D compute_cap 12.0。spike 与 NVFP4 KV 的所有前置条件都满足。
+- **Spike scaffold 构建期间需 2 处修复**：
+  1. `int4_t` 不是真实类型 → 改用 `int` + 手动 4-bit 符号扩展。
+  2. `cvt.rn.satfinite.e4m3x2.bf16x2` 这个 PTX 形式在 SM120 上**不存在** → ptxas 拒绝。换为受支持的 `cvt.rn.satfinite.e4m3x2.f32`（2 fp32 → 1 fp8x2）。反量化链改为：int4 解包 → fp32 减零点 → fp32 乘 scale → cvt 到 e4m3x2。
+- **Spike 结果**（4 个形状，100 iter，cudaEvent 计时）：
+
+| 形状 | TFLOPS | 占 FP8 上限 % | 判定 |
+|---|---|---|---|
+| 16384×14336×4096 | 156.4 | 55.7% | RED |
+| 2048×4096×4096 | 155.8 | 55.4% | RED |
+| 1×14336×4096（decode）| 32.6 | 11.6% | RED（带宽受限）|
+| 8192×8192×8192 | 156.4 | 55.6% | RED |
+
+  ptxas：23 个寄存器，0 spill，1 个 barrier —— kernel 受计算峰值限制。未融合 fp32 路径下的反量化链占 ~43% 周期。
+- **采集完结果立即执行 fcloud 关机**（节费规则）。
+
+### 产出
+- **W4-FP8 密集搁置（RED）**。调优生产 kernel 大致能达 200–240 TF（75–85%），但 3–4 周工程换取 prefill-only 路径上 ~5–12% 端到端，相比 NVFP4 KV（~3 天，~44% KV 内存节省，直接帮助 S∞）不划算。
+- **NVFP4 KV cache 提升至 P2**。等用户批准后启动 dense-only smoke。
+- Catalog 更新，标记 W4-FP8 为 RED，NVFP4 KV 为 P2-NEXT。
+
+### 交叉引用
+- [RESULT_W4_FP8_CUTLASS_SPIKE_20260428_1300.zh.md](../RESULT_W4_FP8_CUTLASS_SPIKE_20260428_1300.zh.md)（终版，替代模板）
+- [SURVEY_NVFP4_KV_P1_20260428_1130.zh.md](../SURVEY_NVFP4_KV_P1_20260428_1130.zh.md)
+- [OPTIMIZATION_CATALOG_GPTQ_FP8_DENSE.md](../OPTIMIZATION_CATALOG_GPTQ_FP8_DENSE.md)（W4-FP8 → RED，NVFP4 KV → P2-NEXT）
+- [spike_w4fp8/bench_w4fp8_sm120.cu](../spike_w4fp8/bench_w4fp8_sm120.cu)（含 cvt 修复）
