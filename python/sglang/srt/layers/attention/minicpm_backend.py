@@ -1819,8 +1819,24 @@ class MiniCPMSparseBackend(AttentionBackend):
                 metadata.flashinfer_kv_indices = kv_indices_view
                 metadata.flashinfer_kv_last_page_len = kv_last_page_len_view
 
-            self.decode_cuda_graph_metadata["compress_k1"][:forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, :, :].fill_(float('-inf')) 
-            self.decode_cuda_graph_metadata["compress_k2"][:forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, :, :].fill_(float('-inf'))
+            # CHANGE_0133: size the defensive -inf fill to the live (bs, max_len)
+            # instead of (forward_batch.batch_size, max_context_len). The compress
+            # kernel only writes rows in [0, bs * ceil(seq_len_i / stride)); rows
+            # beyond that are bounded out by metadata.kN.cu_seqlens, so a tighter
+            # mask is sufficient. Using cudagraph-captured bs avoids
+            # capture-vs-replay batch_size mismatch.
+            fill_rows_k1 = bs * (
+                (max_len + self.k1_kernel_stride - 1) // self.k1_kernel_stride
+            )
+            fill_rows_k2 = bs * (
+                (max_len + self.k2_kernel_stride - 1) // self.k2_kernel_stride
+            )
+            self.decode_cuda_graph_metadata["compress_k1"][:fill_rows_k1].fill_(
+                float('-inf')
+            )
+            self.decode_cuda_graph_metadata["compress_k2"][:fill_rows_k2].fill_(
+                float('-inf')
+            )
             metadata.k1.cu_seqlens[: real_bs + 1].copy_(forward_batch.cu_seqlens_k1_cpu)
             metadata.k2.cu_seqlens[: real_bs + 1].copy_(forward_batch.cu_seqlens_k2_cpu)
 
