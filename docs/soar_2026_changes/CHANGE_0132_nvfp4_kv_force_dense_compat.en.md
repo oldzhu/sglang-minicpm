@@ -1,6 +1,6 @@
 # CHANGE 0132 — NVFP4 KV + `--force-dense-minicpm` compatibility
 
-**Status**: Proposal (awaiting approval)
+**Status**: **Option A INFEASIBLE** after Round 13b code review — see §8.
 **Predecessor**: CHANGE_0131 (P2 plumbing — RED on Round 13 smoke due to architectural blocker)
 **Branch**: `mixed_minicpm_cudagraph` on `minicpm-src`
 
@@ -42,41 +42,58 @@ the FP4 path is unreachable on the production submission config.
 
 ## 3. Detailed implementation plan (before change)
 
-### Option A — preferred (small, low-risk)
+### Option A (originally proposed) — **INFEASIBLE** (see §8 for evidence)
 
-In `python/sglang/srt/server_args.py`, inside
-`_handle_model_specific_adjustments`, locate the block that rewrites
-`minicpm_flashinfer` → `flashinfer` when `force_dense_minicpm` is set,
-and **skip the rewrite when `kv_cache_dtype == "fp4_e2m1"`**:
+The proposal was: in `_handle_model_specific_adjustments`, skip the
+`minicpm_flashinfer → flashinfer` rewrite when
+`kv_cache_dtype == "fp4_e2m1"`, on the assumption that the MiniCPM
+custom backend has a dense-only codepath we could fall through to.
 
-```python
-# server_args.py (sketch)
-if self.force_dense_minicpm:
-    if self.kv_cache_dtype == "fp4_e2m1":
-        # Keep MiniCPM custom backend so FP4 KV plumbing in
-        # MiniCPMAttentionBackend is reached. The custom backend
-        # already supports dense-only batches via its existing
-        # force_dense_minicpm code path.
-        pass
-    else:
-        if self.attention_backend == "minicpm_flashinfer":
-            self.attention_backend = "flashinfer"
-        # ... existing rewrites
-```
+**The Round 13b code review (§8) showed this assumption is wrong.**
+The custom backend is `MiniCPMSparseBackend` and it `raise ValueError`s
+when `has_sparse_attention=False` — which is exactly what
+`force_dense_minicpm=True` sets. There is no dense codepath. Even
+`forward_decode` unconditionally calls `get_topk_for_sparse`. Skipping
+the rewrite would not work.
 
-Why this works: `MiniCPMAttentionBackend` already has a dense-only
-code path (it inspects `force_dense_minicpm` internally), and
-CHANGE_0131 already gates the FP4-aware logic by
-`self.use_fp4_kv_cache`. Keeping `attention_backend == "minicpm_flashinfer"`
-under FP4 simply lets that plumbing run.
+### Option A′ (revised) — heavy fork of MiniCPMSparseBackend
 
-### Option B — fallback (heavy)
+Add a real dense codepath inside `MiniCPMSparseBackend`:
+
+1. Loosen the `has_sparse_attention` guard so the backend can init
+   under `force_dense_minicpm`.
+2. In `forward_decode`/`forward_extend`, branch on a new
+   `is_dense_run` flag: when set, skip `get_topk_for_sparse`,
+   skip `sparse_kernel_extension` calls, use the full `page_table`
+   directly through the already-imported
+   `BatchDecodeWithPagedKVCacheWrapper` (FP4-aware via CHANGE_0131).
+3. Update `init_cuda_graph_state` to allocate dense (full-page-table)
+   buffers in addition to or instead of sparse ones.
+4. Update metadata builders accordingly.
+
+Effort estimate: several hundred lines + careful CUDA graph testing.
+Not a one-day patch.
+
+### Option B — heavy alternative
 
 Add FP4 KV support to stock FlashInfer's decode wrapper. This requires
 upstream FlashInfer kernel templates for `dtype_kv = float4_e2m1fn_x2`.
 Out of scope for the competition timeline.
 
-### Validation pipeline (Option A)
+### Option C (recommended) — park CHANGE_0131/0132
+
+Keep the four boot-fix commits as general hardening (they cost nothing
+at runtime when `SOAR_FP4_KV_CACHE=0`, which is the default). Park the
+FP4 KV experiment until either:
+
+- We need the KV memory savings for a different code path (e.g. very
+  long-context official speed dataset that hits the OOM ceiling).
+- Stock FlashInfer adds FP4 KV support natively (Option B).
+
+Pivot to higher-ROI optimizations from
+`OPTIMIZATION_CATALOG_GPTQ_FP8_DENSE.md`.
+
+### Validation pipeline (only relevant if Option A′ is undertaken)
 
 ```bash
 # 1. Sync + restart
@@ -122,12 +139,88 @@ never taken.
 
 ## 7. Next-step suggestions
 
-1. After Option A is green on dense + accuracy ≥ 75%:
-   - Measure actual throughput / max-running-requests gain from the
-     freed KV memory.
-   - If gain < 5%, deprioritize and pivot to Marlin tile work.
-   - If gain ≥ 5%, file CHANGE_0133 to re-enable sparse path under
-     FP4 (CHANGE_0131 §3 Gap A + B).
-2. If Option A fails accuracy: suspect MiniCPMAttentionBackend dense
-   codepath divergence between `minicpm_flashinfer` and stock
-   `flashinfer` — investigate per-layer outputs.
+Given §8, the recommendation is **Option C — park FP4 KV** for the
+competition timeline:
+
+1. Keep the four R13 hardening commits (`d4608f170`, `fd7e797ea`,
+   `252cc4d64`, `8a0976593`). They are inert when `SOAR_FP4_KV_CACHE=0`.
+2. Pivot to other catalog items (Marlin tile tuning, scheduling,
+   speculative decoding variants).
+3. Revisit FP4 KV only if:
+   - Stock FlashInfer adds an FP4 KV decode kernel (Option B obsoletes
+     itself).
+   - We obtain evidence the official long-context speed dataset is OOM
+     bound on FP8 KV (memory pressure outweighs the kernel-fork cost
+     of Option A′).
+
+## 8. Round 13b code review — evidence Option A is infeasible
+
+Verified against `python/sglang/srt/layers/attention/minicpm_backend.py`
+on commit `49a7ed5f4`.
+
+### Finding 1 — backend hard-asserts `has_sparse_attention=True`
+
+[L221-230](../../python/sglang/srt/layers/attention/minicpm_backend.py#L221-L230):
+
+```python
+self.has_sparse_attention = hf_config is not None and getattr(
+    hf_config, "has_sparse_attention", False
+)
+if not self.has_sparse_attention:
+    raise ValueError(
+        "MiniCPM model must have sparse attention enabled. "
+        "Please ensure the model config has 'has_sparse_attention=True'."
+    )
+```
+
+Meanwhile, [`model_config.py` L238 / L248](../../python/sglang/srt/configs/model_config.py#L238)
+overrides `has_sparse_attention → False` whenever
+`force_dense_minicpm=True`. Therefore the custom backend **cannot
+instantiate** under the production config.
+
+### Finding 2 — `forward_decode` has no dense branch
+
+[L1130-1300](../../python/sglang/srt/layers/attention/minicpm_backend.py#L1130-L1300)
+unconditionally executes:
+
+```python
+topk_idx = self.get_topk_for_sparse(
+    q_reshaped.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
+    1, layer, forward_batch, False,
+)
+sparse_page_table = sparse_kernel_extension.get_block_table_v3(...)
+```
+
+There is no `if not is_sparse_layer: ...` branch and no
+`force_dense_minicpm` short-circuit. Every decode call goes through
+the sparse top-k path.
+
+### Finding 3 — `forward_extend` `else` branch is also sparse-shaped
+
+[L989-1056](../../python/sglang/srt/layers/attention/minicpm_backend.py#L989-L1056):
+the `max(seq_lens) >= self.dense_len` branch runs full sparse top-k,
+and the `else` branch still routes through `metadata.sparse_page_table`,
+`sparse_cache_seqlens_int32`, and the compressed-key allocator. Even
+short sequences traverse sparse plumbing.
+
+### Finding 4 — config-level effect of `force_dense_minicpm`
+
+[`model_config.py` L237-238](../../python/sglang/srt/configs/model_config.py#L238)
+and [L247-248](../../python/sglang/srt/configs/model_config.py#L248)
+clamp `has_sparse_attention → False` and `sparse_layer_ids → []`.
+Both Finding 1's `raise` and the empty `sparse_layer_ids` make
+implicit Option A unworkable.
+
+### Conclusion
+
+The combination required by the production submission
+(`GPTQ + --force-dense-minicpm + --kv-cache-dtype fp4_e2m1`) has **no
+cheap route** to the existing CHANGE_0131 plumbing. The only viable
+implementations are:
+
+- Option A′: real dense-codepath fork inside `MiniCPMSparseBackend`
+  (heavy, multiple hundreds of LoC + cudagraph re-validation).
+- Option B: stock FlashInfer FP4 KV decode kernel (out of scope).
+
+Neither fits the competition timeline. Recommend **Option C: park**.
+

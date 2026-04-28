@@ -123,3 +123,94 @@ Authored:
   - `fd7e797ea` fix(server_args): bypass KV4 MHA assert for minicpm_* attention
   - `252cc4d64` fix(server_args): also bypass for force_dense_minicpm
   - `8a0976593` fix(memory_pool): route MXFP4 KV through MHATokenToKVPoolFP4
+
+---
+
+## Round 13b — Q&A: semantics of `--force-dense-minicpm` and dense-vs-sparse choice
+
+### User asks
+> Before proceeding 0132 or other, just want to know more: if we stop the rewrite `minicpm_flashinfer → flashinfer` when `kv_cache_dtype == "fp4_e2m1"`, does `--force-dense-minicpm` mean we won't use sparse attention (no top-k scoring) but use dense attention in flashinfer? Our baseline (v18) is W4A16 + FP8 KV + dense, not + sparse, because dense gives better speed locally. Why is dense better here when theoretically (especially long context) sparse should be better? Is FlashInfer just more optimized?
+
+### Agent answer (verified against source)
+
+**`--force-dense-minicpm` has TWO independent effects:**
+
+1. **Config-level** (`python/sglang/srt/configs/model_config.py` L238 / L248):
+   ```python
+   has_sparse_attention → False
+   sparse_layer_ids     → []
+   ```
+   ⇒ Zero sparse layers in the model graph. No top-k scoring, no sparse-layer routing, no sparse Lightning path. Every layer is dense.
+2. **Backend-level** (`python/sglang/srt/server_args.py` L1521-1525):
+   ```python
+   if self.force_dense_minicpm:
+       if self.attention_backend == "minicpm_flashattn":   self.attention_backend = "fa3"
+       elif self.attention_backend == "minicpm_flashinfer": self.attention_backend = "flashinfer"
+   ```
+   ⇒ Custom MiniCPM backend swapped out for stock FlashInfer / FA3.
+
+**v18 baseline = W4A16 + FP8 KV + 100% dense + stock FlashInfer.** Confirmed.
+
+**Why dense beats sparse on our local benchmark — three stacking factors:**
+
+1. **Local speed dataset is short.** `speed_{s1,s8,smax}.jsonl` is hand-built by us. Sparse attention's win comes from `O(top_k · L)` vs `O(L²)`, but the crossover is roughly 8-16K tokens. At 1-4K tokens, top-k scoring + gather/scatter + scheduling overhead **costs more than it saves**.
+2. **Stock FlashInfer is highly optimized on Blackwell SM120.** Paged KV, fused FP8 dequant, contiguous TensorCore tile shapes (CHANGE_0125 added the SM120 Marlin tile table). MiniCPM custom sparse backend is mostly Triton — solid for correctness, but typically 20-40% behind FlashInfer on raw decode throughput.
+3. **GPTQ + sparse is broken on accuracy.** Tests 5/6: ~50% acc on old fcloud. Test 8b: 76% with default top_k. The sparse path interacts badly with GPTQ-quantized QKV — top-k scoring is sensitive to quant noise. Test 9 (GPTQ + bf16 KV + sparse) was the only working sparse-with-GPTQ result at 79.67% acc. With FP8 KV + sparse + GPTQ the accuracy collapses.
+
+**Officially**, the organizers announced the speed dataset has more long-context samples than ours. Theoretically sparse should help there — but unless we fix #3, we cannot ship it. That is why dense + FP8 KV + GPTQ is the production config.
+
+### Implication for CHANGE_0132
+
+If we skip the **backend** rewrite when `kv_cache_dtype == "fp4_e2m1"`:
+
+- `has_sparse_attention` is **still False** (config-level effect of `force_dense_minicpm` is independent of the backend rewrite). No sparse layers re-appear. We still get pure dense.
+- `MiniCPMAttentionBackend` stays selected, every layer calls dense attention through it, and the CHANGE_0131 FP4 plumbing finally runs.
+- **Open risk**: `MiniCPMAttentionBackend`'s dense decode path on SM120 may be slower than stock FlashInfer's. If the FP4 KV memory savings (44%) don't translate into more concurrent requests / higher throughput than the kernel gap, the change is net-negative on speed even if it boots and is accurate.
+
+### Decision
+
+User chose the conservative path:
+
+1. **First**, do a code review of `MiniCPMAttentionBackend.forward_decode` to assess whether its dense decode path is competitive with stock FlashInfer on SM120 — establish up-front whether we expect a speed cliff.
+2. **Then**, implement Option A and measure on fcloud (smoke → accuracy → S1/S8/Smax).
+
+### Cross-references
+
+- [server_args.py L1521-1525](../../../python/sglang/srt/server_args.py#L1521-L1525) — backend rewrite
+- [model_config.py L238](../../../python/sglang/srt/configs/model_config.py#L238) / [L248](../../../python/sglang/srt/configs/model_config.py#L248) — sparse layer disable
+- [TEST_RESULTS_TRACKING.md](../TEST_RESULTS_TRACKING.md) Tests 5/6/8b/9/12 — GPTQ sparse-vs-dense empirical history
+- [CHANGE_0132_nvfp4_kv_force_dense_compat.en.md](../CHANGE_0132_nvfp4_kv_force_dense_compat.en.md) §3 Option A
+
+---
+
+## Round 13c — code review verdict: Option A is INFEASIBLE
+
+### User asks
+> Document the answer for tracking. Do (1) [code review of `MiniCPMAttentionBackend.forward_decode`] first, then do (2) [run Option A and measure].
+
+### Agent action
+Read `python/sglang/srt/layers/attention/minicpm_backend.py` end-to-end. Four findings invalidate Option A as proposed:
+
+1. **`MiniCPMSparseBackend.__init__` L226-230** raises `ValueError` if `has_sparse_attention=False`.
+2. **`force_dense_minicpm=True` overrides `has_sparse_attention → False`** at config level (`model_config.py` L238).
+3. **`forward_decode` L1130-1300** unconditionally runs `get_topk_for_sparse` + `sparse_kernel_extension.get_block_table_v3`. No dense branch.
+4. **`forward_extend` L989+** routes both branches through `metadata.sparse_page_table`. Even short sequences traverse sparse plumbing.
+
+⇒ The custom backend cannot even instantiate under `--force-dense-minicpm`, and even if it could, every code path is sparse top-k. My prior claim that "MiniCPMAttentionBackend already supports dense-only batches" was wrong.
+
+### Outcomes
+- **Option A (skip rewrite for FP4) is dead.** No work performed on it.
+- **Option A′ (revised)** would require fork-level changes to `MiniCPMSparseBackend`: relax the init guard, add a `is_dense_run` branch in `forward_decode`/`forward_extend` that bypasses top-k and uses the full `page_table` directly through the already-imported `BatchDecodeWithPagedKVCacheWrapper`, and re-allocate cudagraph buffers accordingly. Effort: hundreds of LoC + careful cudagraph re-validation. Not a 1-day patch.
+- **Option B** (FP4 KV in stock FlashInfer) requires upstream kernel templates — out of scope for the competition timeline.
+- **Recommendation: Option C — park CHANGE_0131/0132.** Keep the four R13 hardening commits (`d4608f170`, `fd7e797ea`, `252cc4d64`, `8a0976593`) — they are inert at runtime when `SOAR_FP4_KV_CACHE=0` (default). Pivot to other catalog items.
+- Updated `CHANGE_0132_nvfp4_kv_force_dense_compat.{en,zh}.md` with a new §8 "Round 13b code review" containing the L221-L230 / L1130-L1300 / L989-L1056 evidence and revised §7 to recommend Option C.
+
+### Agent did NOT proceed to step (2)
+
+Step 2 (run Option A and measure) is blocked because Option A is provably wrong. Surfaced finding to user before any fcloud spend.
+
+### Cross-references
+- [CHANGE_0132_nvfp4_kv_force_dense_compat.en.md](../CHANGE_0132_nvfp4_kv_force_dense_compat.en.md) §8
+- [minicpm_backend.py L221-L230](../../../python/sglang/srt/layers/attention/minicpm_backend.py#L221-L230)
+- [minicpm_backend.py L1130-L1300](../../../python/sglang/srt/layers/attention/minicpm_backend.py#L1130-L1300)
+- [model_config.py L238](../../../python/sglang/srt/configs/model_config.py#L238)

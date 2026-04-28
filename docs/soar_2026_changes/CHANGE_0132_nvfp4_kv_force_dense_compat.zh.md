@@ -1,6 +1,6 @@
 # CHANGE 0132 — NVFP4 KV 与 `--force-dense-minicpm` 兼容
 
-**状态**：提案（待批准）
+**状态**：**方案 A 不可行**，详见 §8 Round 13b 代码审查
 **前置**：CHANGE_0131（P2 plumbing —— Round 13 smoke 因架构阻断 RED）
 **分支**：`mixed_minicpm_cudagraph` on `minicpm-src`
 
@@ -39,39 +39,51 @@ KeyError: torch.float4_e2m1fn_x2
 
 ## 3. 详细实施方案（变更前）
 
-### 方案 A —— 首选（小改动、低风险）
+### 方案 A（原提案）—— **不可行**（证据见 §8）
 
-在 `python/sglang/srt/server_args.py` 的
-`_handle_model_specific_adjustments` 中，找到 `force_dense_minicpm` 时
-把 `minicpm_flashinfer` 改写成 `flashinfer` 的代码块，**当
-`kv_cache_dtype == "fp4_e2m1"` 时跳过该重写**：
+原提案：在 `_handle_model_specific_adjustments` 里，当
+`kv_cache_dtype == "fp4_e2m1"` 时跳过 `minicpm_flashinfer → flashinfer`
+重写，假设 MiniCPM 自定义后端有一条 dense 路径能走。
 
-```python
-# server_args.py（示意）
-if self.force_dense_minicpm:
-    if self.kv_cache_dtype == "fp4_e2m1":
-        # 保留 MiniCPM 自定义后端，使 MiniCPMAttentionBackend 中的
-        # FP4 KV plumbing 可达。该后端本身已通过 force_dense_minicpm
-        # 内部分支支持 dense-only batch。
-        pass
-    else:
-        if self.attention_backend == "minicpm_flashinfer":
-            self.attention_backend = "flashinfer"
-        # ... 既有重写
-```
+**Round 13b 的代码审查（§8）表明该假设是错的**。自定义后端是
+`MiniCPMSparseBackend`，在 `has_sparse_attention=False`（这正是
+`force_dense_minicpm=True` 产生的状态）时会直接
+`raise ValueError`。根本没有 dense 路径。连 `forward_decode`
+也是无条件调 `get_topk_for_sparse`。跳过重写不会生效。
 
-为什么这样可行：`MiniCPMAttentionBackend` 已有 dense-only 路径（它内部
-会查 `force_dense_minicpm`），CHANGE_0131 已用 `self.use_fp4_kv_cache`
-门控 FP4 逻辑。FP4 时保留 `attention_backend == "minicpm_flashinfer"`，
-plumbing 就会跑起来。
+### 方案 A′（修订）—— 重构 MiniCPMSparseBackend
 
-### 方案 B —— 兜底（重）
+在 `MiniCPMSparseBackend` 里加一条真正的 dense 路径：
+
+1. 放宽 `has_sparse_attention` 门限，让 backend 能在
+   `force_dense_minicpm` 下初始化。
+2. 在 `forward_decode`/`forward_extend` 中用一个新的
+   `is_dense_run` 标志分支：开启时不调 `get_topk_for_sparse`、
+   不走 `sparse_kernel_extension`，直接用完整 `page_table` 过
+   `BatchDecodeWithPagedKVCacheWrapper`（已被CHANGE_0131 贴着为 FP4 感知）。
+3. `init_cuda_graph_state` 要额外分配 dense（完整 page_table）的
+   buffer。
+4. 元数据构造器等同步调整。
+
+工作量估计：几百行 + 小心的 cudagraph 重验证。不是一天能收到底的。
+
+### 方案 B —— 重型替代
 
 给主线 FlashInfer 的 decode wrapper 加 FP4 KV 支持。需要 FlashInfer
 端为 `dtype_kv = float4_e2m1fn_x2` 加 kernel template。比赛时间线内
 不可行。
 
-### 验证流程（方案 A）
+### 方案 C（推荐）—— 冻结 CHANGE_0131/0132
+
+保留四个启动期 bug 修复 commit，作为通用加固（`SOAR_FP4_KV_CACHE=0`
+默认下它们在运行期不产生任何代价）。FP4 KV 实验冻结，除非：
+
+- 其他代码路径需要该 KV 内存节省（例如面对官方超长上下文速度集出现 OOM）。
+- 主线 FlashInfer 原生加了 FP4 KV 支持（方案 B 自动过期）。
+
+转轻是优先走 `OPTIMIZATION_CATALOG_GPTQ_FP8_DENSE.md` 里高 ROI 的优化。
+
+### 验证流程（仅当采用方案 A′ 时才需要）
 
 ```bash
 # 1. 同步 + 重启
@@ -116,11 +128,79 @@ git push minicpm-src mixed_minicpm_cudagraph
 
 ## 7. 下一步建议
 
-1. 方案 A 在 dense 上 smoke 绿、精度 ≥ 75% 后：
-   - 量化释放出来的 KV 内存能带来多少吞吐 / max-running-requests 提升。
-   - 增益 < 5%：放下，转 Marlin tile 工作。
-   - 增益 ≥ 5%：开 CHANGE_0133，把 sparse 路径下的 FP4 重启
-     （CHANGE_0131 §3 Gap A + B）。
-2. 方案 A 精度不过：怀疑 MiniCPMAttentionBackend 的 dense 路径在
-   `minicpm_flashinfer` 与主线 `flashinfer` 之间存在分歧 —— 调 per-layer
-   输出对照。
+鉴于 §8，推荐 **方案 C —— 比赛时间线内冻结 FP4 KV**：
+
+1. 保留 R13 的四个加固 commit（`d4608f170`、`fd7e797ea`、
+   `252cc4d64`、`8a0976593`）。`SOAR_FP4_KV_CACHE=0` 时它们是闲置的。
+2. 转轻其他目录项（Marlin tile 调优、调度、推测解码变体等）。
+3. 仅在以下情况重反 FP4 KV：
+   - 主线 FlashInfer 加了 FP4 KV decode kernel（方案 B 自动过期）。
+   - 有证据表明官方长上下文速度集 FP8 KV 会 OOM（内存压力压过
+     方案 A′ 的 fork 成本）。
+
+## 8. Round 13b 代码审查 —— 证据方案 A 不可行
+
+在 commit `49a7ed5f4` 上对
+`python/sglang/srt/layers/attention/minicpm_backend.py` 逐行核实。
+
+### 发现 1 —— 后端硬要求 `has_sparse_attention=True`
+
+[L221-230](../../python/sglang/srt/layers/attention/minicpm_backend.py#L221-L230)：
+
+```python
+self.has_sparse_attention = hf_config is not None and getattr(
+    hf_config, "has_sparse_attention", False
+)
+if not self.has_sparse_attention:
+    raise ValueError(
+        "MiniCPM model must have sparse attention enabled. "
+        "Please ensure the model config has 'has_sparse_attention=True'."
+    )
+```
+
+同时 [`model_config.py` L238 / L248](../../python/sglang/srt/configs/model_config.py#L238)
+上 `force_dense_minicpm=True` 会把 `has_sparse_attention` 覆盖为
+False。所以生产配置下该后端 **根本初始化不了**。
+
+### 发现 2 —— `forward_decode` 没有 dense 分支
+
+[L1130-1300](../../python/sglang/srt/layers/attention/minicpm_backend.py#L1130-L1300)
+无条件执行：
+
+```python
+topk_idx = self.get_topk_for_sparse(
+    q_reshaped.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
+    1, layer, forward_batch, False,
+)
+sparse_page_table = sparse_kernel_extension.get_block_table_v3(...)
+```
+
+没有 `if not is_sparse_layer: ...` 分支，也没有 `force_dense_minicpm`
+短路。所有 decode 调用都走 sparse top-k 路径。
+
+### 发现 3 —— `forward_extend` 的 `else` 分支也是 sparse 形状
+
+[L989-1056](../../python/sglang/srt/layers/attention/minicpm_backend.py#L989-L1056)
+中 `max(seq_lens) >= self.dense_len` 走完整 sparse top-k，`else`
+分支仍走 `metadata.sparse_page_table`、`sparse_cache_seqlens_int32` 以及
+压缩 key 分配器。短序列也跳不开 sparse 管道。
+
+### 发现 4 —— config 层 `force_dense_minicpm` 的效果
+
+[`model_config.py` L237-238](../../python/sglang/srt/configs/model_config.py#L238)
+和 [L247-248](../../python/sglang/srt/configs/model_config.py#L248)
+强制 `has_sparse_attention → False`、`sparse_layer_ids → []`。
+发现 1 的 `raise` 加上空 `sparse_layer_ids` 让所谓“隐式方案 A”不可行。
+
+### 结论
+
+生产提交要求的组合（`GPTQ + --force-dense-minicpm +
+--kv-cache-dtype fp4_e2m1`）**没有便宜路径** 可以走到现有 CHANGE_0131
+plumbing。可行实现只有：
+
+- 方案 A′：在 `MiniCPMSparseBackend` 里 fork 出一条真正的 dense 路径
+  （重，几百行 LoC + cudagraph 重验证）。
+- 方案 B：主线 FlashInfer FP4 KV decode kernel（超出范围）。
+
+两者都不适合比赛时间线。推荐 **方案 C：冻结**。
+

@@ -123,3 +123,94 @@ W4A8 深度会话延续。
   - `fd7e797ea` fix(server_args): bypass KV4 MHA assert for minicpm_*
   - `252cc4d64` fix(server_args): 同时绕过 force_dense_minicpm 情况
   - `8a0976593` fix(memory_pool): MXFP4 KV 走 MHATokenToKVPoolFP4
+
+---
+
+## Round 13b — Q&A：`--force-dense-minicpm` 语义与 dense vs sparse 选择
+
+### 用户提问
+> 在动 0132 之前再问一下：如果 `kv_cache_dtype == "fp4_e2m1"` 时不再把 `minicpm_flashinfer` 改写成 `flashinfer`，那 `--force-dense-minicpm` 是不是意味着我们不用 sparse attention（没有 top-k 打分）而走 flashinfer 的 dense？我们 v18 baseline 是 W4A16 + FP8 KV + dense（不是 + sparse），因为本地 dense 比 sparse 速度更好。但理论上长输入 sparse 应该更快，为什么这里 dense 更好？是 FlashInfer 优化得更狠吗？
+
+### Agent 回答（已对源码核对）
+
+**`--force-dense-minicpm` 有两个独立效果：**
+
+1. **Config 层**（`python/sglang/srt/configs/model_config.py` L238 / L248）：
+   ```python
+   has_sparse_attention → False
+   sparse_layer_ids     → []
+   ```
+   ⇒ 模型图里**完全没有 sparse 层**。没有 top-k 打分、没有 sparse 层路由、没有 sparse Lightning。所有层都是 dense。
+2. **Backend 层**（`python/sglang/srt/server_args.py` L1521-1525）：
+   ```python
+   if self.force_dense_minicpm:
+       if self.attention_backend == "minicpm_flashattn":   self.attention_backend = "fa3"
+       elif self.attention_backend == "minicpm_flashinfer": self.attention_backend = "flashinfer"
+   ```
+   ⇒ MiniCPM 自定义后端被换成主线 FlashInfer / FA3。
+
+**v18 baseline = W4A16 + FP8 KV + 100% dense + 主线 FlashInfer**。确认。
+
+**为什么本地 dense 比 sparse 好 —— 三个叠加因素：**
+
+1. **本地速度数据集太短**。`speed_{s1,s8,smax}.jsonl` 是我们手搓的。sparse 的胜利来自 `O(top_k · L)` vs `O(L²)`，但临界点大约在 8-16K token。在 1-4K token 上，top-k 打分 + gather/scatter + 调度开销 **比节省的还多**。
+2. **主线 FlashInfer 在 Blackwell SM120 上优化得很好**。paged KV、fused FP8 dequant、连续的 TensorCore tile（CHANGE_0125 已加 SM120 Marlin tile 表）。MiniCPM sparse backend 主要是 Triton —— 正确性可靠，但 raw decode 吞吐通常比 FlashInfer 慢 20-40%。
+3. **GPTQ + sparse 在精度上是坏的**。Test 5/6：旧 fcloud 上 ~50% 精度。Test 8b：默认 top_k 下 76%。sparse 路径和 GPTQ 量化的 QKV 配合差 —— top-k 打分对量化噪声敏感。Test 9（GPTQ + bf16 KV + sparse）是唯一能用的 sparse-with-GPTQ 结果，79.67%。FP8 KV + sparse + GPTQ 精度直接崩。
+
+**官方** 已经宣布速度数据集比我们手搓的有更多长上下文样本。理论上 sparse 在那应该有用 —— 但只要 #3 不修，就不能上。所以生产配置必然是 dense + FP8 KV + GPTQ。
+
+### 对 CHANGE_0132 的影响
+
+`kv_cache_dtype == "fp4_e2m1"` 时跳过 **backend** 重写：
+
+- `has_sparse_attention` **还是 False**（`force_dense_minicpm` 的 config 层效果与 backend 重写互相独立）。sparse 层不会回来。还是纯 dense。
+- `MiniCPMAttentionBackend` 保持选中，每层都通过它走 dense attention，CHANGE_0131 的 FP4 plumbing 终于能跑起来。
+- **未解风险**：`MiniCPMAttentionBackend` 的 dense decode 路径在 SM120 上可能比主线 FlashInfer 慢。如果 FP4 KV 节省的 44% 内存带来的并发提升 / 吞吐提升 抵不过 kernel 差距，那即使能启动且精度过，速度也是负收益。
+
+### 决定
+
+用户选保守路线：
+
+1. **先**做 `MiniCPMAttentionBackend.forward_decode` 代码审查，事先评估它的 dense decode 在 SM120 上是否能跟主线 FlashInfer 抗衡 —— 看会不会有速度悬崖。
+2. **然后**实现方案 A，在 fcloud 上量化（smoke → 精度 → S1/S8/Smax）。
+
+### 交叉引用
+
+- [server_args.py L1521-1525](../../../python/sglang/srt/server_args.py#L1521-L1525) —— backend 重写
+- [model_config.py L238](../../../python/sglang/srt/configs/model_config.py#L238) / [L248](../../../python/sglang/srt/configs/model_config.py#L248) —— sparse 层关闭
+- [TEST_RESULTS_TRACKING.md](../TEST_RESULTS_TRACKING.md) Test 5/6/8b/9/12 —— GPTQ sparse-vs-dense 实测史
+- [CHANGE_0132_nvfp4_kv_force_dense_compat.zh.md](../CHANGE_0132_nvfp4_kv_force_dense_compat.zh.md) §3 方案 A
+
+---
+
+## Round 13c — 代码审查结论：方案 A 不可行
+
+### 用户提问
+> 把上面那个回答记录下来供以后参考。先做 (1)（审 `MiniCPMAttentionBackend.forward_decode`），然后再做 (2)（跑方案 A 测量）。
+
+### Agent 操作
+通读 `python/sglang/srt/layers/attention/minicpm_backend.py`，得到四个否定方案 A 的发现：
+
+1. **`MiniCPMSparseBackend.__init__` L226-230**：`has_sparse_attention=False` 时直接 `raise ValueError`。
+2. **`force_dense_minicpm=True` 在 config 层把 `has_sparse_attention` 强制为 False**（`model_config.py` L238）。
+3. **`forward_decode` L1130-1300** 无条件调 `get_topk_for_sparse` + `sparse_kernel_extension.get_block_table_v3`，没有 dense 分支。
+4. **`forward_extend` L989+** 两条分支都走 `metadata.sparse_page_table`。短序列也跳不开 sparse 管道。
+
+⇒ 在 `--force-dense-minicpm` 下，自定义后端 **连初始化都失败**；即便能初始化，每条路径都是 sparse top-k。我之前说"MiniCPMAttentionBackend 已支持 dense-only batch"是错的。
+
+### 结论
+- **方案 A（FP4 时跳过重写）已死**。没做任何实现。
+- **方案 A′（修订版）** 需要在 `MiniCPMSparseBackend` 里 fork：放宽 init 守卫，在 `forward_decode`/`forward_extend` 加 `is_dense_run` 分支跳过 top-k、直接用完整 `page_table` 走已经导入的 `BatchDecodeWithPagedKVCacheWrapper`，cudagraph buffer 重新分配。工作量：几百行 LoC + 仔细的 cudagraph 重验证。不是 1 天能搞定的。
+- **方案 B**（主线 FlashInfer 加 FP4 KV）需要上游 kernel template —— 超出比赛时间线。
+- **推荐：方案 C —— 冻结 CHANGE_0131/0132**。保留 R13 的四个加固 commit（`d4608f170`、`fd7e797ea`、`252cc4d64`、`8a0976593`），`SOAR_FP4_KV_CACHE=0`（默认）时它们在运行期是闲置的。转其他目录项。
+- 已更新 `CHANGE_0132_nvfp4_kv_force_dense_compat.{en,zh}.md`：新增 §8 "Round 13b 代码审查"，列 L221-L230 / L1130-L1300 / L989-L1056 证据；§7 改为推荐方案 C。
+
+### Agent 没有进入第 (2) 步
+
+第 (2) 步（跑方案 A 测量）已无意义，因为方案 A 已被证伪。在花 fcloud 时间之前先把这个结论交给用户。
+
+### 交叉引用
+- [CHANGE_0132_nvfp4_kv_force_dense_compat.zh.md](../CHANGE_0132_nvfp4_kv_force_dense_compat.zh.md) §8
+- [minicpm_backend.py L221-L230](../../../python/sglang/srt/layers/attention/minicpm_backend.py#L221-L230)
+- [minicpm_backend.py L1130-L1300](../../../python/sglang/srt/layers/attention/minicpm_backend.py#L1130-L1300)
+- [model_config.py L238](../../../python/sglang/srt/configs/model_config.py#L238)
