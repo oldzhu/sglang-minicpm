@@ -145,14 +145,37 @@ Why: `MHATokenToKVPoolFP4._get_key_buffer/_get_value_buffer` already returns deq
 
 ## 5. Result summary table
 
-To be filled after fcloud smoke + accuracy + speed.
+Smoke test (Round 13) — RED. The server cannot boot under the baseline
+config (`--force-dense-minicpm` + `--kv-cache-dtype fp4_e2m1`).
 
 | Variant | Baseline (FP8 KV) | New (FP4 KV) | Δ |
 |---|---|---|---|
-| S1 (s) | 121.71 | TBD | TBD |
-| S8 (s) | 44.09 | TBD | TBD |
-| Smax (s) | 35.86 | TBD | TBD |
-| ori_accuracy | 79.29% | TBD | TBD |
+| S1 (s) | 121.71 | n/a — boot blocked | — |
+| S8 (s) | 44.09 | n/a — boot blocked | — |
+| Smax (s) | 35.86 | n/a — boot blocked | — |
+| ori_accuracy | 79.29% | n/a — boot blocked | — |
+
+### 5.1 Boot-time bug chain found and fixed (committed)
+
+| # | Symptom | Root cause | Fix commit |
+|---|---|---|---|
+| 1 | `AssertionError: KV4 MHA expects attention_backend ['triton','torch_native','flex_attention','trtllm_mha'], got flashinfer` | Stock `_handle_kv4_compatibility()` whitelist does not match MiniCPM custom backend (`minicpm_flashinfer`) and does not match the post-`force_dense_minicpm` rewrite (`flashinfer`). | `fd7e797ea` (minicpm prefix bypass) + `252cc4d64` (force_dense_minicpm bypass) |
+| 2 | `NotImplementedError: "fill_cuda" not implemented for 'Float4_e2m1fn_x2'` from `torch.zeros(..., dtype=fp4_e2m1fn_x2)` | `HybridLinearKVPool` always picks `MHATokenToKVPool`, ignoring the existing `MHATokenToKVPoolFP4` class which allocates `uint8`-packed K/V plus an e8m0 shared-exponent buffer. | `8a0976593` (route fp4 to FP4 pool) |
+| 3 | `KeyError: torch.float4_e2m1fn_x2` from `flashinfer.decode.get_batch_decode_uri` | **Architectural blocker.** `--force-dense-minicpm` rewrites `attention_backend = "minicpm_flashinfer"` → `"flashinfer"` in `_handle_model_specific_adjustments`. Standard FlashInfer has no FP4 KV support. | **NOT FIXED** — see §7 below |
+
+### 5.2 Architectural blocker (bug #3)
+
+The CHANGE_0131 plumbing lives entirely in `MiniCPMAttentionBackend`
+(`python/sglang/srt/layers/attention/minicpm_backend.py`). When users
+pass `--force-dense-minicpm`, `_handle_model_specific_adjustments`
+unconditionally rewrites `minicpm_flashinfer` → `flashinfer`, which
+bypasses our backend and lands on stock FlashInfer's `BatchDecode` —
+which has no compiled FP4 KV decode kernel.
+
+The current production submission **always** passes
+`--force-dense-minicpm` (it is part of `SGLANG_SERVER_ARGS` for the
+GPTQ baseline), so we cannot reach the FP4 codepath without further
+work.
 
 ## 6. Rollback instructions
 
@@ -161,11 +184,33 @@ git revert <commit-hash>
 git push minicpm-src mixed_minicpm_cudagraph
 ```
 
-Or simply set `--kv-cache-dtype fp8_e5m2` back in `prepare_env.sh` — code keeps both paths.
+Or simply set `SOAR_FP4_KV_CACHE=0` in environment (default) — the
+opt-in toggle keeps the FP8 baseline path live. The three bug-fix
+commits (kv4-compat bypass + memory-pool routing) are independent
+hardenings and can stay landed.
 
 ## 7. Next-step suggestions
 
-1. After smoke green, run accuracy + speed on dense-only.
-2. If both pass: CHANGE_0132 to re-enable sparse path with FP4 (Gaps A + B).
-3. If accuracy fails: investigate per-layer FP4 sensitivity, consider hybrid (FP4 for shallow layers, FP8 for top layers).
-4. Profile cudagraph capture with `KVFP4QuantizeUtil`; if breaks, rewrite quant/dequant as Triton kernels.
+The boot-time fixes (commits `fd7e797ea`, `252cc4d64`, `8a0976593`)
+are correct and should remain landed — they are general hardening
+for any future MiniCPM + FP4 work.
+
+To actually exercise FP4 KV on the production config, **CHANGE_0132**
+must do one of:
+
+- **Option A (preferred — small change):** Skip the
+  `minicpm_flashinfer` → `flashinfer` rewrite when
+  `kv_cache_dtype == "fp4_e2m1"`. The MiniCPM custom backend
+  already handles dense-only batches when `--force-dense-minicpm`
+  is set; we just need to keep using it (instead of stock
+  flashinfer) so the FP4 plumbing in `minicpm_backend.py` is
+  reached. Then re-run the §3 validation pipeline.
+- **Option B (heavier — weeks of work):** Add FP4 KV support to
+  stock `flashinfer_backend` (requires flashinfer-side kernel
+  templates for `dtype_kv = float4_e2m1fn_x2`). Out of scope for
+  competition timeline.
+- **Option C (sparse re-enable, after Option A passes):**
+  CHANGE_0133 re-enables the sparse path under FP4 (Gaps A + B in
+  CHANGE_0131 §3).
+
+Recommend proceeding with Option A in the next iteration.

@@ -92,3 +92,34 @@ Authored:
 - [SURVEY_NVFP4_KV_P1_20260428_1130.en.md](../SURVEY_NVFP4_KV_P1_20260428_1130.en.md)
 - [OPTIMIZATION_CATALOG_GPTQ_FP8_DENSE.md](../OPTIMIZATION_CATALOG_GPTQ_FP8_DENSE.md) (W4-FP8 → RED, NVFP4 KV → P2-NEXT)
 - [spike_w4fp8/bench_w4fp8_sm120.cu](../spike_w4fp8/bench_w4fp8_sm120.cu) (with cvt fix)
+
+---
+
+## Round 13 — CHANGE_0131 fcloud smoke (RED, architectural blocker)
+
+### User asks
+- "started" — implicit approval to run the §3 validation pipeline from CHANGE_0131 (sync → restart with `SOAR_FP4_KV_CACHE=1` → wait → S1 smoke → accuracy → S8/Smax).
+
+### Agent actions
+1. Committed `prepare_env.sh` SOAR_FP4_KV_CACHE toggle (`d4608f170`) and pushed.
+2. Synced to fcloud, launched server with `SOAR_FP4_KV_CACHE=1 SOAR_QUANT_MODE=gptq`.
+3. **Bug #1**: `_handle_kv4_compatibility` rejects `flashinfer` backend. Patched to early-return for `minicpm_*` backends (`fd7e797ea`).
+4. Re-launched, hit same assert because `force_dense_minicpm` had already rewritten `minicpm_flashinfer` → `flashinfer`. Patched again (`252cc4d64`).
+5. Re-launched, hit `NotImplementedError: "fill_cuda" not implemented for 'Float4_e2m1fn_x2'`. Routed `HybridLinearKVPool` to use existing `MHATokenToKVPoolFP4` class when `dtype == fp4_e2m1fn_x2` (`8a0976593`).
+6. Re-launched, KV pool allocates correctly (27 GB packed) — but cudagraph capture fails: `KeyError: torch.float4_e2m1fn_x2` from `flashinfer.decode.get_batch_decode_uri`.
+7. Diagnosed: `--force-dense-minicpm` rewrites attention_backend `minicpm_flashinfer` → `flashinfer` (stock FlashInfer), which has no compiled FP4 KV decode kernel. Our CHANGE_0131 plumbing only lives in `MiniCPMAttentionBackend`.
+8. Shut down fcloud per cost rule.
+9. Updated CHANGE_0131 §5/§6/§7 (EN+ZH) with the bug chain table, architectural-blocker analysis, and three Option A/B/C paths forward.
+
+### Outcomes
+- **CHANGE_0131 P2 plumbing smoke = RED on the production config.** The KV cache plumbing in `MiniCPMAttentionBackend` is correct, but the `--force-dense-minicpm` argument on which the GPTQ baseline depends bypasses our backend entirely. The combination "force-dense + FP4 KV" is unreachable without further changes.
+- **3 boot-time bug fixes landed** (kv4-compat bypass × 2 + memory-pool routing). They are general hardening and should remain even if FP4 KV is parked.
+- **Recommended next step (CHANGE_0132)**: Option A — skip the `minicpm_flashinfer → flashinfer` rewrite when `kv_cache_dtype == "fp4_e2m1"`, so the MiniCPM custom backend (which already supports dense-only batches under `force_dense_minicpm`) handles FP4 dequant via `KVFP4QuantizeUtil`. ~1 day. After Option A green, revisit Options C (sparse re-enable).
+
+### Cross-references
+- [CHANGE_0131_nvfp4_kv_p2_plumbing.en.md](../CHANGE_0131_nvfp4_kv_p2_plumbing.en.md) §5.1, §5.2, §7
+- Commits on `mixed_minicpm_cudagraph`:
+  - `d4608f170` feat(prepare_env): SOAR_FP4_KV_CACHE toggle
+  - `fd7e797ea` fix(server_args): bypass KV4 MHA assert for minicpm_* attention
+  - `252cc4d64` fix(server_args): also bypass for force_dense_minicpm
+  - `8a0976593` fix(memory_pool): route MXFP4 KV through MHATokenToKVPoolFP4

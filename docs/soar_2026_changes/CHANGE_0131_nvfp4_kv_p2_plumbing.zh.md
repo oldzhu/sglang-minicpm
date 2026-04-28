@@ -144,14 +144,35 @@ if (
 
 ## 5. 结果汇总表
 
-fcloud smoke + 精度 + 速度跑完后填。
+Smoke 测试（Round 13）—— RED。基线配置（`--force-dense-minicpm` +
+`--kv-cache-dtype fp4_e2m1`）下 server 无法启动。
 
 | 变体 | 基线（FP8 KV）| 新（FP4 KV）| Δ |
 |---|---|---|---|
-| S1 (s) | 121.71 | TBD | TBD |
-| S8 (s) | 44.09 | TBD | TBD |
-| Smax (s) | 35.86 | TBD | TBD |
-| ori_accuracy | 79.29% | TBD | TBD |
+| S1 (s) | 121.71 | n/a — 启动被阻断 | — |
+| S8 (s) | 44.09 | n/a — 启动被阻断 | — |
+| Smax (s) | 35.86 | n/a — 启动被阻断 | — |
+| ori_accuracy | 79.29% | n/a — 启动被阻断 | — |
+
+### 5.1 已发现并修复的启动期 bug 链（已提交）
+
+| # | 现象 | 根因 | 修复 commit |
+|---|---|---|---|
+| 1 | `AssertionError: KV4 MHA expects attention_backend ['triton','torch_native','flex_attention','trtllm_mha'], got flashinfer` | 主线 `_handle_kv4_compatibility()` 白名单没考虑 MiniCPM 自定义后端（`minicpm_flashinfer`），也没考虑 `force_dense_minicpm` 把它重写成 `flashinfer` 后的情况。 | `fd7e797ea`（minicpm 前缀绕过）+ `252cc4d64`（force_dense_minicpm 绕过）|
+| 2 | `NotImplementedError: "fill_cuda" not implemented for 'Float4_e2m1fn_x2'`，来自 `torch.zeros(..., dtype=fp4_e2m1fn_x2)` | `HybridLinearKVPool` 永远使用 `MHATokenToKVPool`，忽略了文件里已经存在的 `MHATokenToKVPoolFP4`（uint8 打包 K/V + e8m0 共享指数缓冲）。 | `8a0976593`（fp4 路由到 FP4 池）|
+| 3 | `KeyError: torch.float4_e2m1fn_x2`，来自 `flashinfer.decode.get_batch_decode_uri` | **架构性阻断。** `--force-dense-minicpm` 在 `_handle_model_specific_adjustments` 里把 `attention_backend = "minicpm_flashinfer"` 改写成 `"flashinfer"`。主线 FlashInfer 没有 FP4 KV 支持。 | **未修复** —— 见 §7 |
+
+### 5.2 架构阻断（bug #3）
+
+CHANGE_0131 的全部 plumbing 都在 `MiniCPMAttentionBackend`
+（`python/sglang/srt/layers/attention/minicpm_backend.py`）。但传入
+`--force-dense-minicpm` 时，`_handle_model_specific_adjustments`
+会无条件把 `minicpm_flashinfer` 重写为 `flashinfer`，绕过我们的后端，
+落到主线 FlashInfer 的 `BatchDecode` —— 它根本没编译 FP4 KV 的 decode
+kernel。
+
+当前生产提交 **始终** 带 `--force-dense-minicpm`（GPTQ baseline 的
+`SGLANG_SERVER_ARGS` 写死），所以不进一步改造就根本碰不到 FP4 代码路径。
 
 ## 6. 回滚说明
 
@@ -160,11 +181,26 @@ git revert <commit-hash>
 git push minicpm-src mixed_minicpm_cudagraph
 ```
 
-或在 `prepare_env.sh` 改回 `--kv-cache-dtype fp8_e5m2` —— 代码两条路径都保留。
+或者把环境变量 `SOAR_FP4_KV_CACHE` 设为 0（默认）—— opt-in 开关保留 FP8
+基线路径。三个 bug 修复 commit（kv4-compat 绕过 + memory-pool 路由）属于
+通用加固，可以保留。
 
 ## 7. 下一步建议
 
-1. Smoke 绿后跑 dense-only 精度 + 速度。
-2. 都过：CHANGE_0132 重启 sparse 路径下的 FP4（Gap A + B）。
-3. 精度不过：分析 per-layer FP4 敏感度，考虑混合（浅层 FP4，顶层 FP8）。
-4. 用 `KVFP4QuantizeUtil` 做 cudagraph capture 的 profile；如果断了，重写 quant/dequant 为 Triton kernel。
+启动期修复 commit（`fd7e797ea`、`252cc4d64`、`8a0976593`）是正确的，
+应保留 —— 它们对未来任何 MiniCPM + FP4 工作都是通用加固。
+
+要在生产配置上真正跑通 FP4 KV，**CHANGE_0132** 必须在以下中选一个：
+
+- **方案 A（首选 —— 小改动）：** 当 `kv_cache_dtype == "fp4_e2m1"` 时，
+  跳过 `minicpm_flashinfer` → `flashinfer` 的重写。MiniCPM 自定义后端
+  在 `--force-dense-minicpm` 下本来就能处理 dense-only batch，我们只
+  要继续用它（而不是主线 flashinfer），就能命中
+  `minicpm_backend.py` 里的 FP4 plumbing。然后重跑 §3 验证流程。
+- **方案 B（更重 —— 数周工作量）：** 给主线 `flashinfer_backend` 加
+  FP4 KV 支持（需要 flashinfer 端的
+  `dtype_kv = float4_e2m1fn_x2` kernel template）。比赛时间线内不可行。
+- **方案 C（在方案 A 通过后开 sparse）：** CHANGE_0133 重启 sparse
+  路径下的 FP4（CHANGE_0131 §3 中的 Gap A + B）。
+
+建议下一轮直接走方案 A。

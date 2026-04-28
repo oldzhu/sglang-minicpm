@@ -92,3 +92,34 @@ W4A8 深度会话延续。
 - [SURVEY_NVFP4_KV_P1_20260428_1130.zh.md](../SURVEY_NVFP4_KV_P1_20260428_1130.zh.md)
 - [OPTIMIZATION_CATALOG_GPTQ_FP8_DENSE.md](../OPTIMIZATION_CATALOG_GPTQ_FP8_DENSE.md)（W4-FP8 → RED，NVFP4 KV → P2-NEXT）
 - [spike_w4fp8/bench_w4fp8_sm120.cu](../spike_w4fp8/bench_w4fp8_sm120.cu)（含 cvt 修复）
+
+---
+
+## Round 13 — CHANGE_0131 fcloud smoke（RED，架构阻断）
+
+### 用户提问
+- "started" —— 隐式批准跑 CHANGE_0131 §3 验证流程（sync → 用 `SOAR_FP4_KV_CACHE=1` 重启 → wait → S1 smoke → 精度 → S8/Smax）。
+
+### Agent 操作
+1. 提交 `prepare_env.sh` 的 SOAR_FP4_KV_CACHE 开关（`d4608f170`）并推送。
+2. 同步到 fcloud，用 `SOAR_FP4_KV_CACHE=1 SOAR_QUANT_MODE=gptq` 启动 server。
+3. **Bug #1**：`_handle_kv4_compatibility` 拒绝 `flashinfer` backend。改成 `minicpm_*` 后端早返回（`fd7e797ea`）。
+4. 重启又中同一个 assert，因为 `force_dense_minicpm` 已经把 `minicpm_flashinfer` 改写成 `flashinfer`。再补一次（`252cc4d64`）。
+5. 重启，撞 `NotImplementedError: "fill_cuda" not implemented for 'Float4_e2m1fn_x2'`。把 `HybridLinearKVPool` 路由到现有的 `MHATokenToKVPoolFP4`（`8a0976593`）。
+6. 重启，KV pool 分配成功（27 GB 打包大小）—— 但 cudagraph capture 挂：`KeyError: torch.float4_e2m1fn_x2`，来自 `flashinfer.decode.get_batch_decode_uri`。
+7. 诊断：`--force-dense-minicpm` 把 attention_backend `minicpm_flashinfer` 改写成 `flashinfer`（主线 FlashInfer），主线根本没编译 FP4 KV decode kernel。我们 CHANGE_0131 的 plumbing 只在 `MiniCPMAttentionBackend` 里。
+8. 按 cost 规则关停 fcloud。
+9. 更新 CHANGE_0131 §5/§6/§7（EN+ZH），带 bug 链表、架构阻断分析，给出方案 A/B/C。
+
+### 结论
+- **CHANGE_0131 P2 plumbing smoke = 在生产配置上 RED**。`MiniCPMAttentionBackend` 里的 KV 路径写对了，但 GPTQ baseline 必带的 `--force-dense-minicpm` 把我们绕掉。"force-dense + FP4 KV" 这个组合不再做改动就够不到。
+- **3 个启动期 bug 修复已合入**（kv4-compat 绕过 × 2 + memory-pool 路由）。属于通用加固，即便 FP4 KV 被 park 也应保留。
+- **下一步建议（CHANGE_0132）**：方案 A —— 当 `kv_cache_dtype == "fp4_e2m1"` 时跳过 `minicpm_flashinfer → flashinfer` 重写，让 MiniCPM 自定义后端（在 `force_dense_minicpm` 下本来就能处理 dense-only batch）走自己的 FP4 dequant（`KVFP4QuantizeUtil`）。约 1 天。方案 A 通过后再考虑方案 C（sparse 重启）。
+
+### 交叉引用
+- [CHANGE_0131_nvfp4_kv_p2_plumbing.zh.md](../CHANGE_0131_nvfp4_kv_p2_plumbing.zh.md) §5.1、§5.2、§7
+- `mixed_minicpm_cudagraph` 上的 commit：
+  - `d4608f170` feat(prepare_env): SOAR_FP4_KV_CACHE 开关
+  - `fd7e797ea` fix(server_args): bypass KV4 MHA assert for minicpm_*
+  - `252cc4d64` fix(server_args): 同时绕过 force_dense_minicpm 情况
+  - `8a0976593` fix(memory_pool): MXFP4 KV 走 MHATokenToKVPoolFP4
