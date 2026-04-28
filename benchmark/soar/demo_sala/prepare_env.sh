@@ -146,12 +146,23 @@ else
 	KV_CACHE_DTYPE_ARG="fp8_e5m2"
 fi
 
+# SOAR Round 13d: opt-in switch to drop --force-dense-minicpm so the model
+# runs in native sparse mode (8 minicpm4 sparse-attention layers + 24
+# lightning-attn layers). Default off = current dense submission baseline.
+# Set SOAR_SPARSE_MODE=1 to enable native sparse path for retesting.
+export SOAR_SPARSE_MODE="${SOAR_SPARSE_MODE:-0}"
+if [[ "$SOAR_SPARSE_MODE" == "1" || "$SOAR_SPARSE_MODE" == "true" || "$SOAR_SPARSE_MODE" == "TRUE" ]]; then
+	FORCE_DENSE_ARG=""
+else
+	FORCE_DENSE_ARG=" --force-dense-minicpm"
+fi
+
 if [[ "$QUANT_MODE" == "gptq" ]]; then
 	FUSED_QK_NORM_ROPE_ARG=""
 	if [[ "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "1" || "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "true" || "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "TRUE" ]]; then
 		FUSED_QK_NORM_ROPE_ARG=" --enable-fused-qk-norm-rope"
 	fi
-	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 32768 --max-prefill-tokens 32768 --prefill-max-requests 1 --max-running-requests 24 --mem-fraction-static 0.84 --schedule-conservativeness 1.0 --dense-as-sparse --quantization gptq_marlin --force-dense-minicpm --kv-cache-dtype ${KV_CACHE_DTYPE_ARG}${FUSED_QK_NORM_ROPE_ARG} --enable-torch-compile --torch-compile-max-bs 8 --enable-mixed-chunk"
+	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 32768 --max-prefill-tokens 32768 --prefill-max-requests 1 --max-running-requests 24 --mem-fraction-static 0.84 --schedule-conservativeness 1.0 --dense-as-sparse --quantization gptq_marlin${FORCE_DENSE_ARG} --kv-cache-dtype ${KV_CACHE_DTYPE_ARG}${FUSED_QK_NORM_ROPE_ARG} --enable-torch-compile --torch-compile-max-bs 8 --enable-mixed-chunk"
 elif [[ "$QUANT_MODE" == "fp8_blockwise" ]]; then
 	# FP8 blockwise: pre-quantized offline weights (N,K) float8_e4m3fn + blockwise scales
 	# Uses SM120 UMMA kernel (fp8_blockwise_scaled_mm) via weight.t() col-major zero-copy
