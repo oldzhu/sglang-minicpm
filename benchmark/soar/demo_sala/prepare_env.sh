@@ -136,12 +136,22 @@ export SGLANG_FLA_CHUNK_SIZE="${SGLANG_FLA_CHUNK_SIZE:-64}"
 # docs/soar_2026_changes/PROPOSAL_iteration_W4A8_001.{en,zh}.md.
 export SOAR_W4A8_FP8_GEMM="${SOAR_W4A8_FP8_GEMM:-0}"
 
+# SOAR CHANGE_0131: opt-in MXFP4 KV cache (--kv-cache-dtype fp4_e2m1).
+# Default off (FP8 e5m2 baseline). Set SOAR_FP4_KV_CACHE=1 to enable.
+# See docs/soar_2026_changes/CHANGE_0131_nvfp4_kv_p2_plumbing.{en,zh}.md.
+export SOAR_FP4_KV_CACHE="${SOAR_FP4_KV_CACHE:-0}"
+if [[ "$SOAR_FP4_KV_CACHE" == "1" || "$SOAR_FP4_KV_CACHE" == "true" || "$SOAR_FP4_KV_CACHE" == "TRUE" ]]; then
+	KV_CACHE_DTYPE_ARG="fp4_e2m1"
+else
+	KV_CACHE_DTYPE_ARG="fp8_e5m2"
+fi
+
 if [[ "$QUANT_MODE" == "gptq" ]]; then
 	FUSED_QK_NORM_ROPE_ARG=""
 	if [[ "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "1" || "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "true" || "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "TRUE" ]]; then
 		FUSED_QK_NORM_ROPE_ARG=" --enable-fused-qk-norm-rope"
 	fi
-	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 32768 --max-prefill-tokens 32768 --prefill-max-requests 1 --max-running-requests 24 --mem-fraction-static 0.84 --schedule-conservativeness 1.0 --dense-as-sparse --quantization gptq_marlin --force-dense-minicpm --kv-cache-dtype fp8_e5m2${FUSED_QK_NORM_ROPE_ARG} --enable-torch-compile --torch-compile-max-bs 8 --enable-mixed-chunk"
+	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 32768 --max-prefill-tokens 32768 --prefill-max-requests 1 --max-running-requests 24 --mem-fraction-static 0.84 --schedule-conservativeness 1.0 --dense-as-sparse --quantization gptq_marlin --force-dense-minicpm --kv-cache-dtype ${KV_CACHE_DTYPE_ARG}${FUSED_QK_NORM_ROPE_ARG} --enable-torch-compile --torch-compile-max-bs 8 --enable-mixed-chunk"
 elif [[ "$QUANT_MODE" == "fp8_blockwise" ]]; then
 	# FP8 blockwise: pre-quantized offline weights (N,K) float8_e4m3fn + blockwise scales
 	# Uses SM120 UMMA kernel (fp8_blockwise_scaled_mm) via weight.t() col-major zero-copy
