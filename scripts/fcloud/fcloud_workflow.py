@@ -51,6 +51,7 @@ FCLOUD_SIM = "/root/submission_sim"
 FCLOUD_DATA = "/root/data"
 MODEL_PATH = "/root/models/openbmb/MiniCPM-SALA-90-qa-cwe-mcq-sparse_qkv_w8"
 FP8_MODEL_PATH = "/root/models/minicpm_fp8_blockwise"
+NOQUANT_MODEL_PATH = "/root/models/openbmb/MiniCPM-SALA"
 HOST = "0.0.0.0"
 PORT = 30000
 API_BASE = f"http://127.0.0.1:{PORT}"
@@ -260,7 +261,12 @@ def step_restart_server(base_url, token, quant_mode="gptq", model_path=None):
     print_section("RESTART SERVER")
 
     if model_path is None:
-        model_path = FP8_MODEL_PATH if quant_mode == "fp8_blockwise" else MODEL_PATH
+        if quant_mode == "fp8_blockwise":
+            model_path = FP8_MODEL_PATH
+        elif quant_mode == "noquant":
+            model_path = NOQUANT_MODEL_PATH
+        else:
+            model_path = MODEL_PATH
 
     print(f"[restart-server] quant_mode={quant_mode}, model_path={model_path}")
 
@@ -660,7 +666,7 @@ def main():
     sub.add_parser("full", help="Full workflow: sync → restart → accuracy")
     sub.add_parser("sync", help="Git pull and copy changed files")
     p_restart = sub.add_parser("restart-server", help="Restart sglang server")
-    p_restart.add_argument("--quant-mode", choices=["gptq", "fp8_blockwise"], default="gptq",
+    p_restart.add_argument("--quant-mode", choices=["gptq", "fp8_blockwise", "noquant"], default="gptq",
                            help="Quantization mode (default: gptq)")
     p_restart.add_argument("--model-path", type=str, default=None,
                            help="Override model path (default: auto from quant-mode)")

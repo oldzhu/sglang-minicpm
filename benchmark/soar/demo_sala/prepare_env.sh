@@ -177,6 +177,20 @@ elif [[ "$QUANT_MODE" == "fp8_blockwise" ]]; then
 		FUSED_QK_NORM_ROPE_ARG=" --enable-fused-qk-norm-rope"
 	fi
 	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 65536 --max-prefill-tokens 65536 --prefill-max-requests 4 --max-running-requests 24 --mem-fraction-static 0.84 --schedule-conservativeness 0.8 --quantization fp8_blockwise --force-dense-minicpm --kv-cache-dtype fp8_e5m2${FUSED_QK_NORM_ROPE_ARG} --enable-torch-compile --torch-compile-max-bs 8 --enable-mixed-chunk"
+elif [[ "$QUANT_MODE" == "noquant" ]]; then
+	# SOAR Round 13e Test 1: BF16 (no quantization) + native sparse + FP8 KV.
+	# Used to isolate whether the GPTQ + sparse + FP8 KV regression observed
+	# in Round 13d is GPTQ-specific or a global sparse-path regression on HEAD.
+	# - No --quantization (BF16 weights from MiniCPM-SALA-Copy / MiniCPM-SALA)
+	# - No --force-dense-minicpm (run the 8 sparse-attention layers natively)
+	# - No --enable-torch-compile (incompatible with sparse attn cudagraph capture)
+	# - Smaller --max-running-requests / mem-fraction (BF16 weights are ~3-4x larger
+	#   than 4-bit GPTQ weights, less HBM left for KV/activations).
+	FUSED_QK_NORM_ROPE_ARG=""
+	if [[ "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "1" || "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "true" || "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "TRUE" ]]; then
+		FUSED_QK_NORM_ROPE_ARG=" --enable-fused-qk-norm-rope"
+	fi
+	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 32768 --max-prefill-tokens 32768 --prefill-max-requests 1 --max-running-requests 8 --mem-fraction-static 0.78 --schedule-conservativeness 1.0 --dense-as-sparse --kv-cache-dtype fp8_e5m2${FUSED_QK_NORM_ROPE_ARG} --enable-mixed-chunk"
 fi
 
 # export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --log-level info"
