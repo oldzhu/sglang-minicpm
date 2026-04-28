@@ -1779,7 +1779,12 @@ class ServerArgs:
         # SOAR CHANGE_0131: MiniCPM custom attention backend manages its own
         # KV layout (incl. MXFP4 dequant via KVFP4QuantizeUtil). The stock
         # KV4-MHA backend assertion does not apply.
+        # Note: --force-dense-minicpm rewrites attention_backend
+        # "minicpm_flashinfer" -> "flashinfer" earlier in __post_init__,
+        # so we additionally check force_dense_minicpm.
         if self.attention_backend and str(self.attention_backend).startswith("minicpm"):
+            return
+        if getattr(self, "force_dense_minicpm", False):
             return
 
         use_mla_backend = self.use_mla_backend()
