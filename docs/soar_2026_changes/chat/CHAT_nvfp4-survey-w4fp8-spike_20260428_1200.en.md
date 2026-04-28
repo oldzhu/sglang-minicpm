@@ -214,3 +214,64 @@ Step 2 (run Option A and measure) is blocked because Option A is provably wrong.
 - [minicpm_backend.py L221-L230](../../../python/sglang/srt/layers/attention/minicpm_backend.py#L221-L230)
 - [minicpm_backend.py L1130-L1300](../../../python/sglang/srt/layers/attention/minicpm_backend.py#L1130-L1300)
 - [model_config.py L238](../../../python/sglang/srt/configs/model_config.py#L238)
+
+---
+
+## Round 13d — pre-decision discussion: best sparse results + per-layer behavior of `--force-dense-minicpm`
+
+### User asks
+1. What are our best accuracy + benchmark results for `W4A16 + FP8 KV + sparse` and `W4A16 + bf16 KV + sparse`?
+2. Under `--force-dense-minicpm`, sparse-attention layers run as dense softmax (no top-k, no sparse ops) — confirmed. What about lightning layers? Do they also become dense?
+
+### Agent answer
+
+**Q1 — best results we have**
+
+| Config | Best test | ori_acc | norm | C | mcq / qa / niah / cwe / fwe | accuracy-eval duration | Notes |
+|---|---|---|---|---|---|---|---|
+| GPTQ + FP8 KV + **sparse** | Test 8b (`9d3ecd168`) | 76.07% | 95.08% | **0** | 60 / 66.67 / 96.67 / 60.33 / 96.67 | 2411 s | FP8 KV breaks sparse top-k scoring (descale rounding) |
+| GPTQ + bf16 KV + **sparse** | Test 9 (`79e49f39f`) | **79.67%** | **99.58%** | **1.0** | 63.33 / 56.67 / 100 / 81.67 / 96.67 | 3157 s | Only sparse config that reaches C=1.0 |
+| GPTQ + FP8 KV + **dense** (current baseline) | Test 12 (`9e82efe43`) | 79.29% | 99.11% | **1.0** | 63.33 / 72 / 97.78 / 100 / 63.33 | 4244 s | S1=121.71s, S8=44.09s, Smax=35.86s |
+
+Key observation: **neither sparse config has S1/S8/Smax measured separately**. The "duration" column is the accuracy-eval total, not the speed-benchmark trio. Test 8b's 2411 s being smaller than Test 12's 4244 s is the duration of *running 150 accuracy samples at concurrency 8*, not S1/S8/Smax. We cannot conclude "sparse is faster" from it without dedicated speed runs.
+
+User raised the point that Test 8b's short eval duration could hint at better throughput. Counterpoint: in dense FP8 we already serve >100 tok/s, so a 2411s/4244s ratio is dominated by output-length differences (sparse runs may have shorter outputs because of accuracy regression — when answers are wrong/truncated they finish sooner, NOT because the model decoded faster).
+
+**Q2 — per-layer behavior under `--force-dense-minicpm`**
+
+Reading `model_config.py` L238/L248 + `minicpm.py` L546-590 + `configs/minicpm.py`:
+
+- `force_dense_minicpm=True` only overrides `has_sparse_attention` and `sparse_layer_ids`. It **does not** touch `mixer_types` / `lightning_layer_ids`.
+- Layer construction in `MiniCPMDecoderLayer.__init__` dispatches purely on `self.mixer_type` (per-layer string from `config.mixer_types[layer_id]`):
+
+| Per-layer mixer_type | Module | Backend | Effect of `--force-dense-minicpm` |
+|---|---|---|---|
+| `"minicpm4"` | `MiniCPMAttention` (softmax QKV) | The configured attention_backend | Backend rewrite: `minicpm_flashinfer → flashinfer` ⇒ **runs as dense softmax**, no top-k, no sparse_page_table |
+| `"lightning"` / `"lightning_attn"` | `MiniCPMLightningMixer` | `SimpleGLAAttnBackend` (linear-attn / chunked GLA) | **Untouched** — lightning is linear attention with hidden state; has no equivalent dense softmax form. The chunked-GLA kernel still runs |
+| `"attention"` / `"standard"` | `MiniCPMAttention` (softmax) | The configured attention_backend | Same as minicpm4: runs on stock FlashInfer dense |
+
+Conclusion: the **user's intuition was half-right**. Sparse softmax layers do convert to dense; lightning layers do **NOT** — they keep running through `SimpleGLAAttnBackend`. Whether our specific submission model has any lightning layers needs `config.json` inspection (user says expectation is 8 sparse + 24 lightning; pending fcloud inspection).
+
+### User input (champions context)
+> "Almost all champion posts use W4A16 + mixed FP4/FP8 KV cache. They didn't mention force-dense or sparse — I guess they use sparse default (otherwise they would mention)."
+
+This is a strong hint that the *winning* recipe might be **sparse + mixed-precision KV** rather than dense + uniform FP8 KV. Plausible, but with two caveats:
+1. We have direct evidence that **GPTQ + FP8 KV + sparse breaks accuracy** (Test 8b: 76.07%, far below 99% normalized threshold). The descale-rounding compounding in top-k is real.
+2. Champion posts may be using **per-layer mixed KV**: bf16 (or FP8 with very careful scaling) on the few sparse top-k-scoring layers, FP4/FP8 on the rest. We don't currently have this mixed-KV plumbing.
+
+### Decision context
+User wants to **retest GPTQ + FP8 KV + sparse**:
+- (a) to confirm the Test 8b accuracy regression on the new fcloud / current code (the model has been re-quantized since, and the kernels updated);
+- (b) to collect S1/S8/Smax for the sparse path, which we never did;
+- (c) to validate or refute the champion-recipe hypothesis.
+
+### Outcomes / pending
+- This Q&A documented in chat log (this entry).
+- User is starting fcloud so agent can inspect `config.json` of `MiniCPM-SALA-90-qa-cwe-mcq-sparse_qkv_w8` to confirm `mixer_types` (expected 8 minicpm4 + 24 lightning).
+- Next: agent will propose a concrete retest plan (sparse + FP8 KV: accuracy + speed S1/S8/Smax) once mixer_types is confirmed.
+
+### Cross-references
+- [TEST_RESULTS_TRACKING.md](../TEST_RESULTS_TRACKING.md) Tests 8b, 9, 12
+- [model_config.py L238 / L248](../../../python/sglang/srt/configs/model_config.py#L238)
+- [minicpm.py L546-L590](../../../python/sglang/srt/models/minicpm.py#L546-L590)
+- [configs/minicpm.py L145-L167](../../../python/sglang/srt/configs/minicpm.py#L145-L167)

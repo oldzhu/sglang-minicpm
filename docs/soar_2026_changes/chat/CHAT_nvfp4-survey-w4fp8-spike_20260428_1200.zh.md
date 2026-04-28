@@ -214,3 +214,64 @@ W4A8 深度会话延续。
 - [minicpm_backend.py L221-L230](../../../python/sglang/srt/layers/attention/minicpm_backend.py#L221-L230)
 - [minicpm_backend.py L1130-L1300](../../../python/sglang/srt/layers/attention/minicpm_backend.py#L1130-L1300)
 - [model_config.py L238](../../../python/sglang/srt/configs/model_config.py#L238)
+
+---
+
+## Round 13d — 决策前讨论：稀疏的最优结果 + `--force-dense-minicpm` 的逐层行为
+
+### 用户提问
+1. `W4A16 + FP8 KV + sparse` 和 `W4A16 + bf16 KV + sparse` 我们历史最好的精度+速度结果是什么？
+2. 加了 `--force-dense-minicpm` 之后，稀疏注意力层会以 dense softmax 运行（不再调 top-k 和稀疏算子）—— 已确认。那么 lightning 层呢？是否也变成 dense？
+
+### Agent 回答
+
+**Q1 —— 历史最好结果**
+
+| 配置 | 最佳测试 | ori_acc | norm | C | mcq / qa / niah / cwe / fwe | 精度评测时长 | 备注 |
+|---|---|---|---|---|---|---|---|
+| GPTQ + FP8 KV + **稀疏** | Test 8b (`9d3ecd168`) | 76.07% | 95.08% | **0** | 60 / 66.67 / 96.67 / 60.33 / 96.67 | 2411 s | FP8 KV 破坏稀疏 top-k 评分（descale 舍入误差）|
+| GPTQ + bf16 KV + **稀疏** | Test 9 (`79e49f39f`) | **79.67%** | **99.58%** | **1.0** | 63.33 / 56.67 / 100 / 81.67 / 96.67 | 3157 s | 唯一达到 C=1.0 的稀疏配置 |
+| GPTQ + FP8 KV + **dense**（当前 baseline）| Test 12 (`9e82efe43`) | 79.29% | 99.11% | **1.0** | 63.33 / 72 / 97.78 / 100 / 63.33 | 4244 s | S1=121.71s, S8=44.09s, Smax=35.86s |
+
+关键观察：**两个稀疏配置都没单独跑过 S1/S8/Smax**。表里 "时长" 是精度评测（150 样本 concurrency=8）的总时长，不是速度 benchmark trio。Test 8b 的 2411s < Test 12 的 4244s 不能直接推出 "稀疏更快"，差异多半来自输出长度（精度回退时模型答错或截断会更快结束，并不是 decode 真的快）。
+
+用户提出 Test 8b 的时长短可能预示更高吞吐。反驳：dense FP8 已经 >100 tok/s，2411/4244 的比值由输出长度主导，不是 decode 速度。
+
+**Q2 —— `--force-dense-minicpm` 下的逐层行为**
+
+读 `model_config.py` L238/L248 + `minicpm.py` L546-590 + `configs/minicpm.py`：
+
+- `force_dense_minicpm=True` 只改写 `has_sparse_attention` 和 `sparse_layer_ids`。**不会**动 `mixer_types` / `lightning_layer_ids`。
+- `MiniCPMDecoderLayer.__init__` 的层构建严格按 `self.mixer_type`（来自 `config.mixer_types[layer_id]`）分支：
+
+| 逐层 mixer_type | 模块 | 后端 | `--force-dense-minicpm` 的影响 |
+|---|---|---|---|
+| `"minicpm4"` | `MiniCPMAttention`（softmax QKV）| 配置的 attention_backend | 后端被改写：`minicpm_flashinfer → flashinfer` ⇒ **以 dense softmax 跑全 KV**，不调 top-k、不调 sparse_page_table |
+| `"lightning"` / `"lightning_attn"` | `MiniCPMLightningMixer` | `SimpleGLAAttnBackend`（线性注意力 / chunked GLA）| **不动** —— lightning 是带隐状态的线性注意力，没有 dense softmax 等价形式。chunked-GLA kernel 照常执行 |
+| `"attention"` / `"standard"` | `MiniCPMAttention`（softmax）| 配置的 attention_backend | 同 minicpm4：走 stock FlashInfer dense |
+
+结论：**用户直觉对了一半**。稀疏 softmax 层会变成 dense；lightning 层 **不会** —— 仍走 `SimpleGLAAttnBackend`。我们提交模型究竟有没有 lightning 层得看 `config.json`（用户预期 8 个 sparse + 24 个 lightning，待 fcloud 起来后实测）。
+
+### 用户输入（冠军帖子上下文）
+> "几乎所有冠军帖都用 W4A16 + 混合 FP4/FP8 KV cache，他们没提 force-dense 也没说稀疏 —— 我猜他们默认用稀疏（否则会强调）。"
+
+这是个强烈的暗示：**赢家配方很可能是稀疏 + 混合精度 KV**，不是 dense + 单一 FP8 KV。但要注意两点：
+1. 我们有直接证据 **GPTQ + FP8 KV + 稀疏会破坏精度**（Test 8b 76.07%，远低于 99% 归一化阈值）。top-k 上的 descale 舍入误差累积是真的。
+2. 冠军方案可能用 **逐层混合 KV**：在做 top-k 评分的几层稀疏层上用 bf16（或精心 scale 的 FP8），其它层用 FP4/FP8。我们目前没有这套混合 KV plumbing。
+
+### 决策上下文
+用户想 **重测 GPTQ + FP8 KV + 稀疏**：
+- (a) 在新 fcloud / 当前代码上确认 Test 8b 的精度回退是否依然存在（模型已经重新量化过，kernel 也更新过）；
+- (b) 收集稀疏路径的 S1/S8/Smax —— 我们从来没跑过；
+- (c) 验证或证伪冠军方案猜想。
+
+### 结论 / 待办
+- 本轮 Q&A 已记录到 chat log（本条目）。
+- 用户开 fcloud，等会让 agent 看 `MiniCPM-SALA-90-qa-cwe-mcq-sparse_qkv_w8` 的 `config.json`，确认 `mixer_types`（预期 8 个 minicpm4 + 24 个 lightning）。
+- 下一步：mixer_types 确认后，agent 给出具体的重测方案（稀疏 + FP8 KV：精度 + 速度 S1/S8/Smax）。
+
+### 交叉引用
+- [TEST_RESULTS_TRACKING.md](../TEST_RESULTS_TRACKING.md) Tests 8b、9、12
+- [model_config.py L238 / L248](../../../python/sglang/srt/configs/model_config.py#L238)
+- [minicpm.py L546-L590](../../../python/sglang/srt/models/minicpm.py#L546-L590)
+- [configs/minicpm.py L145-L167](../../../python/sglang/srt/configs/minicpm.py#L145-L167)
