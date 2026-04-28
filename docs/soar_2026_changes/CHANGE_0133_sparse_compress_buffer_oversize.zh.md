@@ -94,14 +94,29 @@ Test 8b（commit `9d3ecd168`）已经有这两行，但它跑的是不一样的�
 - 长上下文 decode 时每步有用工作本身受 attention I/O 时间限制，相对
   量级变大。
 
-我们这次的评测（32K–128K prompt，concurrency=32，bs=8 + queue=24）
-fill 是按 524288 token 算的，但实际只摸到至多 32K — 16× 浪费，
-每个 decode step 都付。
+我们这次的评测（32K–128K prompt，concurrency=32，bs=8 + queue=24），
+decode 时实际的 `max_seq_len` 是完整 prompt 长度（32K–128K），所以
+fill 的超额倍数是 **128K 时 4×、32K 时 16×**，每个 decode step
+都要付。注意：`--chunked-prefill-size 32768` 仅限制 *prefill* 分块大小，
+**不**限制 decode 时的 `seq_lens_cpu.max()` —— 到 decode 时所有 prefill
+chunk 已写入 KV cache，`seq_lens` 反映的是完整 prompt 长度。
 
-Round 13d 的 `--enable-torch-compile` 崩溃曾掩盖了这个问题：
-torch.compile 在 cudagraph 捕获时访问 RNG 立刻崩溃，过填代码根本
-没机会跑。Round 13d 第二次提交（commit `613ea54e4`）我们去掉
-`--enable-torch-compile` 之后，路径才能跑通，但代价就是这个过填。
+### 与 Round 13d torch.compile 崩溃的关系（独立问题）
+
+Round 13d 在这个 fill 运行之前还撞到另一个错误：
+`RuntimeError: Cannot call CUDAGeneratorImpl::current_seed during CUDA
+graph capture`（`torch._dynamo` 在 cudagraph 捕获期间，稀疏
+attn kernel 或其分解调用了 RNG 状态时抛出）。这个崩溃与
+**过填无关**：fill 只是 `tensor.fill_(-inf)`，不使用 RNG。
+去掉 `--enable-torch-compile`（commit `613ea54e4`）只是绕开了
+RNG/cudagraph-捕获 不兼容，对 fill 本身的代价没有任何影响。
+
+后果：**仅修 CHANGE_0133、并不会重新启用稀疏路径上的
+torch.compile**。如果以后要在稀疏路径重新启用 torch.compile，
+需要单独调查：定位被捕获区间内接触 RNG 的调用（可能是某个
+np dropout helper 在 p=0 时仍拼 RNG，或某 kernel 调用
+`torch.cuda.get_rng_state()`），要么把它提出捕获区间、要么
+换为不使用 Generator 的确定性实现。
 
 ## 提议修复（单文件，低风险）
 

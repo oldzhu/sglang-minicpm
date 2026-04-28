@@ -108,14 +108,31 @@ explodes when:
   attention I/O time.
 
 For our long-context eval (32K–128K prompts, concurrency=32 → bs=8 with
-24 queued), the fill is sized for 524288 tokens while the useful work
-only touches at most 32K — a 16× over-fill, applied every decode step.
+24 queued), the live decode-time `max_seq_len` is the full prefilled
+prompt length (32K–128K), so the fill is **4× (at 128K) to 16×
+(at 32K) over-sized** every decode step. Note: `--chunked-prefill-size
+32768` only caps the *prefill* chunk size; it does **not** cap
+`seq_lens_cpu.max()` at decode time — by then all prefill chunks have
+been written into the KV cache and `seq_lens` reflects the full prompt.
 
-The Round 13d crash on `--enable-torch-compile` masked this issue
-earlier: torch.compile was failing fast on RNG access during cudagraph
-capture, before the over-fill could ever run. Once we dropped
-torch.compile (commit `613ea54e4`), the path ran end-to-end but at the
-over-fill cost.
+### Relationship to the Round 13d torch.compile crash (independent issue)
+
+Round 13d also hit a different error before this fill could even run:
+`RuntimeError: Cannot call CUDAGeneratorImpl::current_seed during CUDA
+graph capture` (raised inside `torch._dynamo` when sparse-attn kernels
+or their decompositions touched RNG state during cudagraph capture).
+That crash is **unrelated to the over-fill**: the fill is a plain
+`tensor.fill_(-inf)` and uses no RNG. Dropping `--enable-torch-compile`
+(commit `613ea54e4`) only sidestepped the RNG/cudagraph-capture
+incompatibility; it had no effect on the fill cost.
+
+Consequence: **fixing CHANGE_0133 will not by itself re-enable
+torch.compile in sparse mode.** If we later want torch.compile back on
+the sparse path, that requires a separate investigation — locate the
+RNG-touching site inside the captured region (likely a dropout-style
+helper that grabs RNG even when `p=0`, or a kernel calling
+`torch.cuda.get_rng_state()`) and either lift it outside capture or
+replace it with a deterministic non-Generator path.
 
 ## Proposed fix (single-file, low risk)
 
