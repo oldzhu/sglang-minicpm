@@ -1269,6 +1269,11 @@ class HybridLinearKVPool(KVCache):
 
                 TokenToKVPoolClass = NPUMHATokenToKVPool
 
+            # SOAR CHANGE_0131: route MXFP4 KV through the FP4 pool (uint8
+            # packed K/V + e8m0 shared-exponent scale buffer).
+            if dtype == torch.float4_e2m1fn_x2:
+                TokenToKVPoolClass = MHATokenToKVPoolFP4
+
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
                 page_size=self.page_size,
