@@ -80,7 +80,35 @@ MMA 行简单。**反量化重写**复杂因为：
 | 内存杠杆 | 激活 2× 缩小（vs BF16）——decode 收益小 | KV 2× 缩小 vs FP8（4× vs BF16）——**长上下文大收益** | 视项 |
 | 冠军组合证据 | 无 | 有 | n/a |
 
-## 7. 建议
+## 7. 2026-04-28 补充澄清
+
+### 7.1 “W4A8 #1” 到底是什么 vs v18 baseline
+
+之前标为“W4A8 #1”的测试（commit `7ce21c3f5`）实际是 **W8A8 FP8**，不是 INT8 也不是真正的 W4A8。流程对比：
+
+| 阶段 | v18 baseline (W4A16 BF16) | W4A8 #1 误标签 (W8A8 FP8) | 真实 W4A8 FP8（选项 A 留档） |
+|---|---|---|---|
+| 权重 HBM 类型 | INT4 打包 | **FP8 e4m3（2× 肨胀）** | INT4 打包 |
+| K 循环反量化 | INT4 → BF16 | 无 | INT4 → FP8 e4m3 |
+| 激活 | BF16（不量化） | BF16 → FP8 e4m3 per-token | BF16 → FP8 e4m3 per-token |
+| MMA | BF16×BF16 → FP32, 148 TF | FP8×FP8 → FP32, 281 TF 峰 | FP8×FP8 → FP32, 281 TF 峰 |
+| 权重字节/参数 | 0.5 B | 1.0 B | 0.5 B |
+| 结果 | 参考 | **+118%/+56%/+30% 回退**（decode 是权重带宽受限；权重字节翻倍） | 假设：两个世界的最优 |
+
+“W4A8 #1” 的回退与“在带宽受限 decode 上权重 HBM 字节翻倍”一致。不能否定真实 W4A8。
+
+我们从未在模型上端到端测试 **W8A8 INT8**。INT8 仅作为 Phase 0 合成微基准出现（136 TF，在任何模型级测试前已终止）。
+
+### 7.2 Phase 0 vs CUTLASS spike（Proposal B）
+
+| 测试 | MMA 输入 | 衡量 | 数字 |
+|---|---|---|---|
+| Phase 0（已） | FP8 × FP8（K 循环无反量化） | 硬件 FP8 上限 | 281 TF |
+| Proposal B（拟） | INT4 打包 → 内核反量化 → FP8 × FP8 | W4→FP8 反量化后的 FP8 上限 | TBD |
+
+Proposal B 衡量的是 Phase 0 故意不包含的反量化税。
+
+## 8. 建议
 
 1. **W4-FP8 稠密 GEMM 留档为选项 A**。NVFP4 KV 落地后再考虑。
 2. **下一轮迭代选 NVFP4 KV 缓存**——见 `PROPOSAL_NVFP4_KV_CACHE_20260427_1730.{en,zh}.md`。

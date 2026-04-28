@@ -80,7 +80,35 @@ Realistic with debug iterations: **3–4 weeks**.
 | Memory lever | Activations 2× smaller (vs BF16) — small decode win | KV 2× smaller vs FP8 (4× vs BF16) — **big win at long context** | varies |
 | Champion-combo evidence | None | Yes | n/a |
 
-## 7. Recommendation
+## 7. Clarifications added 2026-04-28
+
+### 7.1 What "W4A8 #1" actually was vs the v18 baseline
+
+A prior test labeled "W4A8 #1" (commit `7ce21c3f5`) was actually **W8A8 FP8**, not INT8 and not real W4A8. Process flow:
+
+| Stage | v18 baseline (W4A16 BF16) | W4A8 #1 mislabel (W8A8 FP8) | Real W4A8 FP8 (parked Option A) |
+|---|---|---|---|
+| Weight HBM dtype | INT4 packed | **FP8 e4m3 (inflated 2×)** | INT4 packed |
+| Dequant in K-loop | INT4 → BF16 | none | INT4 → FP8 e4m3 |
+| Activation | BF16 (no quant) | BF16 → FP8 e4m3 per-token | BF16 → FP8 e4m3 per-token |
+| MMA | BF16×BF16 → FP32, 148 TF | FP8×FP8 → FP32, 281 TF peak | FP8×FP8 → FP32, 281 TF peak |
+| Weight bytes/param | 0.5 B | 1.0 B | 0.5 B |
+| Result | Reference | **+118%/+56%/+30% regression** (decode is weight-BW-bound; weight bytes doubled) | Hypothesis: best of both worlds |
+
+The regression of "W4A8 #1" is consistent with doubling weight HBM bytes on a bandwidth-bound decode workload. It does NOT invalidate real W4A8.
+
+We never tested **W8A8 INT8** end-to-end on the model. INT8 only appeared as the synthetic Phase 0 microbench (136 TF, killed before any model-level test).
+
+### 7.2 Phase 0 vs CUTLASS spike (Proposal B)
+
+| Test | Inputs at MMA | Measures | Number |
+|---|---|---|---|
+| Phase 0 (done) | FP8 × FP8 (no dequant in K-loop) | Hardware FP8 ceiling | 281 TF |
+| Proposal B (proposed) | INT4 packed → in-kernel dequant → FP8 × FP8 | FP8 ceiling **after** W4→FP8 dequant overhead | TBD |
+
+Proposal B measures the dequant tax that Phase 0 deliberately did not include.
+
+## 8. Recommendation
 
 1. **Park W4-FP8 dense GEMM** as Option A. Worth revisiting only after NVFP4 KV lands.
 2. **Pursue NVFP4 KV cache as next iteration** — see `PROPOSAL_NVFP4_KV_CACHE_20260427_1730.{en,zh}.md`.

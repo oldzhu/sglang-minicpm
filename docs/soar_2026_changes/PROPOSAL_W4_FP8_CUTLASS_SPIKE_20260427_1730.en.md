@@ -10,6 +10,17 @@
 
 **This is NOT a production kernel.** It's a measurement spike — a synthetic-data benchmark to find the FP8 ceiling for the W4-weight × FP8-activation shape we'd actually use.
 
+### 1.1 How this differs from Phase 0 (already done)
+
+Phase 0 (`PHASE0_INT8_vs_FP8_SM120_20260427_1630`) measured **dense FP8×FP8 → BF16 GEMM** via `torch._scaled_mm`. Both inputs were already FP8 in registers when the MMA fired — no dequant happened in the K-loop. That gave the **hardware ceiling = 281 TF**.
+
+Proposal B measures something different: a **W4-weight × FP8-activation GEMM** where the INT4 weights are loaded packed from HBM and **dequantized in the K-loop** (mask + shift int4 → multiply by fp16 group scale → encode FP8 e4m3 bit pattern with saturation) before feeding the same MMA opcode. The dequant chain runs in the same SMs as the MMA and may serialize or stall warps. Proposal B's number tells us **how much of the 281 TF ceiling actually survives the dequant tax** — which is exactly the unknown that decides whether the 3–4 week production-kernel investment is worth it.
+
+| Test | Inputs at MMA | Measures | Number |
+|---|---|---|---|
+| Phase 0 (done) | FP8 × FP8 (no dequant) | Hardware FP8 ceiling | 281 TF |
+| Proposal B (this) | INT4 packed → in-kernel dequant → FP8 × FP8 | FP8 ceiling **after** W4→FP8 dequant overhead | TBD |
+
 ## 2. Rule-compliance check
 
 N/A — this is a one-day **measurement** task. No model change, no submission package change, no accuracy risk. Pure benchmark on synthetic data.
