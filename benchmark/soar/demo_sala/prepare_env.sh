@@ -208,8 +208,16 @@ if [[ "$QUANT_MODE" == "gptq" ]]; then
 		else
 			FORCE_DENSE_ARG=""
 		fi
-		DENSE_AS_SPARSE_ARG=""
-		echo "[prepare_env] SOAR_BACKEND_VARIANT=flashinfer KEEP_FORCE_DENSE=${SOAR_BACKEND_KEEP_FORCE_DENSE:-0} -> using stock flashinfer backend, FORCE_DENSE_ARG='${FORCE_DENSE_ARG}', dropping --dense-as-sparse"
+		# Round 13f-3: also gate --dense-as-sparse on KEEP_FORCE_DENSE so we can
+		# isolate whether --dense-as-sparse is the missing acc lever. With
+		# KEEP_FORCE_DENSE=1 the flashinfer branch becomes flag-equivalent to
+		# Test 12 (which internally rewrites minicpm_flashinfer→flashinfer).
+		if [[ "$SOAR_BACKEND_KEEP_FORCE_DENSE" == "1" ]]; then
+			DENSE_AS_SPARSE_ARG=" --dense-as-sparse"
+		else
+			DENSE_AS_SPARSE_ARG=""
+		fi
+		echo "[prepare_env] SOAR_BACKEND_VARIANT=flashinfer KEEP_FORCE_DENSE=${SOAR_BACKEND_KEEP_FORCE_DENSE:-0} -> stock flashinfer, FORCE_DENSE_ARG='${FORCE_DENSE_ARG}', DENSE_AS_SPARSE_ARG='${DENSE_AS_SPARSE_ARG}'"
 	else
 		if [[ "$SDL_DENSE_AS_SPARSE_OVERRIDE" == "drop" ]]; then
 			DENSE_AS_SPARSE_ARG=""
