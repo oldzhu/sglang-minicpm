@@ -1,0 +1,124 @@
+nohup: ignoring input
+
+================================================================================
+=== round13e_128k.trace.json.gz ===
+Total GPU kernel time: 19774.7 ms
+Unique kernels: 87
+
+Top 25 kernels by total time:
+   76.9%  15216.6ms ( 640x) [GEMM (Marlin/GPTQ)  ] void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8>(cutlass_80_tensorop_bf16_s16
+    4.3%    848.0ms ( 544x) [FLA/SimpleGLA       ] void flashinfer::BatchPrefillWithPagedKVCacheKernel<flashinfer::KernelTraits<(flashinfer::MaskMode)0, 16u, 1u, 2u, 8u, 8
+    3.8%    757.0ms (5632x) [GEMM (other)        ] std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, floa
+    1.6%    312.9ms (2176x) [FLA/SimpleGLA       ] void flashinfer::activation::act_and_mul_kernel<__nv_bfloat16, &(float silu<float>(float const&))>(__nv_bfloat16*, __nv_
+    1.1%    225.7ms (1888x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<c10::BFloat16>, std::array<char*, 1ul> >(int, 
+    1.1%    219.1ms (4352x) [FLA/SimpleGLA       ] void flashinfer::norm::FusedAddRMSNormKernel<8u, __nv_bfloat16>(__nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, unsigned
+    1.0%    190.1ms ( 928x) [Other               ] void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::T
+    0.8%    167.6ms (  32x) [Other               ] void get_block_table_cuda_v2<96>(int const*, int const*, int const*, int const*, int const*, int*, int, int)
+    0.8%    167.5ms (4676x) [GEMM (other)        ] std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, floa
+    0.8%    151.6ms ( 544x) [Other               ] cumsum_kernel
+    0.6%    118.5ms (  96x) [FLA/SimpleGLA       ] chunk_fwd_kernel_o
+    0.6%    113.0ms (1632x) [RMSNorm             ] void tensorrt_llm::kernels::fusedQKNormRopeKernel<128, false>(__nv_bfloat16*, int, int, int, float, __nv_bfloat16 const*
+    0.5%     98.2ms (4420x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16,
+    0.5%     94.1ms (3518x) [Other               ] void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}:
+    0.5%     89.8ms (1641x) [Other               ] void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_put_kernel_impl<at::nat
+    0.4%     88.2ms (  96x) [FLA/SimpleGLA       ] chunk_fwd_kernel_h
+    0.4%     87.3ms ( 512x) [GEMM (Marlin/GPTQ)  ] void flash_fwd_splitkv_stage1_kernel<Flash_fwd_kernel_traits<128, 16, 64, 1, false, false, cutlass::bfloat16_t, Flash_ke
+    0.4%     79.3ms (2176x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16,
+    0.4%     79.0ms ( 747x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::array<char*, 1ul> >(int, at::native
+    0.4%     79.0ms ( 544x) [FLA/SimpleGLA       ] flatten_and_fill_kernel
+    0.4%     76.9ms (  64x) [Other               ] void at::native::reduce_kernel<512, 1, at::native::ReduceOp<long, at::native::func_wrapper_t<long, at::native::sum_funct
+    0.4%     72.2ms (  64x) [Other               ] void at::native::mbtopk::radixFindKthValues<c10::BFloat16, unsigned int, unsigned int, 2>(at::cuda::detail::TensorInfo<c
+    0.3%     53.6ms (  32x) [Embedding/Gather    ] void at::native::mbtopk::gatherTopK<c10::BFloat16, unsigned int, 2>(at::cuda::detail::TensorInfo<c10::BFloat16 const, un
+    0.3%     53.3ms (  32x) [GEMM (Marlin/GPTQ)  ] void flash_fwd_splitkv_stage1_kernel<Flash_fwd_kernel_traits<128, 16, 64, 1, false, false, cutlass::bfloat16_t, Flash_ke
+    0.3%     50.8ms (2176x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::sigmoid_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}
+
+Category breakdown:
+   77.7%  15357.2ms  GEMM (Marlin/GPTQ)
+    8.7%   1711.7ms  FLA/SimpleGLA
+    8.1%   1593.1ms  Other
+    4.7%    924.5ms  GEMM (other)
+    0.6%    113.0ms  RMSNorm
+    0.3%     66.6ms  Embedding/Gather
+    0.0%      8.7ms  Memory ops
+
+================================================================================
+=== round13e_32k.trace.json.gz ===
+Total GPU kernel time: 5658.4 ms
+Unique kernels: 86
+
+Top 25 kernels by total time:
+   66.7%   3771.9ms ( 160x) [GEMM (Marlin/GPTQ)  ] void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8>(cutlass_80_tensorop_bf16_s16
+   13.4%    758.8ms (5632x) [GEMM (other)        ] std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, floa
+    3.6%    201.6ms ( 520x) [FLA/SimpleGLA       ] void flashinfer::BatchPrefillWithPagedKVCacheKernel<flashinfer::KernelTraits<(flashinfer::MaskMode)0, 16u, 1u, 2u, 8u, 8
+    3.0%    167.2ms (4673x) [GEMM (other)        ] std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, floa
+    1.5%     82.8ms (2080x) [FLA/SimpleGLA       ] void flashinfer::activation::act_and_mul_kernel<__nv_bfloat16, &(float silu<float>(float const&))>(__nv_bfloat16*, __nv_
+    1.1%     62.5ms (4160x) [FLA/SimpleGLA       ] void flashinfer::norm::FusedAddRMSNormKernel<8u, __nv_bfloat16>(__nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, unsigned
+    1.0%     57.1ms (1720x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<c10::BFloat16>, std::array<char*, 1ul> >(int, 
+    0.8%     47.8ms ( 616x) [Other               ] void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::T
+    0.7%     41.4ms (   8x) [Other               ] void get_block_table_cuda_v2<96>(int const*, int const*, int const*, int const*, int const*, int*, int, int)
+    0.7%     37.9ms ( 520x) [Other               ] cumsum_kernel
+    0.6%     31.2ms (1560x) [RMSNorm             ] void tensorrt_llm::kernels::fusedQKNormRopeKernel<128, false>(__nv_bfloat16*, int, int, int, float, __nv_bfloat16 const*
+    0.5%     29.4ms (  24x) [FLA/SimpleGLA       ] chunk_fwd_kernel_o
+    0.5%     27.4ms (4225x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16,
+    0.5%     26.4ms (3311x) [Other               ] void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}:
+    0.5%     25.8ms (1611x) [Other               ] void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_put_kernel_impl<at::nat
+    0.4%     23.5ms ( 512x) [GEMM (Marlin/GPTQ)  ] void flash_fwd_splitkv_stage1_kernel<Flash_fwd_kernel_traits<128, 16, 64, 1, false, false, cutlass::bfloat16_t, Flash_ke
+    0.4%     22.0ms (  24x) [FLA/SimpleGLA       ] chunk_fwd_kernel_h
+    0.4%     21.4ms (2080x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16,
+    0.4%     20.9ms ( 520x) [FLA/SimpleGLA       ] flatten_and_fill_kernel
+    0.4%     19.9ms ( 576x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::array<char*, 1ul> >(int, at::native
+    0.3%     19.1ms (  16x) [Other               ] void at::native::reduce_kernel<512, 1, at::native::ReduceOp<long, at::native::func_wrapper_t<long, at::native::sum_funct
+    0.3%     17.6ms (  16x) [Other               ] void at::native::mbtopk::radixFindKthValues<c10::BFloat16, unsigned int, unsigned int, 2>(at::cuda::detail::TensorInfo<c
+    0.3%     14.9ms (2080x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::sigmoid_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}
+    0.2%     13.2ms (   8x) [Embedding/Gather    ] void at::native::mbtopk::gatherTopK<c10::BFloat16, unsigned int, 2>(at::cuda::detail::TensorInfo<c10::BFloat16 const, un
+    0.2%     13.0ms (1625x) [FLA/SimpleGLA       ] void flashinfer::norm::RMSNormKernel<8u, __nv_bfloat16>(__nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, unsigned int, un
+
+Category breakdown:
+   67.2%   3800.8ms  GEMM (Marlin/GPTQ)
+   16.4%    926.0ms  GEMM (other)
+    7.7%    437.6ms  FLA/SimpleGLA
+    7.7%    432.9ms  Other
+    0.6%     31.2ms  RMSNorm
+    0.4%     25.4ms  Embedding/Gather
+    0.1%      4.5ms  Memory ops
+
+================================================================================
+=== round13e_64k.trace.json.gz ===
+Total GPU kernel time: 10344.0 ms
+Unique kernels: 87
+
+Top 25 kernels by total time:
+   73.2%   7571.4ms ( 320x) [GEMM (Marlin/GPTQ)  ] void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8>(cutlass_80_tensorop_bf16_s16
+    7.3%    759.5ms (5632x) [GEMM (other)        ] std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, floa
+    4.0%    416.5ms ( 528x) [FLA/SimpleGLA       ] void flashinfer::BatchPrefillWithPagedKVCacheKernel<flashinfer::KernelTraits<(flashinfer::MaskMode)0, 16u, 1u, 2u, 8u, 8
+    1.6%    167.5ms (4674x) [GEMM (other)        ] std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, floa
+    1.5%    159.4ms (2112x) [FLA/SimpleGLA       ] void flashinfer::activation::act_and_mul_kernel<__nv_bfloat16, &(float silu<float>(float const&))>(__nv_bfloat16*, __nv_
+    1.1%    114.7ms (4224x) [FLA/SimpleGLA       ] void flashinfer::norm::FusedAddRMSNormKernel<8u, __nv_bfloat16>(__nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, unsigned
+    1.1%    113.2ms (1776x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<c10::BFloat16>, std::array<char*, 1ul> >(int, 
+    0.9%     95.1ms ( 720x) [Other               ] void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::T
+    0.8%     86.5ms (  16x) [Other               ] void get_block_table_cuda_v2<96>(int const*, int const*, int const*, int const*, int const*, int*, int, int)
+    0.7%     75.8ms ( 528x) [Other               ] cumsum_kernel
+    0.6%     59.2ms (  48x) [FLA/SimpleGLA       ] chunk_fwd_kernel_o
+    0.6%     58.7ms (1584x) [RMSNorm             ] void tensorrt_llm::kernels::fusedQKNormRopeKernel<128, false>(__nv_bfloat16*, int, int, int, float, __nv_bfloat16 const*
+    0.5%     50.9ms (4290x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16,
+    0.5%     48.9ms (3380x) [Other               ] void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}:
+    0.4%     46.5ms (1621x) [Other               ] void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_put_kernel_impl<at::nat
+    0.4%     44.8ms ( 512x) [GEMM (Marlin/GPTQ)  ] void flash_fwd_splitkv_stage1_kernel<Flash_fwd_kernel_traits<128, 16, 64, 1, false, false, cutlass::bfloat16_t, Flash_ke
+    0.4%     44.0ms (  48x) [FLA/SimpleGLA       ] chunk_fwd_kernel_h
+    0.4%     40.6ms (2112x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16,
+    0.4%     40.2ms ( 528x) [FLA/SimpleGLA       ] flatten_and_fill_kernel
+    0.4%     39.6ms ( 633x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::array<char*, 1ul> >(int, at::native
+    0.4%     38.4ms (  32x) [Other               ] void at::native::reduce_kernel<512, 1, at::native::ReduceOp<long, at::native::func_wrapper_t<long, at::native::sum_funct
+    0.3%     35.7ms (  32x) [Other               ] void at::native::mbtopk::radixFindKthValues<c10::BFloat16, unsigned int, unsigned int, 2>(at::cuda::detail::TensorInfo<c
+    0.3%     26.8ms (2112x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::sigmoid_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}
+    0.3%     26.6ms (  16x) [Embedding/Gather    ] void at::native::mbtopk::gatherTopK<c10::BFloat16, unsigned int, 2>(at::cuda::detail::TensorInfo<c10::BFloat16 const, un
+    0.2%     24.1ms (  16x) [Other               ] void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<int, int, bool, at::native::(anonymous names
+
+Category breakdown:
+   73.8%   7632.4ms  GEMM (Marlin/GPTQ)
+    9.0%    927.0ms  GEMM (other)
+    8.3%    861.6ms  FLA/SimpleGLA
+    7.9%    819.2ms  Other
+    0.6%     58.7ms  RMSNorm
+    0.4%     39.1ms  Embedding/Gather
+    0.1%      6.0ms  Memory ops
