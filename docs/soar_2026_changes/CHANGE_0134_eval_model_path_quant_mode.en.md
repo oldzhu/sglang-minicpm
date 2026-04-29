@@ -1,6 +1,13 @@
 # CHANGE_0134 — Fix eval `--model_path` to honor `quant_mode`; clarify sparse-path activation rules
 
-## Status: APPLIED (no fcloud test yet — instance is shut down)
+## Status: APPLIED + DIAGNOSED
+
+Workflow fix shipped (commit `ae119f5aa`). On-fcloud diagnosis run
+2026-04-29 confirms: **the Round 13e timeouts were NOT caused by the
+model_path mismatch.** Detailed result in section
+["On-fcloud verification (2026-04-29)"](#on-fcloud-verification-2026-04-29)
+below. The fix is still kept (good hygiene; prevents future drift if
+the two model dirs ever diverge in a behaviorally-significant way).
 
 Commit (pending push): `scripts/fcloud/fcloud_workflow.py` — adds
 `_resolve_model_path()` + `--quant-mode` / `--model-path` CLI flags to
@@ -169,3 +176,66 @@ git checkout scripts/fcloud/fcloud_workflow.py
 - CHANGE_0133 — sparse decode `compress_k1/k2` over-fill (already
   applied this round; necessary but not sufficient to make sparse path
   viable at concurrency=32 long-context).
+
+## On-fcloud verification (2026-04-29)
+
+Ran the three diffs and an end-to-end tokenizer comparison on the live
+fcloud instance.
+
+### File-level diffs
+
+`tokenizer_config.json` differs:
+
+- `"add_prefix_space": null` added (GPTQ).
+- `"extra_special_tokens": {}` added (GPTQ).
+- `"tokenizer_class"`: `LlamaTokenizer` (BF16) → `LlamaTokenizerFast`
+  (GPTQ).
+- `"chat_template"` key **removed** from the JSON in GPTQ. GPTQ has a
+  separate `chat_template.jinja` file instead.
+- `"_commit_hash": null` appended (GPTQ).
+
+`generation_config.json` differs:
+
+- `"do_sample": true` added (GPTQ).
+- `transformers_version` 4.56.1 → 4.57.1.
+- `eos_token_id` and `pad_token_id` unchanged.
+
+`chat_template.jinja`: not present in BF16 dir (template is embedded
+in `tokenizer_config.json`); present in GPTQ dir as a separate file.
+
+### Behavioural comparison
+
+- BF16-embedded chat template vs GPTQ standalone `chat_template.jinja`:
+  **byte-identical** (sha256 `accdbc3c45c7ee51`, both 8 803 bytes).
+- `AutoTokenizer.from_pretrained(...)` for both dirs returns a
+  `LlamaTokenizerFast` instance (HF auto-upgrades the BF16 JSON
+  declaration of `LlamaTokenizer`).
+- `eos_token_id`, `eos_token`, `bos_token`, derived `stop_words`
+  (`['</s>', '<|im_end|>']`): identical.
+- Render of a sample prompt through `apply_chat_template`: byte-identical
+  (76 chars), and `tok.encode(...)` returns the same 17 token IDs.
+- `eval_model_001.py` pops `do_sample` on init
+  (`self.generation_kwargs.pop('do_sample', None)`), so the GPTQ
+  `do_sample: true` does not affect the harness.
+
+### Conclusion
+
+The model_path mismatch in the workflow is a real bug (we keep the
+fix), but it does **not** explain the Round 13e Test 1 long-context
+timeouts: tokenization, chat template, EOS / stop-word derivation are
+all identical between the two dirs in current state.
+
+Therefore Round 13e Test 1's stalls and read-timeouts at
+concurrency=32 are genuinely caused by sparse-attention slowness on
+long context (32K–128K), not by tokenizer/template drift.
+**Re-running the same configuration with CHANGE_0134 alone is unlikely
+to change the outcome** (no new evidence). Decision pending:
+
+- Option A: close the sparse line for now, continue dense-path
+  optimization (current submission baseline Test 12 remains best).
+- Option B: profile the sparse decode kernels (top-k scoring +
+  sparse FlashAttention) at bs=8 × max_seq_len=128K to find the
+  actual hot path before committing more time.
+- Option C: try sparse with smaller `max-running-requests` (e.g. 4
+  instead of 8) to see whether per-step cost scales sub-linearly with
+  bs, and whether a lower-concurrency sparse run can beat dense.

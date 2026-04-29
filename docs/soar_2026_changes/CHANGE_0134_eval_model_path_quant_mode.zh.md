@@ -1,6 +1,12 @@
 # CHANGE_0134 — 修正 eval `--model_path` 按 `quant_mode` 选择；澄清稀疏路径激活规则
 
-## 状态：已应用（fcloud 当前已关机，尚未上机重测）
+## 状态：已应用 + 已诊断
+
+Workflow 修复已 push（commit `ae119f5aa`）。2026-04-29 上机诊断确认：
+**Round 13e 超时不是 model_path 不匹配造成的。**详见下面
+[《fcloud 上机验证（2026-04-29）》](#fcloud-上机验证2026-04-29)。
+修复仍然保留（是干净卸载，防止以后两个模型目录出现行为差异时
+静默踩坑）。
 
 提交（待 push）：`scripts/fcloud/fcloud_workflow.py` —— 新增
 `_resolve_model_path()` 与 `--quant-mode` / `--model-path` CLI 参数，
@@ -158,3 +164,61 @@ git checkout scripts/fcloud/fcloud_workflow.py
   `has_sparse_attention` 的影响。
 - CHANGE_0133 —— 稀疏 decode `compress_k1/k2` 过填修复（本轮已应用；
   必要但不充分，不足以让稀疏路径在 concurrency=32 长上下文下可用）。
+
+## fcloud 上机验证（2026-04-29）
+
+在实例上跑了三个 diff 与一个端到端的 tokenizer 对比。
+
+### 文件级别的 diff
+
+`tokenizer_config.json` 不一致：
+
+- GPTQ 多了 `"add_prefix_space": null`。
+- GPTQ 多了 `"extra_special_tokens": {}`。
+- `"tokenizer_class"` 由 `LlamaTokenizer`（BF16）变为
+  `LlamaTokenizerFast`（GPTQ）。
+- GPTQ JSON 里**删了** `"chat_template"` 键。GPTQ 目录下另有一个
+  独立的 `chat_template.jinja`。
+- GPTQ 末尾多了 `"_commit_hash": null`。
+
+`generation_config.json` 不一致：
+
+- GPTQ 多了 `"do_sample": true`。
+- `transformers_version` 4.56.1 → 4.57.1。
+- `eos_token_id`、`pad_token_id` 不变。
+
+`chat_template.jinja`：BF16 目录**没有**这个文件（模板嵌在
+`tokenizer_config.json` 里）；GPTQ 目录**有**这个独立文件。
+
+### 行为层对比
+
+- BF16 嵌入的 chat template vs GPTQ 独立 `chat_template.jinja`：
+  **字节级别一致**（sha256 `accdbc3c45c7ee51`，都是 8 803 字节）。
+- 两个目录执行 `AutoTokenizer.from_pretrained(...)` 都返回
+  `LlamaTokenizerFast` 实例（HF 自动把 BF16 的 `LlamaTokenizer`
+  声明升级为 Fast）。
+- `eos_token_id`、`eos_token`、`bos_token`、推导出的 `stop_words`
+  （`['</s>', '<|im_end|>']`）：完全一致。
+- 同一个示例 prompt 走 `apply_chat_template`：字节级别一致（76 字符），
+  `tok.encode(...)` 结果也完全一致（17 个 token id）。
+- `eval_model_001.py` 在初始化时 pop 掉 `do_sample`
+  （`self.generation_kwargs.pop('do_sample', None)`），所以 GPTQ 多
+  出的 `do_sample: true` 对 harness 无影响。
+
+### 结论
+
+workflow 里的 model_path 不匹配是个真 bug（修复保留），但**它不能
+解释** Round 13e Test 1 的长上下文超时：两个目录在 tokenizer、
+chat template、EOS / stop-word 推导上目前表现完全一致。
+
+因此 Round 13e Test 1 在 concurrency=32 下的卡顿与读超时是**稀疏
+attention 在长上下文（32K–128K）上本身就慢**造成的，不是
+tokenizer / template 漂移。**仅靠 CHANGE_0134、原配置重测几乎不会改变
+结果**（没有新证据）。待定选项：
+
+- 选项 A：暂关稀疏线，继续 dense 路径优化（现在提交基线 Test 12
+  仍是最佳）。
+- 选项 B：在再投人之前，先 profile 稀疏 decode kernel（top-k 评分 +
+  稀疏 FlashAttention）在 bs=8 × max_seq=128K 的热点。
+- 选项 C：调低 `max-running-requests`（例如 4 而非 8）试稀疏，
+  看看每步代价是否随 bs 亚线性，以及低并发下的稀疏能不能超过 dense。
