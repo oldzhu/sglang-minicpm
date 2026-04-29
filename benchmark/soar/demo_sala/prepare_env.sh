@@ -196,9 +196,20 @@ if [[ "$QUANT_MODE" == "gptq" ]]; then
 	BACKEND_ARG=" --attention-backend minicpm_flashinfer"
 	if [[ "$SOAR_BACKEND_VARIANT" == "flashinfer" ]]; then
 		BACKEND_ARG=" --attention-backend flashinfer"
-		FORCE_DENSE_ARG=""
+		# Round 13f-2: by default keep dropping --force-dense-minicpm (Round 13f-1 behaviour).
+		# Set SOAR_BACKEND_KEEP_FORCE_DENSE=1 to retain --force-dense-minicpm so
+		# model_config exposes has_sparse_attention=False / sparse_layer_ids=[];
+		# isolates whether those flag-gated scheduler/KV-pool paths own the
+		# 2.4pt acc regression seen in Round 13f-1. See
+		# docs/soar_2026_changes/PROPOSAL_round13f2_flashinfer_keep_force_dense.en.md
+		if [[ "$SOAR_BACKEND_KEEP_FORCE_DENSE" == "1" ]]; then
+			# Keep FORCE_DENSE_ARG as set above (" --force-dense-minicpm")
+			:
+		else
+			FORCE_DENSE_ARG=""
+		fi
 		DENSE_AS_SPARSE_ARG=""
-		echo "[prepare_env] SOAR_BACKEND_VARIANT=flashinfer -> using stock flashinfer backend, dropping --force-dense-minicpm and --dense-as-sparse"
+		echo "[prepare_env] SOAR_BACKEND_VARIANT=flashinfer KEEP_FORCE_DENSE=${SOAR_BACKEND_KEEP_FORCE_DENSE:-0} -> using stock flashinfer backend, FORCE_DENSE_ARG='${FORCE_DENSE_ARG}', dropping --dense-as-sparse"
 	else
 		if [[ "$SDL_DENSE_AS_SPARSE_OVERRIDE" == "drop" ]]; then
 			DENSE_AS_SPARSE_ARG=""
