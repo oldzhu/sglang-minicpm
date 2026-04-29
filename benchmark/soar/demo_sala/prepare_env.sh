@@ -177,11 +177,17 @@ if [[ "$QUANT_MODE" == "gptq" ]]; then
 	# CUDAGeneratorImpl::current_seed during CUDA graph capture from
 	# hybrid_linear_attn_backend._can_use_fast_state_io). This matches the
 	# SOAR_SPARSE_MODE=1 branch above.
+	# Also drop --dense-as-sparse: it forces dense_len=0 inside the
+	# backend ctor BEFORE our env override can take effect (the override
+	# is gated by `not self.dense_as_sparse`); leaving it on would route
+	# every request to the sparse path regardless of SOAR_SPARSE_DENSE_LEN.
+	SDL_DENSE_AS_SPARSE_OVERRIDE=""
 	if [[ -n "$SOAR_SPARSE_DENSE_LEN" ]]; then
 		export SOAR_SPARSE_DENSE_LEN
 		FORCE_DENSE_ARG=""
 		TORCH_COMPILE_ARGS=""
-		echo "[prepare_env] SOAR_SPARSE_DENSE_LEN=${SOAR_SPARSE_DENSE_LEN} -> dropping --force-dense-minicpm and --enable-torch-compile; per-request routing controlled by env override"
+		SDL_DENSE_AS_SPARSE_OVERRIDE="drop"
+		echo "[prepare_env] SOAR_SPARSE_DENSE_LEN=${SOAR_SPARSE_DENSE_LEN} -> dropping --force-dense-minicpm, --dense-as-sparse, and --enable-torch-compile; per-request routing controlled by env override"
 	fi
 	# Round 13f-1 smoketest: SOAR_BACKEND_VARIANT=flashinfer swaps the
 	# minicpm_flashinfer backend (with optional --force-dense-minicpm) for
@@ -194,7 +200,11 @@ if [[ "$QUANT_MODE" == "gptq" ]]; then
 		DENSE_AS_SPARSE_ARG=""
 		echo "[prepare_env] SOAR_BACKEND_VARIANT=flashinfer -> using stock flashinfer backend, dropping --force-dense-minicpm and --dense-as-sparse"
 	else
-		DENSE_AS_SPARSE_ARG=" --dense-as-sparse"
+		if [[ "$SDL_DENSE_AS_SPARSE_OVERRIDE" == "drop" ]]; then
+			DENSE_AS_SPARSE_ARG=""
+		else
+			DENSE_AS_SPARSE_ARG=" --dense-as-sparse"
+		fi
 	fi
 	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache${BACKEND_ARG} --chunked-prefill-size 32768 --max-prefill-tokens 32768 --prefill-max-requests 1 --max-running-requests 24 --mem-fraction-static 0.84 --schedule-conservativeness 1.0${DENSE_AS_SPARSE_ARG} --quantization gptq_marlin${FORCE_DENSE_ARG} --kv-cache-dtype ${KV_CACHE_DTYPE_ARG}${FUSED_QK_NORM_ROPE_ARG}${TORCH_COMPILE_ARGS} --enable-mixed-chunk"
 elif [[ "$QUANT_MODE" == "fp8_blockwise" ]]; then
