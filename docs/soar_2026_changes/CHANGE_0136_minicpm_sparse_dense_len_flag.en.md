@@ -1,5 +1,13 @@
 # CHANGE_0136 — Tunable `sparse_dense_len` runtime override (per-request dense/sparse routing threshold)
 
+## Status: **PARKED** (2026-04-29)
+
+Implementation landed on `minicpm-src/mixed_minicpm_cudagraph` at commits `6a070110b` (core), `45e316ee0`, `7a7a568eb` (env-side fixes) and is ready to use. Validation is **blocked** by a pre-existing sparse-path off-by-one in `MiniCPMSparseBackend.forward_extend`'s dense fallback writer — see [CHANGE_0137_sparse_prefill_page_table_off_by_one.en.md](CHANGE_0137_sparse_prefill_page_table_off_by_one.en.md). The `SOAR_SPARSE_DENSE_LEN=524288` sanity step crashes on the very first prefill request (size 103 vs 104). `=65536` and `=16384` would hit the same code path. Resume validation once CHANGE_0137 (and ideally CHANGE_0133) lands.
+
+In parallel, the team is investigating whether the Round 13f-1 (`SOAR_BACKEND_VARIANT=flashinfer`) line can be evolved into a viable submission baseline at higher priority. See [RESEARCH_flashinfer_vs_minicpm_flashinfer_codeflow.en.md](RESEARCH_flashinfer_vs_minicpm_flashinfer_codeflow.en.md).
+
+---
+
 ## Status: PROPOSAL (awaiting approval)
 
 ## 1. Background and motivation

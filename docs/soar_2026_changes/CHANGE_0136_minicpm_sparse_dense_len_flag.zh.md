@@ -1,3 +1,5 @@
+# (PARKED 2026-04-29 — 在 CHANGE_0137 + CHANGE_0133 落地前阻塞;详见 [CHANGE_0137_sparse_prefill_page_table_off_by_one.zh.md](CHANGE_0137_sparse_prefill_page_table_off_by_one.zh.md) 与 [RESEARCH_flashinfer_vs_minicpm_flashinfer_codeflow.zh.md](RESEARCH_flashinfer_vs_minicpm_flashinfer_codeflow.zh.md))
+
 # CHANGE_0136 — `sparse_dense_len` 运行时可调阈值(每请求 dense/sparse 路由开关)
 
 ## 状态: 提案(待批准)
