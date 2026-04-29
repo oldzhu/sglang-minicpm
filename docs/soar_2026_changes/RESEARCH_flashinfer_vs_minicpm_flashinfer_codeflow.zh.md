@@ -21,11 +21,20 @@ baseline?*
    Test 12 baseline 的实际运行状态。**
 5. 因此 Test 12(79.29%)和 Round 13f-1(76.91%)**std-attn kernel 完全相同**
    (都是 stock FlashInfer)。两者差异**不在** std-attn kernel,而在与
-   `--force-dense-minicpm` 一起切换的**周边配置**:
+   `--force-dense-minicpm` 一起切换的**周边配置**(考虑 `prepare_env.sh`
+   已经覆盖的项后):
    - `model_config.has_sparse_attention`: True(无 force) ↔ False(有 force)。
    - `model_config.sparse_layer_ids`: 非空 ↔ 空。
-   - Lightning mixer `recurrent_threshold`: 64(无 force) ↔ 128(有 force)。
-   - `--dense-as-sparse`: Round 13f-1 单独丢弃。
+   - `--dense-as-sparse`: Round 13f-1 单独丢弃(仅影响
+     `MiniCPMSparseBackend` 构造;`flashinfer` 后端不加载该类,实际是 no-op)。
+
+> **勘误(2026-04-29 事后)**: 本文早期版本把 Lightning mixer
+> `recurrent_threshold`(`hybrid_linear_attn_backend.py:1484` 中默认 64 vs 128)
+> 列为假设 1。那是错的:`prepare_env.sh:129` 无条件导出
+> `SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD=128`,路径 B 和路径 C 都读
+> 到 128。该阈值**不是** 2.4pt 准确率下降的来源。假设 2
+> (`has_sparse_attention` / `sparse_layer_ids` 模型构造时副作用)现在是
+> 领头候选。
 
 ## 后端注册(分歧起点)
 
@@ -175,29 +184,24 @@ server_args.py:1521-1525:
 std-attn kernel 完全相同。准确率差只能来自与 `force_dense_minicpm` 一起切换
 的周边旋钮:
 
-### 假设 1(最可能)— Lightning mixer recurrent 阈值
+### 假设 1(已被插销)— Lightning mixer recurrent 阈值
+
+*初稿列为最强候选;二次复查后排除。*
 
 `hybrid_linear_attn_backend.py:1484`:
 ```python
 default_recurrent_threshold = 128 if self.force_dense_minicpm else 64
+self.recurrent_threshold = max(1, get_int_env_var(
+    "SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD", default_recurrent_threshold))
 ```
 
-Lightning mixer 有两套实现:
-- **chunk 模式**(seq_len ≥ threshold)— 分块 SimpleGLA,长序列更快,但通过
-  分块 causal kernel 累积状态。
-- **recurrent 模式**(seq_len < threshold)— 逐元素递推状态更新,与训练数学
-  完全一致。
+**默认值**随 `force_dense_minicpm` 翻转,但 `prepare_env.sh:129` 对 gptq 路径
+**无条件**导出了 `SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD=128`。
+环境变量赢过默认值,路径 B 和路径 C 都读到 128。**该旋钮不是 2.4pt
+下降的原因**。如果重跑不同阈值,只是测试阈值本身,而不是
+ Test 12 与 Round 13f-1 的差异。
 
-路径 B 阈值 = 64,路径 C 阈值 = 128。许多 eval prompt 的 extend_seq_len 落在
-[64, 128) 区间(短 mcq ~60-100 tokens、qa 短答、running > 64 的 decode 步)。
-路径 B 走 **chunk** 模式,路径 C 走 **recurrent** 模式。两者在 float32 下
-等价,但**低精度下偏离**,因为 chunk 模式的分块 reduction 累积 FP 误差不同。
-
-这是 150 样本 benchmark 上损失 2.4pt 的**最强候选**,尤其对 cwe(损失最严重:
-路径 B 82.33% vs 期望 ≥87%)和 qa(56.67% vs Test 20 63.33%)这类对注意力
-状态精度极敏感的检索任务。
-
-### 假设 2 — `has_sparse_attention=True` 副作用
+### 假设 2(现为领头)— `has_sparse_attention=True` 副作用
 
 若 `has_sparse_attention=True`,模型加载器 / KV cache 可能:
 - 为稀疏层分配不同 KV 布局(例如为 compress_k1/k2 留出额外空间)。stock
@@ -227,19 +231,16 @@ Lightning mixer 有两套实现:
 
 | # | 实验 | 验证 | 预期 |
 |---|------|------|------|
-| **A** | 路径 B + `SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD=128` | 假设 1 | 若准确率回升 ≥1.5pt → 阈值是主因,应聚焦该旋钮。 |
-| **B** | 路径 B + `--force-dense-minicpm` 但保留 stock flashinfer 字符串 | 把 force-dense 所有副作用(config + 阈值)叠加,而无需重写 backend 名 | 若准确率回到 Test 12 → 速度收益与 backend 切换无关;直接出新 baseline。 |
-| **C** | 路径 C 把 `--max-running-requests` 降至 16(更接近 Round 13f-1 的有效并发) | 排除调度器影响 | 准确率应不动;反向印证 kernel/阈值答案。 |
-| **D** | 路径 B 重新启用 `--enable-torch-compile --torch-compile-max-bs 8` | Round 13f-1 丢了 compile;Test 12 保留。compile 路径或可稳定数值 | 若 compile 救回准确率 → 数值稳定性是核心。 |
+| **A** | 路径 B + `SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD=64` | 假设 1(仅作 sanity,因两路径已使用 128) | 准确率不应变化;若变化说明环境传递追踪错误。 |
+| **B** | 路径 B (`--attention-backend flashinfer`) + 加回 `--force-dense-minicpm` | 假设 2:隔离 `has_sparse_attention` / `sparse_layer_ids` 副作用,不改 std-attn kernel 字符串 | 若准确率回到 ~Test 12 → 稀疏配置副作用拥有这 2.4pt;切新 baseline。若速度仍 ~110s S1 → 增益来自配置而非 kernel。 |
+| **C** | 路径 B + `--force-dense-minicpm` + `--dense-as-sparse`(仅 `flashinfer` 与 `minicpm_flashinfer` 字面差异) | 最严格对照:重写后二者本来就等价,应准确复现 Test 12 | 若 acc/速度 = Test 12 → 证实 `server_args.py:1525` 重写忠实,Round 13f-1 的 76.91% 完全归因于丢弃 `--force-dense-minicpm`。 |
+| **D** | 路径 B + 重新开启 `--enable-torch-compile --torch-compile-max-bs 8` | Round 13f-1 丢了 compile;Test 12 保留。compile 路径可能稳定数值 | 若 compile 单独恢复 ≥1pt acc → 数值稳定性部分负责。 |
 
-推荐先跑**实验 B**。如果 `--force-dense-minicpm` + stock flashinfer(实际上
-就是 Test 12 已有的同一服务器配置)能复现 79.29%,那 Round 13f-1 的"速度
-收益"是错觉(同 backend、同 kernel),7% 差异必来自 {compile, lightning 阈值,
-调度器} 之一。在显式 `flashinfer` 字符串下复现该状态 → 已经就是新 baseline。
-
-如果实验 B 速度回归到 Test 12 水平,说明 Round 13f-1 的速度增益恰好来自
-**移除** `--force-dense-minicpm`,即 stock flashinfer 在 `has_sparse_attention=True`
-状态下运行。该状态正是损失 2.4pt 的源头,需进一步刻画。
+推荐顺序:
+1. **实验B优先**(一个配置变动,信息产出最大)。
+2. 若 B 达到 ≥79% acc → 切为 `v20` 候选,跑完整的 S1/S8/Smax 矩阵。
+3. 若 B 失败,跑**实验 D**(重开 compile)排除数值因素。
+4. **实验 C** 是 B 模棱两可时的最净对照。
 
 ## 回答原始问题
 

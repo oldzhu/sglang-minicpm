@@ -23,11 +23,23 @@ so we can pinpoint the behavioral delta that costs 2.4 acc points.
 5. So Test 12 (79.29%) and Round 13f-1 (76.91%) **both run stock FlashInfer
    for std-attn**. The difference between them is **not** the std-attn kernel.
    It is in the *peripheral* config knobs that flip together with
-   `--force-dense-minicpm`. The most likely accuracy-relevant ones:
+   `--force-dense-minicpm`. The most likely accuracy-relevant ones (after
+   correcting for what `prepare_env.sh` already overrides):
    - `model_config.has_sparse_attention` flips True (no force) ↔ False (force).
    - `model_config.sparse_layer_ids` flips populated ↔ empty.
-   - Lightning-mixer `recurrent_threshold` flips 64 (no force) ↔ 128 (force).
-   - `--dense-as-sparse` is independently dropped in Round 13f-1.
+   - `--dense-as-sparse` is independently dropped in Round 13f-1 (see notes
+     below — reaches `MiniCPMSparseBackend` ctor only, but `flashinfer`
+     backend never loads that class so it is a no-op).
+
+> **Correction (2026-04-29 post-write)**: an earlier version of this doc
+> listed lightning-mixer `recurrent_threshold` (64 vs 128 default in
+> `hybrid_linear_attn_backend.py:1484`) as Hypothesis 1. That is wrong:
+> `prepare_env.sh:129` unconditionally exports
+> `SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD=128`, so both Path B and
+> Path C read 128. The `recurrent_threshold` is therefore **not** the
+> source of the 2.4 acc-pt regression. Hypothesis 2
+> (`has_sparse_attention` / `sparse_layer_ids` model-construction
+> side-effects) is now the leading candidate.
 
 ## Backend registration (where the divergence starts)
 
@@ -183,32 +195,25 @@ kernel as Path C (Test 12)
 The std-attn kernel is identical. The accuracy delta therefore must come from
 the peripheral knobs that flip with `force_dense_minicpm`:
 
-### Hypothesis 1 (most likely) — Lightning-mixer recurrent threshold
+### Hypothesis 1 (INVALIDATED) — Lightning-mixer recurrent threshold
+
+*Originally listed as the strongest candidate; ruled out on second pass.*
 
 `hybrid_linear_attn_backend.py:1484`:
 ```python
 default_recurrent_threshold = 128 if self.force_dense_minicpm else 64
+self.recurrent_threshold = max(1, get_int_env_var(
+    "SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD", default_recurrent_threshold))
 ```
 
-The lightning mixer has two implementations:
-- **chunk** mode (used when seq_len ≥ threshold) — chunked SimpleGLA, faster
-  on long seqs but accumulates state via chunked-causal kernel.
-- **recurrent** mode (used when seq_len < threshold) — element-wise
-  recurrent state update, exact match to training math.
+The **default** flips with `force_dense_minicpm`, but `prepare_env.sh:129`
+already exports `SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD=128`
+unconditionally for the gptq path. The env var wins over the default, so
+both Path B and Path C read 128. **This knob is not the cause of the 2.4
+acc-pt drop.** Re-running with a different threshold would only test the
+threshold itself, not what differentiates Test 12 from Round 13f-1.
 
-Path B threshold = 64, Path C threshold = 128. Many eval prompts have
-extend_seq_len in [64, 128) (e.g., short mcq prompts ~60-100 tokens, qa
-short answers, decode-step batches with running > 64). On Path B these run
-**chunk** mode; on Path C they run **recurrent** mode. The two are
-mathematically equivalent in float32 but **diverge in low precision**
-because chunk-mode's blockwise reductions accumulate FP errors differently.
-
-This is the **strongest candidate** for a 2.4 acc-point drop on a 150-sample
-benchmark, particularly on tasks like cwe (which lost most: 82.33% on Path B
-vs ≥87% expected) and qa (56.67% vs 63.33% on Test 20). cwe-style retrieval
-is highly sensitive to attention-state precision.
-
-### Hypothesis 2 — `has_sparse_attention=True` side-effects
+### Hypothesis 2 (now leading) — `has_sparse_attention=True` side-effects
 
 If `has_sparse_attention` is True, the model loader / KV cache might:
 - Allocate a different KV layout for sparse layers (e.g., extra room for
@@ -241,22 +246,16 @@ top of Path B that recovers Test-12-class accuracy while keeping the speed gain.
 
 | # | Experiment | What it tests | Expected outcome |
 |---|------------|---------------|------------------|
-| **A** | Path B + `SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD=128` | Hypothesis 1 | If acc rises ≥1.5pt → confirms lightning threshold is dominant; pursue this knob. |
-| **B** | Path B + `--force-dense-minicpm` BUT keep stock flashinfer string | Combines all force-dense side-effects (config + threshold) without rewriting backend twice | If acc reaches Test 12 level → speed gain is real and unrelated to sparse routing; cut a new submission baseline. |
-| **C** | Path C with `--max-running-requests` reduced to 16 (closer to Round 13f-1 effective concurrency) | Rules out scheduler-side effects | Should not move acc; confirms the kernel/threshold answer. |
-| **D** | Path B with `--enable-torch-compile --torch-compile-max-bs 8` re-enabled | Round 13f-1 had compile dropped; Test 12 keeps it. Compile path may stabilize numerics. | If compile recovers acc → numerical stability is the issue. |
+| **A** | Path B + `SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD=64` | Hypothesis 1 (sanity-only since both paths already use 128) | Should NOT change acc; if it does we mis-traced env propagation. |
+| **B** | Path B (`--attention-backend flashinfer`) + add back `--force-dense-minicpm` | Hypothesis 2: isolates `has_sparse_attention` / `sparse_layer_ids` side-effects WITHOUT changing the std-attn kernel string. | If acc returns to ~Test 12 → sparse-config side-effects own the 2.4pt; cut new submission baseline. If speed still ~110s S1 → the gain was about config not kernel. |
+| **C** | Path B + `--force-dense-minicpm` + `--dense-as-sparse` (only delta from Test 12 is the literal backend string) | Strictest control: ONLY the `flashinfer` vs `minicpm_flashinfer` literal differs (post-rewrite they are the same anyway, so this should reproduce Test 12 exactly). | If acc/speed = Test 12 → confirms `server_args.py:1525` rewrite is faithful, and Round 13f-1's 76.91% is fully attributable to the absence of `--force-dense-minicpm`. |
+| **D** | Path B + `--enable-torch-compile --torch-compile-max-bs 8` re-enabled | Round 13f-1 dropped compile; Test 12 keeps it. compile path may stabilize numerics. | If compile alone recovers ≥1pt acc → numerical stability is partly responsible. |
 
-Recommended first run: **experiment B**. If `--force-dense-minicpm` + stock
-flashinfer (which is internally what Test 12 already does — they're the
-**same** server config) reproduces 79.29%, then Round 13f-1's "speed gain" is
-illusory (same backend, same kernel) and the 7% delta must come from one of
-{compile, lightning threshold, scheduler}. If we replicate that under the
-`flashinfer` string explicitly, we likely already are at the next baseline.
-
-If experiment B shows speed regresses back to Test 12 numbers, then the
-gain in Round 13f-1 came specifically from **dropping** `--force-dense-minicpm`,
-which means stock flashinfer was running with `has_sparse_attention=True`.
-That state is what costs 2.4 acc points and what we'd need to characterize.
+Recommended order:
+1. **Exp B first** (one config change, biggest information yield).
+2. If B reaches ≥79% acc → cut as `v20` candidate, run the full S1/S8/Smax matrix.
+3. If B fails, run **Exp D** (compile re-enabled) to factor out numerics.
+4. **Exp C** is the cleanest control if B is ambiguous.
 
 ## Answer to the original question
 
