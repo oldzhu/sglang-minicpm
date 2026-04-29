@@ -321,9 +321,28 @@ def step_wait_server(base_url, token, timeout=300):
     return False
 
 
-def step_accuracy(base_url, token, timeout=3600):
+def _resolve_model_path(quant_mode="gptq", model_path=None):
+    """Pick the eval --model_path that matches the served model.
+
+    eval_model_001.py loads tokenizer + GenerationConfig (eos / stop
+    words) from --model_path. It MUST match what the server serves,
+    otherwise prompts/stop tokens may differ and generation may run
+    away to max_tokens (read timeout).
+    """
+    if model_path is not None:
+        return model_path
+    if quant_mode == "fp8_blockwise":
+        return FP8_MODEL_PATH
+    if quant_mode == "noquant":
+        return NOQUANT_MODEL_PATH
+    return MODEL_PATH
+
+
+def step_accuracy(base_url, token, timeout=3600, quant_mode="gptq", model_path=None):
     """Run accuracy evaluation."""
     print_section("ACCURACY TEST")
+    eval_model_path = _resolve_model_path(quant_mode, model_path)
+    print(f"[accuracy] quant_mode={quant_mode}, eval --model_path={eval_model_path}")
     # Kill any leftover eval processes to avoid duplicate requests
     fcloud_run(base_url, token,
                'pkill -f "eval_model" 2>/dev/null; sleep 1; echo "cleaned"',
@@ -331,7 +350,7 @@ def step_accuracy(base_url, token, timeout=3600):
     cmd = (
         f"cd {FCLOUD_DATA} && python3 eval_model_001.py "
         f"--api_base {API_BASE} "
-        f"--model_path {MODEL_PATH} "
+        f"--model_path {eval_model_path} "
         f"--data_path {FCLOUD_DATA}/perf_public_set.jsonl "
         f"--concurrency 32 2>&1"
     )
@@ -340,7 +359,7 @@ def step_accuracy(base_url, token, timeout=3600):
     return out
 
 
-def step_quick_accuracy(base_url, token, task_filter=None, num_per_task=None, timeout=1200):
+def step_quick_accuracy(base_url, token, task_filter=None, num_per_task=None, timeout=1200, quant_mode="gptq", model_path=None):
     """Run quick accuracy evaluation with subset of data."""
     label = "QUICK ACCURACY"
     extra = ""
@@ -355,13 +374,15 @@ def step_quick_accuracy(base_url, token, task_filter=None, num_per_task=None, ti
         extra += " --task_filter mcq"
         label += " (mcq-only)"
     print_section(label)
+    eval_model_path = _resolve_model_path(quant_mode, model_path)
+    print(f"[quick-accuracy] quant_mode={quant_mode}, eval --model_path={eval_model_path}")
     fcloud_run(base_url, token,
                'pkill -f "eval_model" 2>/dev/null; sleep 1; echo "cleaned"',
                timeout=10)
     cmd = (
         f"cd {FCLOUD_DATA} && python3 eval_model_001.py "
         f"--api_base {API_BASE} "
-        f"--model_path {MODEL_PATH} "
+        f"--model_path {eval_model_path} "
         f"--data_path {FCLOUD_DATA}/perf_public_set.jsonl "
         f"--concurrency 32{extra} 2>&1"
     )
@@ -422,17 +443,17 @@ def step_server_logs(base_url, token, lines=100):
     return ""
 
 
-def workflow_full(base_url, token):
+def workflow_full(base_url, token, quant_mode="gptq", model_path=None):
     """Full workflow: sync → restart → wait → accuracy."""
     step_sync(base_url, token)
-    server_term = step_restart_server(base_url, token)
+    server_term = step_restart_server(base_url, token, quant_mode=quant_mode, model_path=model_path)
     ready = step_wait_server(base_url, token, timeout=300)
     if not ready:
         print("[ABORT] Server did not start in time")
         step_server_logs(base_url, token, lines=50)
         return
 
-    accuracy_out = step_accuracy(base_url, token)
+    accuracy_out = step_accuracy(base_url, token, quant_mode=quant_mode, model_path=model_path)
 
     # Parse accuracy from output
     m = re.search(r"Average Score:\s*([\d.]+)%", accuracy_out)
@@ -663,7 +684,9 @@ def main():
     parser = argparse.ArgumentParser(description="fcloud automated test workflow")
     sub = parser.add_subparsers(dest="action", required=True)
 
-    sub.add_parser("full", help="Full workflow: sync → restart → accuracy")
+    p_full = sub.add_parser("full", help="Full workflow: sync → restart → accuracy")
+    p_full.add_argument("--quant-mode", choices=["gptq", "fp8_blockwise", "noquant"], default="gptq")
+    p_full.add_argument("--model-path", type=str, default=None)
     sub.add_parser("sync", help="Git pull and copy changed files")
     p_restart = sub.add_parser("restart-server", help="Restart sglang server")
     p_restart.add_argument("--quant-mode", choices=["gptq", "fp8_blockwise", "noquant"], default="gptq",
@@ -671,11 +694,17 @@ def main():
     p_restart.add_argument("--model-path", type=str, default=None,
                            help="Override model path (default: auto from quant-mode)")
     sub.add_parser("wait-server", help="Wait for server to be ready")
-    sub.add_parser("accuracy", help="Run accuracy test")
+    p_acc = sub.add_parser("accuracy", help="Run accuracy test")
+    p_acc.add_argument("--quant-mode", choices=["gptq", "fp8_blockwise", "noquant"], default="gptq",
+                       help="Pick eval --model_path matching the served model (default: gptq)")
+    p_acc.add_argument("--model-path", type=str, default=None,
+                       help="Override eval --model_path (default: auto from quant-mode)")
 
     p_qacc = sub.add_parser("quick-accuracy", help="Quick accuracy test (subset)")
     p_qacc.add_argument("--tasks", type=str, default=None, help="Comma-separated task types (e.g. mcq,qa,cwe)")
     p_qacc.add_argument("--per-task", type=int, default=None, help="Max samples per task type")
+    p_qacc.add_argument("--quant-mode", choices=["gptq", "fp8_blockwise", "noquant"], default="gptq")
+    p_qacc.add_argument("--model-path", type=str, default=None)
 
     p_speed = sub.add_parser("speed", help="Run speed benchmark")
     p_speed.add_argument("--variant", choices=["s1", "s8", "smax", "all"], default="s1")
@@ -692,7 +721,9 @@ def main():
     base_url, token = fcloud_exec.load_config()
 
     if args.action == "full":
-        workflow_full(base_url, token)
+        workflow_full(base_url, token,
+                      quant_mode=args.quant_mode,
+                      model_path=args.model_path)
     elif args.action == "sync":
         step_sync(base_url, token)
     elif args.action == "restart-server":
@@ -702,9 +733,15 @@ def main():
     elif args.action == "wait-server":
         step_wait_server(base_url, token)
     elif args.action == "accuracy":
-        step_accuracy(base_url, token)
+        step_accuracy(base_url, token,
+                      quant_mode=args.quant_mode,
+                      model_path=args.model_path)
     elif args.action == "quick-accuracy":
-        step_quick_accuracy(base_url, token, task_filter=args.tasks, num_per_task=args.per_task)
+        step_quick_accuracy(base_url, token,
+                            task_filter=args.tasks,
+                            num_per_task=args.per_task,
+                            quant_mode=args.quant_mode,
+                            model_path=args.model_path)
     elif args.action == "speed":
         step_speed(base_url, token, args.variant)
     elif args.action == "server-logs":
