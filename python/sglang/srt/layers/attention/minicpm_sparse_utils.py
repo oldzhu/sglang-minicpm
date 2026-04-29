@@ -7,6 +7,7 @@ combining both backend-agnostic sparse attention components and kernel utilities
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 import math
 from typing import TYPE_CHECKING, Optional
@@ -955,7 +956,19 @@ class SparseConfig:
         kernel_stride = hf_config.sparse_kernel_stride
         block_size = hf_config.sparse_block_size
         window_size = hf_config.sparse_window_size
+        # CHANGE_0136: SOAR_SPARSE_DENSE_LEN env var overrides the model-config
+        # sparse_dense_len at backend metadata construction time. Mirrors the
+        # override in MiniCPMAttentionBackend.__init__ so the SparseConfig used
+        # by metadata builders agrees with the per-request routing threshold.
         dense_len = hf_config.sparse_dense_len
+        _env_dense_len = os.environ.get("SOAR_SPARSE_DENSE_LEN")
+        if _env_dense_len is not None:
+            try:
+                _override = int(_env_dense_len)
+                if _override >= 0:
+                    dense_len = _override
+            except (ValueError, TypeError):
+                pass
 
         head_dim = model_config.head_dim
         num_kv_heads = model_config.num_key_value_heads

@@ -167,7 +167,30 @@ if [[ "$QUANT_MODE" == "gptq" ]]; then
 	if [[ "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "1" || "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "true" || "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "TRUE" ]]; then
 		FUSED_QK_NORM_ROPE_ARG=" --enable-fused-qk-norm-rope"
 	fi
-	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 32768 --max-prefill-tokens 32768 --prefill-max-requests 1 --max-running-requests 24 --mem-fraction-static 0.84 --schedule-conservativeness 1.0 --dense-as-sparse --quantization gptq_marlin${FORCE_DENSE_ARG} --kv-cache-dtype ${KV_CACHE_DTYPE_ARG}${FUSED_QK_NORM_ROPE_ARG}${TORCH_COMPILE_ARGS} --enable-mixed-chunk"
+	# CHANGE_0136: when SOAR_SPARSE_DENSE_LEN is set, the per-request
+	# dense/sparse routing threshold is overridden at backend init time.
+	# In that mode --force-dense-minicpm must be dropped (otherwise the
+	# threshold has no effect and every request runs dense). The threshold
+	# is read at runtime via os.environ inside MiniCPMAttentionBackend.
+	if [[ -n "$SOAR_SPARSE_DENSE_LEN" ]]; then
+		export SOAR_SPARSE_DENSE_LEN
+		FORCE_DENSE_ARG=""
+		echo "[prepare_env] SOAR_SPARSE_DENSE_LEN=${SOAR_SPARSE_DENSE_LEN} -> dropping --force-dense-minicpm; per-request routing controlled by env override"
+	fi
+	# Round 13f-1 smoketest: SOAR_BACKEND_VARIANT=flashinfer swaps the
+	# minicpm_flashinfer backend (with optional --force-dense-minicpm) for
+	# the stock --attention-backend flashinfer (the official-site default).
+	# Default behaviour unchanged when the env var is unset.
+	BACKEND_ARG=" --attention-backend minicpm_flashinfer"
+	if [[ "$SOAR_BACKEND_VARIANT" == "flashinfer" ]]; then
+		BACKEND_ARG=" --attention-backend flashinfer"
+		FORCE_DENSE_ARG=""
+		DENSE_AS_SPARSE_ARG=""
+		echo "[prepare_env] SOAR_BACKEND_VARIANT=flashinfer -> using stock flashinfer backend, dropping --force-dense-minicpm and --dense-as-sparse"
+	else
+		DENSE_AS_SPARSE_ARG=" --dense-as-sparse"
+	fi
+	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache${BACKEND_ARG} --chunked-prefill-size 32768 --max-prefill-tokens 32768 --prefill-max-requests 1 --max-running-requests 24 --mem-fraction-static 0.84 --schedule-conservativeness 1.0${DENSE_AS_SPARSE_ARG} --quantization gptq_marlin${FORCE_DENSE_ARG} --kv-cache-dtype ${KV_CACHE_DTYPE_ARG}${FUSED_QK_NORM_ROPE_ARG}${TORCH_COMPILE_ARGS} --enable-mixed-chunk"
 elif [[ "$QUANT_MODE" == "fp8_blockwise" ]]; then
 	# FP8 blockwise: pre-quantized offline weights (N,K) float8_e4m3fn + blockwise scales
 	# Uses SM120 UMMA kernel (fp8_blockwise_scaled_mm) via weight.t() col-major zero-copy
@@ -225,5 +248,7 @@ echo "[prepare_env] SGLANG_MINICPM_LIGHTNING_FAST_OUTPUT_GATE=${SGLANG_MINICPM_L
 echo "[prepare_env] SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD=${SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD}"
 echo "[prepare_env] SGLANG_FLA_CHUNK_SIZE=${SGLANG_FLA_CHUNK_SIZE}"
 echo "[prepare_env] SOAR_W4A8_FP8_GEMM=${SOAR_W4A8_FP8_GEMM}"
+echo "[prepare_env] SOAR_SPARSE_DENSE_LEN=${SOAR_SPARSE_DENSE_LEN:-<unset>}"
+echo "[prepare_env] SOAR_BACKEND_VARIANT=${SOAR_BACKEND_VARIANT:-<unset>}"
 echo "[prepare_env] SGLANG_SERVER_ARGS=${SGLANG_SERVER_ARGS}"
 echo "[prepare_env] done"

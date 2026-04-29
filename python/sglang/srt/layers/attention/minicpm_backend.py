@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -235,8 +236,38 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.block_size = hf_config.sparse_block_size
         self.window_size = hf_config.sparse_window_size
         self.dense_as_sparse = model_runner.server_args.dense_as_sparse
-        self.dense_len = 0 if self.dense_as_sparse else hf_config.sparse_dense_len
-        self.config_dense_len = hf_config.sparse_dense_len
+        # CHANGE_0136: SOAR_SPARSE_DENSE_LEN env var overrides the per-request
+        # dense/sparse routing threshold from the model config. Sequences with
+        # seq_len < dense_len take the dense FlashInfer path inside the sparse
+        # layers; longer ones take the sparse top-k path. Ignored when
+        # dense_as_sparse is set (that flag forces every request to sparse).
+        _env_dense_len = os.environ.get("SOAR_SPARSE_DENSE_LEN")
+        if _env_dense_len is not None and not self.dense_as_sparse:
+            try:
+                _override = int(_env_dense_len)
+                if _override < 0:
+                    raise ValueError("must be >= 0")
+                self.dense_len = _override
+                self.config_dense_len = _override
+                logger.info(
+                    "SOAR_SPARSE_DENSE_LEN override: dense_len=%d "
+                    "(model config default was %d)",
+                    _override,
+                    hf_config.sparse_dense_len,
+                )
+            except (ValueError, TypeError) as _e:
+                logger.warning(
+                    "SOAR_SPARSE_DENSE_LEN=%r invalid (%s); falling back to "
+                    "config value %d",
+                    _env_dense_len,
+                    _e,
+                    hf_config.sparse_dense_len,
+                )
+                self.dense_len = hf_config.sparse_dense_len
+                self.config_dense_len = hf_config.sparse_dense_len
+        else:
+            self.dense_len = 0 if self.dense_as_sparse else hf_config.sparse_dense_len
+            self.config_dense_len = hf_config.sparse_dense_len
         topk = hf_config.sparse_topk
         self.use_nope = hf_config.sparse_use_nope
         self.local_blocks = self.window_size // self.block_size  # local_blocks
