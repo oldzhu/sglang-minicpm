@@ -190,7 +190,14 @@ elif [[ "$QUANT_MODE" == "noquant" ]]; then
 	if [[ "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "1" || "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "true" || "$SOAR_ENABLE_FUSED_QK_NORM_ROPE" == "TRUE" ]]; then
 		FUSED_QK_NORM_ROPE_ARG=" --enable-fused-qk-norm-rope"
 	fi
-	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 32768 --max-prefill-tokens 32768 --prefill-max-requests 1 --max-running-requests 8 --mem-fraction-static 0.78 --schedule-conservativeness 1.0 --dense-as-sparse --kv-cache-dtype fp8_e5m2${FUSED_QK_NORM_ROPE_ARG} --enable-mixed-chunk"
+	# NOTE: --dense-as-sparse intentionally removed (Round 13e analysis):
+	#   - Under flashinfer backend it's a no-op (custom MiniCPM backend not loaded).
+	#   - Under minicpm_flashinfer it forces requests with seq_len < hf_config.sparse_dense_len
+	#     (default 512) through the expensive sparse top-k+sparse-FA path, which is
+	#     slower than the dense FA branch they would otherwise take. Letting the
+	#     model-config dense_len threshold route short requests to dense and long
+	#     requests to sparse matches the mixed architecture's design intent.
+	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 32768 --max-prefill-tokens 32768 --prefill-max-requests 1 --max-running-requests 8 --mem-fraction-static 0.78 --schedule-conservativeness 1.0 --kv-cache-dtype fp8_e5m2${FUSED_QK_NORM_ROPE_ARG} --enable-mixed-chunk"
 fi
 
 # export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --log-level info"
