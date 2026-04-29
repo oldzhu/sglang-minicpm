@@ -249,7 +249,7 @@ def step_sync(base_url, token):
     print("[sync] Done")
 
 
-def step_restart_server(base_url, token, quant_mode="gptq", model_path=None):
+def step_restart_server(base_url, token, quant_mode="gptq", model_path=None, extra_env=None):
     """Kill existing sglang server and start a new one.
 
     Args:
@@ -257,6 +257,8 @@ def step_restart_server(base_url, token, quant_mode="gptq", model_path=None):
                     Controls SOAR_QUANT_MODE passed to prepare_env.sh.
         model_path: Override model path. Defaults to MODEL_PATH for gptq,
                     FP8_MODEL_PATH for fp8_blockwise.
+        extra_env: Optional dict of extra env vars to export before sourcing
+                   prepare_env.sh (e.g. {"SOAR_BACKEND_VARIANT": "flashinfer"}).
     """
     print_section("RESTART SERVER")
 
@@ -280,7 +282,13 @@ def step_restart_server(base_url, token, quant_mode="gptq", model_path=None):
 
     # Source prepare_env.sh and start server in background.
     # Export SOAR_QUANT_MODE before sourcing so prepare_env.sh picks up the right branch.
-    server_cmd = f"""cd {FCLOUD_SIM} && export SOAR_QUANT_MODE={quant_mode} && source ./prepare_env.sh && \\
+    extra_exports = ""
+    if extra_env:
+        for k, v in extra_env.items():
+            # Single-quote safe (no embedded ' expected for our env values)
+            extra_exports += f"export {k}='{v}' && "
+        print(f"[restart-server] extra_env={extra_env}")
+    server_cmd = f"""cd {FCLOUD_SIM} && {extra_exports}export SOAR_QUANT_MODE={quant_mode} && source ./prepare_env.sh && \\
 MODEL_PATH={model_path} && \\
 HOST={HOST} && \\
 PORT={PORT} && \\
@@ -693,6 +701,8 @@ def main():
                            help="Quantization mode (default: gptq)")
     p_restart.add_argument("--model-path", type=str, default=None,
                            help="Override model path (default: auto from quant-mode)")
+    p_restart.add_argument("--env", action="append", default=[],
+                           help="Extra env var KEY=VAL to export before sourcing prepare_env.sh; repeatable")
     sub.add_parser("wait-server", help="Wait for server to be ready")
     p_acc = sub.add_parser("accuracy", help="Run accuracy test")
     p_acc.add_argument("--quant-mode", choices=["gptq", "fp8_blockwise", "noquant"], default="gptq",
@@ -727,9 +737,16 @@ def main():
     elif args.action == "sync":
         step_sync(base_url, token)
     elif args.action == "restart-server":
+        extra_env = {}
+        for kv in (args.env or []):
+            if "=" not in kv:
+                parser.error(f"--env must be KEY=VAL, got: {kv!r}")
+            k, v = kv.split("=", 1)
+            extra_env[k] = v
         step_restart_server(base_url, token,
                             quant_mode=args.quant_mode,
-                            model_path=args.model_path)
+                            model_path=args.model_path,
+                            extra_env=extra_env or None)
     elif args.action == "wait-server":
         step_wait_server(base_url, token)
     elif args.action == "accuracy":

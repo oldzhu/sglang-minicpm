@@ -172,10 +172,16 @@ if [[ "$QUANT_MODE" == "gptq" ]]; then
 	# In that mode --force-dense-minicpm must be dropped (otherwise the
 	# threshold has no effect and every request runs dense). The threshold
 	# is read at runtime via os.environ inside MiniCPMAttentionBackend.
+	# Also drop --enable-torch-compile: the sparse path is incompatible
+	# with cudagraph capture under torch.compile (raises
+	# CUDAGeneratorImpl::current_seed during CUDA graph capture from
+	# hybrid_linear_attn_backend._can_use_fast_state_io). This matches the
+	# SOAR_SPARSE_MODE=1 branch above.
 	if [[ -n "$SOAR_SPARSE_DENSE_LEN" ]]; then
 		export SOAR_SPARSE_DENSE_LEN
 		FORCE_DENSE_ARG=""
-		echo "[prepare_env] SOAR_SPARSE_DENSE_LEN=${SOAR_SPARSE_DENSE_LEN} -> dropping --force-dense-minicpm; per-request routing controlled by env override"
+		TORCH_COMPILE_ARGS=""
+		echo "[prepare_env] SOAR_SPARSE_DENSE_LEN=${SOAR_SPARSE_DENSE_LEN} -> dropping --force-dense-minicpm and --enable-torch-compile; per-request routing controlled by env override"
 	fi
 	# Round 13f-1 smoketest: SOAR_BACKEND_VARIANT=flashinfer swaps the
 	# minicpm_flashinfer backend (with optional --force-dense-minicpm) for
