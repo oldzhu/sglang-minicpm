@@ -185,23 +185,76 @@ startup).
   `--mode off`. It removes both v2 and legacy v1 markers idempotently.
 - **In source code**: revert commit `0c7767aa8`.
 
+## fcloud regression test (v2 ON, 2026-04-30)
+
+After local Jinja2 render tests passed, we applied v2 to the actual fcloud
+model (`MiniCPM-SALA-90-qa-cwe-mcq-sparse_qkv_w8`), restarted sglang, and ran
+the full public accuracy eval at concurrency=32. Render-test against the live
+model tokenizer confirmed the prefix correctly ended with
+`<|im_start|>assistant\n<think>\n\n</think>\n\n` for mcq prompts.
+
+| Task | v1 (no-op, A1 result) | **v2 ON (this round)** | v20 baseline (clean) |
+|------|----------------------:|------------------------:|---------------------:|
+| mcq  | 56.67% (avg_out 10438) | **46.67% (avg_out 12094)** | (high; not separately broken out) |
+| qa   | ~50%                   | 53.33%                 | — |
+| niah | 100%                   | 96.67%                 | — |
+| cwe  | 82.67%                 | 82.00%                 | — |
+| fwe  | 100%                   | 98.89%                 | — |
+| **Average** | **77.87%**       | **75.51%**             | (acc_ori 80.87, normalized 100) |
+| Wall  | (not captured)        | 2880.74 s              | — |
+
+**v2 is a regression**, not a fix:
+
+- mcq accuracy DROPPED from v1's 56.67% → 46.67%.
+- mcq `avg_out_len` went UP from 10438 → 12094 — i.e. the model produced MORE
+  reasoning tokens despite the pre-seeded closed `<think>`.
+- Render-test confirms the input prefix is correct, so the failure is in the
+  model's response, not in template plumbing.
+
+**Root cause (hypothesis, confirmed by behaviour):** MiniCPM-SALA-90 does NOT
+treat `<|im_start|>assistant\n<think>\n\n</think>\n\n` as a sink state. The
+Qwen3 closed-empty-think idiom assumes the model has been distilled / SFT'd on
+data where empty `<think>...</think>` blocks are valid "already finished
+thinking" turns. MiniCPM-SALA-90 instead **re-opens reasoning** after our
+closed `</think>\n\n` (either by emitting another `<think>` or by writing
+free-form reasoning text), so we end up with EXTRA tokens, not fewer. The
+standard Qwen3 trick does not transfer to this model.
+
+**Why v1 looked similar but "better":** v1 was a pure no-op — it just left
+thinking on. v2 actively perturbs the prefix in a way the model wasn't trained
+on, which appears to slightly destabilise mcq behaviour relative to the
+untouched template (v20 clean).
+
+## Disposition
+
+- v2 was reverted on the fcloud model immediately after this run
+  (`toggle_mcq_thinking_patch.py --mode off`); the chat_template now matches
+  the v20 submission byte-for-byte.
+- fcloud paused (`pause-instance` succeeded after one 504 retry).
+- Code stays in the repo as a **documented dead-end**. The toggle helper +
+  preprocess wiring + tests are still useful infrastructure if we ever revisit
+  thinking-control.
+- We will **not ship v2**. The submitted v20 already has `C=1.0` officially
+  (acc=100 normalized, acc_ori=80.87) — accuracy is not the bottleneck.
+
 ## Status (as of v20 submission window)
 
 - v20 returned `acc=100.0` (`acc_ori=80.87`), `C=1.0`, but `final_score=32.84`
   — accuracy is no longer the bottleneck; speed is.
-- Decision: keep v2 code committed but evaluate whether to **apply** it on the
-  submitted model is now optional. If a future submission ever drops below
-  `C=1.0`, v2 becomes the primary lever.
+- v2 was tested and rejected (this document); CHANGE_0140 closes here.
 - Pivoting subsequent work to speed (S1/S8/Smax) per
   `OPTIMIZATION_CATALOG_GPTQ_FP8_DENSE.md`.
 
 ## Next-step suggestions (post-pivot)
 
-1. Re-baseline current S1/S8/Smax with v2 OFF on fcloud (quick acc + S1 sanity
-   to confirm the pivot point) — this is the single fcloud round we're running
-   right now after this doc lands.
-2. Continue work in the GPTQ + FP8 dense optimization catalog, focused on
-   prefill throughput, sparse attention, KV cache efficiency (these dominate
-   the hidden long-context official speed set).
-3. Keep v2 as a safety net — if accuracy regresses on a future iteration we
-   can flip it on without re-quantization.
+1. v2 is closed; do NOT re-test or re-apply it on any future iteration without
+   first solving the "model re-opens think after `</think>`" behaviour.
+2. Move directly to speed work: open
+   `docs/soar_2026_changes/OPTIMIZATION_CATALOG_GPTQ_FP8_DENSE.md` and pick
+   the top-priority candidates focused on prefill throughput, sparse
+   attention, KV cache efficiency (which dominate the hidden long-context
+   official speed set).
+3. If a future iteration ever DROPS below `C=1.0` and we need an mcq accuracy
+   lever, the next idea worth trying is **server-side stop-token** suppression
+   (force `</think>` to be sampled early) rather than prefix shaping —
+   different mechanism that does not depend on the model's training pattern.
