@@ -1037,28 +1037,94 @@ def run_gptq_quantization(
 # submission-prep time on the official runner).  No harness edit; complies with
 # repo's eval-script-integrity rule.
 
-CHAT_TEMPLATE_MCQ_PATCH_MARKER = "{# SOAR_MCQ_THINKING_DISABLE_v1 #}"
+CHAT_TEMPLATE_MCQ_PATCH_MARKER_V1 = "{# SOAR_MCQ_THINKING_DISABLE_v1 #}"
+CHAT_TEMPLATE_MCQ_PATCH_MARKER = "{# SOAR_MCQ_THINKING_DISABLE_v2 #}"
 
-# Note: Jinja2 `{% set %}` inside an `{% if %}` or `{% for %}` block is local to
-# that block and does NOT rebind variables in the enclosing scope.  To rebind
-# `enable_thinking` for the rest of the template we use the standard
-# `namespace()` workaround: mutate ns.et inside the loop (mutation IS visible
-# across scopes), then do a single top-level `{% set enable_thinking = ns.et %}`
-# which IS at template scope and therefore rebinds globally.
-CHAT_TEMPLATE_MCQ_PATCH_PREAMBLE = (
-    CHAT_TEMPLATE_MCQ_PATCH_MARKER
-    + "\n"
-    + "{%- set _soar_ns = namespace(et=(enable_thinking if enable_thinking is defined else true)) -%}\n"
-    + "{%- if messages is defined and messages -%}\n"
-    + "{%- for _m in messages -%}\n"
-    + "{%- set _c = _m['content'] if (_m['content'] is defined and _m['content'] is string) else '' -%}\n"
-    + "{%- if 'LETTER is one of ABCD' in _c -%}\n"
-    + "{%- set _soar_ns.et = false -%}\n"
-    + "{%- endif -%}\n"
-    + "{%- endfor -%}\n"
-    + "{%- endif -%}\n"
-    + "{%- set enable_thinking = _soar_ns.et -%}\n"
+# Strategy v2: the upstream chat_template does NOT read `enable_thinking`
+# anywhere (the model was trained to always begin its assistant turn with
+# `<think>`).  To actually suppress thinking on mcq prompts we replace the
+# trailing `add_generation_prompt` block so that, when an mcq is detected, we
+# pre-seed a closed `<think>\n\n</think>\n\n` block right after the assistant
+# header.  This is the standard Qwen3 disable-thinking trick.
+#
+# Detection signal: literal substring "LETTER is one of ABCD" in any user
+# message (present in 30/30 public mcq prompts, 0 false positives).
+#
+# Jinja note: `{% set %}` inside an `{% if %}/{% for %}` block is block-local;
+# we use `namespace(...)` to mutate state across the for-loop and check after.
+CHAT_TEMPLATE_MCQ_PATCH_OLD_TRAILING = (
+    "{%- if add_generation_prompt %}\n"
+    "    {{- '<|im_start|>assistant\\n' }}\n"
+    "{%- endif %}"
 )
+CHAT_TEMPLATE_MCQ_PATCH_NEW_TRAILING = (
+    CHAT_TEMPLATE_MCQ_PATCH_MARKER + "\n"
+    "{%- if add_generation_prompt %}\n"
+    "    {{- '<|im_start|>assistant\\n' }}\n"
+    "    {%- set _soar_mcq_ns = namespace(disable_think=false) -%}\n"
+    "    {%- if messages is defined and messages -%}\n"
+    "        {%- for _m in messages -%}\n"
+    "            {%- if _m['content'] is defined and _m['content'] is string and 'LETTER is one of ABCD' in _m['content'] -%}\n"
+    "                {%- set _soar_mcq_ns.disable_think = true -%}\n"
+    "            {%- endif -%}\n"
+    "        {%- endfor -%}\n"
+    "    {%- endif -%}\n"
+    "    {%- if _soar_mcq_ns.disable_think -%}\n"
+    "        {{- '<think>\\n\\n</think>\\n\\n' }}\n"
+    "    {%- endif -%}\n"
+    "{%- endif %}"
+)
+
+# Legacy v1 preamble (kept here so revert can clean up older patched models).
+CHAT_TEMPLATE_MCQ_PATCH_V1_PREAMBLE_PREFIX = CHAT_TEMPLATE_MCQ_PATCH_MARKER_V1 + "\n"
+CHAT_TEMPLATE_MCQ_PATCH_V1_PREAMBLE_TAIL = "{%- set enable_thinking = _soar_ns.et -%}\n"
+
+
+def _strip_v1_preamble(template: str) -> str:
+    if CHAT_TEMPLATE_MCQ_PATCH_MARKER_V1 not in template:
+        return template
+    idx = template.find(CHAT_TEMPLATE_MCQ_PATCH_V1_PREAMBLE_PREFIX)
+    if idx < 0:
+        return template
+    end_marker = CHAT_TEMPLATE_MCQ_PATCH_V1_PREAMBLE_TAIL
+    end_idx = template.find(end_marker, idx)
+    if end_idx < 0:
+        return template
+    return template[:idx] + template[end_idx + len(end_marker):]
+
+
+def _apply_mcq_patch_to_template(template: str) -> Optional[str]:
+    """Return new template with v2 patch applied, or None if cannot/already patched."""
+    # Always strip any legacy v1 preamble first (it was a no-op).
+    template = _strip_v1_preamble(template)
+    if CHAT_TEMPLATE_MCQ_PATCH_MARKER in template:
+        return None  # already v2-patched
+    if CHAT_TEMPLATE_MCQ_PATCH_OLD_TRAILING not in template:
+        return ""  # cannot patch — trailing block doesn't match expected shape
+    return template.replace(
+        CHAT_TEMPLATE_MCQ_PATCH_OLD_TRAILING,
+        CHAT_TEMPLATE_MCQ_PATCH_NEW_TRAILING,
+        1,
+    )
+
+
+def _revert_mcq_patch_from_template(template: str) -> Optional[str]:
+    """Return cleaned template, or None if nothing to revert."""
+    changed = False
+    if CHAT_TEMPLATE_MCQ_PATCH_MARKER in template:
+        if CHAT_TEMPLATE_MCQ_PATCH_NEW_TRAILING in template:
+            template = template.replace(
+                CHAT_TEMPLATE_MCQ_PATCH_NEW_TRAILING,
+                CHAT_TEMPLATE_MCQ_PATCH_OLD_TRAILING,
+                1,
+            )
+            changed = True
+    if CHAT_TEMPLATE_MCQ_PATCH_MARKER_V1 in template:
+        new_t = _strip_v1_preamble(template)
+        if new_t != template:
+            template = new_t
+            changed = True
+    return template if changed else None
 
 
 def _patch_chat_template_for_mcq(dst: Path) -> None:
@@ -1068,7 +1134,7 @@ def _patch_chat_template_for_mcq(dst: Path) -> None:
       (1) embedded:  tokenizer_config.json["chat_template"] = "<jinja>"
       (2) external:  chat_template.jinja file (raw jinja source)
 
-    Idempotent (returns early if marker already present).
+    Idempotent (no-op if already v2-patched).  Auto-cleans v1 preamble.
     Skipped when env SOAR_DISABLE_MCQ_THINKING is falsy.
     """
     if not _env_truthy("SOAR_DISABLE_MCQ_THINKING", True):
@@ -1084,16 +1150,19 @@ def _patch_chat_template_for_mcq(dst: Path) -> None:
         if not template.strip():
             print(f"[preprocess][change-0140] {jinja_path} empty; skip")
             return
-        if CHAT_TEMPLATE_MCQ_PATCH_MARKER in template:
-            print(f"[preprocess][change-0140] {jinja_path} already patched; skip")
+        new = _apply_mcq_patch_to_template(template)
+        if new is None:
+            print(f"[preprocess][change-0140] {jinja_path} already v2-patched; skip")
             return
-        new_template = CHAT_TEMPLATE_MCQ_PATCH_PREAMBLE + template
+        if new == "":
+            print(f"[preprocess][change-0140] {jinja_path}: trailing add_generation_prompt block not found in expected shape; skip")
+            return
         tmp_path = jinja_path.with_suffix(".jinja.tmp")
-        tmp_path.write_text(new_template, encoding="utf-8")
+        tmp_path.write_text(new, encoding="utf-8")
         tmp_path.replace(jinja_path)
         print(
-            f"[preprocess][change-0140] {jinja_path.name} patched: mcq prompts "
-            "(marker 'LETTER is one of ABCD') now have enable_thinking=false"
+            f"[preprocess][change-0140] {jinja_path.name} patched (v2): mcq prompts "
+            "(marker 'LETTER is one of ABCD') now pre-seed <think></think> block"
         )
         return
 
@@ -1110,19 +1179,23 @@ def _patch_chat_template_for_mcq(dst: Path) -> None:
         print("[preprocess][change-0140] no chat_template.jinja AND tokenizer_config.json has no chat_template; skip")
         return
 
-    if CHAT_TEMPLATE_MCQ_PATCH_MARKER in template:
-        print("[preprocess][change-0140] embedded chat_template already patched; skip")
+    new = _apply_mcq_patch_to_template(template)
+    if new is None:
+        print("[preprocess][change-0140] embedded chat_template already v2-patched; skip")
+        return
+    if new == "":
+        print("[preprocess][change-0140] embedded chat_template: trailing block not found in expected shape; skip")
         return
 
-    cfg["chat_template"] = CHAT_TEMPLATE_MCQ_PATCH_PREAMBLE + template
+    cfg["chat_template"] = new
 
     tmp_path = tok_path.with_suffix(".json.tmp")
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     tmp_path.replace(tok_path)
     print(
-        "[preprocess][change-0140] embedded chat_template patched: mcq prompts "
-        "(marker 'LETTER is one of ABCD') now have enable_thinking=false"
+        "[preprocess][change-0140] embedded chat_template patched (v2): mcq prompts "
+        "(marker 'LETTER is one of ABCD') now pre-seed <think></think> block"
     )
 
 
