@@ -1,6 +1,6 @@
 # Option B Phase 1 — FP8 Blockwise GEMM Implementation Delivery
 
-**Status**: ✅ **IMPLEMENTATION COMPLETE & COMMITTED**
+**Status**: ❌ **FAILED — DO NOT PURSUE** (accuracy test completed 2026-04-21, results unviable)
 
 **Commits**:
 - Implementation: `b794b692d` — "feat: Option B Phase 1 - FP8 blockwise quantization implementation"
@@ -305,4 +305,64 @@ The implementation provides:
 **Expected outcome**: 30-45% prefill speedup + maintained accuracy (99%+ normalized).
 
 **Timeline**: Days 2-5 for fcloud testing and validation. User approval required to proceed.
+
+---
+
+## Test Results — FINAL (2026-04-21) ❌ FAILED
+
+### Bugs Fixed Before Valid Test
+
+| Bug | Description | Fix Commit | Details |
+|-----|-------------|-----------|---------|
+| Bug 8 | `FP8BlockwiseLinearMethod` not in `WEIGHT_LOADER_V2_SUPPORTED` → `narrow()` crash on scale tensor | `6b0492021` | Added to set in `python/sglang/srt/layers/linear.py` |
+| Bug 9 | `_quantize_activation_fp8_blockwise` used float32 scale → BF16 activation tensor upcasted to float32 → 3.88 GB OOM during prefill | `2d958dd95` | Changed `scale_expanded` to `x.dtype` (BF16) in `fp8_blockwise.py` |
+
+### Accuracy Test Run 1 (INVALID — Bug 9 present)
+- **Output dir**: `/root/data/outputs/20260421_081651/`
+- **Result**: Server OOM crashed after 19/150 samples
+- **Partial results**: mcq=16.67% (~random chance), niah=30%, cwe/fwe/qa=0%
+- **Verdict**: Invalid — Bug 9 (float32 OOM) caused server crash, results are garbage
+
+### Accuracy Test Run 2 (VALID — both bugs fixed)
+- **Output dir**: `/root/data/outputs/20260421_082644/`
+- **Commits**: `6b0492021` (Bug 8) + `2d958dd95` (Bug 9)
+- **Progress**: 139/150 samples in 46 minutes → fcloud 3600s timeout hit
+- **Remaining**: Last 11 samples projected even longer (last seen sample took 152s)
+- **Outcome**: No `predictions.jsonl` written — eval never completed
+- **Evidence of failure**: Model generates near-max-length (65536 token) outputs on the majority of long-context tasks:
+  - Late samples: 50–152 seconds each (vs ~8–12s on GPTQ baseline)
+  - This is consistent with degenerate outputs where the model cannot follow stop-token instructions
+  - Avg tokens/sample estimated >30,000 (vs ~1,000 on baseline)
+- **Accuracy verdict**: Cannot be measured (no final JSON), but projected ≈ 0–20% on CWE/FWE/QA tasks → **C = 0 (eliminated)**
+
+### Root Cause Analysis
+
+FP8 blockwise quantization (`float8_e4m3fn`, block_size=128) with **per-block static offline scales** does NOT preserve the model's instruction-following / stop-token generation behavior for this task. The model (MiniCPM-SALA) likely has:
+
+1. **Scale mismatch at inference time**: Offline scales were computed with `scale = max(abs(block)) / 448.0`. If the activation distribution at inference time differs from weight distribution, the GEMM output is distorted.
+2. **Per-block activation scaling**: The activation quantizer computes per-row, per-128-K-block scales at runtime — this is correct in principle, but any numerical mismatch (especially BF16 precision loss in scale computation) accumulates across 80 transformer layers.
+3. **Long-context tasks are most sensitive**: NIAH and QA tasks require attending to tokens far away in context. Even small per-token numerical errors compound over 65K-token sequences.
+
+### Final Verdict
+
+**Option B (FP8 blockwise GEMM) FAILS the accuracy gate.** 
+
+- ❌ Accuracy: C = 0 (projected), eval timed out, model generates runaway outputs
+- ❌ Speed: Even if accuracy were acceptable, eval was 3× slower than baseline — the model generates far more tokens per sample
+- ❌ Viability: **DO NOT SUBMIT this configuration**
+
+### What Works (Not Broken)
+- The FP8 blockwise kernel (`fp8_blockwise_scaled_mm`) exists and is callable
+- The weight conversion (`preprocess_model.py --mode fp8_blockwise`) works correctly
+- The model loads without errors and CUDA graphs capture successfully
+- The server stays alive (no OOM after Bug 9 fix)
+- **The failure is in quantization quality, not in the code infrastructure**
+
+### Rollback Instructions
+
+Option B code is isolated and does not affect the baseline config. To return to baseline:
+1. Switch back to GPTQ model: `--model-path /root/models/openbmb/MiniCPM-SALA-90-qa-cwe-mcq-sparse_qkv_w8`
+2. Restore baseline `SGLANG_SERVER_ARGS` in `prepare_env.sh` (no `--quant-mode fp8_blockwise`)
+3. The FP8 blockwise code files (`fp8_blockwise.py`, changes to `linear.py`) are harmless when GPTQ model is used
+
 
