@@ -1062,7 +1062,11 @@ CHAT_TEMPLATE_MCQ_PATCH_PREAMBLE = (
 
 
 def _patch_chat_template_for_mcq(dst: Path) -> None:
-    """Patch tokenizer_config.json's chat_template to disable thinking on mcq.
+    """Patch the model's chat_template to disable thinking on mcq prompts.
+
+    Supports both HF storage layouts:
+      (1) embedded:  tokenizer_config.json["chat_template"] = "<jinja>"
+      (2) external:  chat_template.jinja file (raw jinja source)
 
     Idempotent (returns early if marker already present).
     Skipped when env SOAR_DISABLE_MCQ_THINKING is falsy.
@@ -1071,9 +1075,31 @@ def _patch_chat_template_for_mcq(dst: Path) -> None:
         print("[preprocess][change-0140] SOAR_DISABLE_MCQ_THINKING=false -> skip mcq chat-template patch")
         return
 
+    jinja_path = dst / "chat_template.jinja"
     tok_path = dst / "tokenizer_config.json"
+
+    # Layout (2): external chat_template.jinja takes precedence (newer HF convention).
+    if jinja_path.exists():
+        template = jinja_path.read_text(encoding="utf-8")
+        if not template.strip():
+            print(f"[preprocess][change-0140] {jinja_path} empty; skip")
+            return
+        if CHAT_TEMPLATE_MCQ_PATCH_MARKER in template:
+            print(f"[preprocess][change-0140] {jinja_path} already patched; skip")
+            return
+        new_template = CHAT_TEMPLATE_MCQ_PATCH_PREAMBLE + template
+        tmp_path = jinja_path.with_suffix(".jinja.tmp")
+        tmp_path.write_text(new_template, encoding="utf-8")
+        tmp_path.replace(jinja_path)
+        print(
+            f"[preprocess][change-0140] {jinja_path.name} patched: mcq prompts "
+            "(marker 'LETTER is one of ABCD') now have enable_thinking=false"
+        )
+        return
+
+    # Layout (1): embedded chat_template inside tokenizer_config.json.
     if not tok_path.exists():
-        print(f"[preprocess][change-0140] tokenizer_config.json not found at {tok_path}; skip")
+        print(f"[preprocess][change-0140] no chat_template.jinja and tokenizer_config.json not found at {tok_path}; skip")
         return
 
     with tok_path.open("r", encoding="utf-8") as f:
@@ -1081,11 +1107,11 @@ def _patch_chat_template_for_mcq(dst: Path) -> None:
 
     template = cfg.get("chat_template")
     if not isinstance(template, str) or not template.strip():
-        print("[preprocess][change-0140] chat_template missing/empty; skip mcq patch")
+        print("[preprocess][change-0140] no chat_template.jinja AND tokenizer_config.json has no chat_template; skip")
         return
 
     if CHAT_TEMPLATE_MCQ_PATCH_MARKER in template:
-        print("[preprocess][change-0140] chat_template already patched; skip")
+        print("[preprocess][change-0140] embedded chat_template already patched; skip")
         return
 
     cfg["chat_template"] = CHAT_TEMPLATE_MCQ_PATCH_PREAMBLE + template
@@ -1095,8 +1121,8 @@ def _patch_chat_template_for_mcq(dst: Path) -> None:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     tmp_path.replace(tok_path)
     print(
-        "[preprocess][change-0140] chat_template patched: mcq prompts (marker "
-        "'LETTER is one of ABCD') now have enable_thinking=false"
+        "[preprocess][change-0140] embedded chat_template patched: mcq prompts "
+        "(marker 'LETTER is one of ABCD') now have enable_thinking=false"
     )
 
 

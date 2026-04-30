@@ -42,50 +42,94 @@ def _atomic_write(tok_path: Path, cfg: dict) -> None:
     tmp_path.replace(tok_path)
 
 
-def apply_patch(tok_path: Path) -> str:
-    cfg = _load(tok_path)
-    template = cfg.get("chat_template")
-    if not isinstance(template, str) or not template.strip():
-        return "skip: chat_template missing/empty"
+def _atomic_write_text(p: Path, text: str) -> None:
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(p)
+
+
+def _strip_preamble(template: str) -> str:
+    """Remove the CHANGE_0140 preamble from a template string. Tolerant."""
+    rebind_line = "{%- set enable_thinking = _soar_ns.et -%}\n"
+    idx_marker = template.find(CHAT_TEMPLATE_MCQ_PATCH_MARKER)
+    if idx_marker < 0:
+        return template
+    idx_rebind = template.find(rebind_line, idx_marker)
+    if idx_rebind < 0:
+        # marker present but rebind missing → corrupted; refuse to touch
+        raise RuntimeError("marker present but rebind line missing; manual fix needed")
+    end = idx_rebind + len(rebind_line)
+    return template[:idx_marker] + template[end:]
+
+
+def _resolve_layout(model_dir: Path):
+    """Returns (kind, path) where kind in {'jinja','embedded',None}."""
+    jinja = model_dir / "chat_template.jinja"
+    tok = model_dir / "tokenizer_config.json"
+    if jinja.exists():
+        return ("jinja", jinja)
+    if tok.exists():
+        try:
+            cfg = json.loads(tok.read_text(encoding="utf-8"))
+            t = cfg.get("chat_template")
+            if isinstance(t, str) and t.strip():
+                return ("embedded", tok)
+        except Exception:
+            pass
+    return (None, None)
+
+
+def apply_patch(model_dir: Path) -> str:
+    kind, path = _resolve_layout(model_dir)
+    if kind is None:
+        return "skip: no chat_template.jinja and no embedded chat_template"
+    if kind == "jinja":
+        template = path.read_text(encoding="utf-8")
+        if not template.strip():
+            return "skip: chat_template.jinja empty"
+        if CHAT_TEMPLATE_MCQ_PATCH_MARKER in template:
+            return "noop: already patched"
+        _atomic_write_text(path, CHAT_TEMPLATE_MCQ_PATCH_PREAMBLE + template)
+        return "patched (chat_template.jinja)"
+    # embedded
+    cfg = _load(path)
+    template = cfg.get("chat_template", "")
     if CHAT_TEMPLATE_MCQ_PATCH_MARKER in template:
         return "noop: already patched"
     cfg["chat_template"] = CHAT_TEMPLATE_MCQ_PATCH_PREAMBLE + template
-    _atomic_write(tok_path, cfg)
-    return "patched"
+    _atomic_write(path, cfg)
+    return "patched (tokenizer_config.json)"
 
 
-def revert_patch(tok_path: Path) -> str:
-    cfg = _load(tok_path)
-    template = cfg.get("chat_template")
-    if not isinstance(template, str) or not template.strip():
-        return "skip: chat_template missing/empty"
+def revert_patch(model_dir: Path) -> str:
+    kind, path = _resolve_layout(model_dir)
+    if kind is None:
+        return "skip: no chat_template.jinja and no embedded chat_template"
+    if kind == "jinja":
+        template = path.read_text(encoding="utf-8")
+        if CHAT_TEMPLATE_MCQ_PATCH_MARKER not in template:
+            return "noop: not patched"
+        _atomic_write_text(path, _strip_preamble(template))
+        return "reverted (chat_template.jinja)"
+    cfg = _load(path)
+    template = cfg.get("chat_template", "")
     if CHAT_TEMPLATE_MCQ_PATCH_MARKER not in template:
         return "noop: not patched"
-    # Remove the preamble. Be permissive: strip the marker line and everything
-    # up to and including the trailing top-level rebind line. We rely on the
-    # fact that the preamble is contiguous and ends with the rebind line.
-    rebind_line = "{%- set enable_thinking = _soar_ns.et -%}\n"
-    idx_marker = template.find(CHAT_TEMPLATE_MCQ_PATCH_MARKER)
-    if idx_marker != 0:
-        # Marker should be at position 0 because we always prepend; if not,
-        # fall back to a tolerant strip.
-        pass
-    idx_rebind = template.find(rebind_line)
-    if idx_rebind < 0:
-        return "error: marker present but rebind line missing; manual fix needed"
-    end = idx_rebind + len(rebind_line)
-    new_template = template[:idx_marker] + template[end:]
-    cfg["chat_template"] = new_template
-    _atomic_write(tok_path, cfg)
-    return "reverted"
+    cfg["chat_template"] = _strip_preamble(template)
+    _atomic_write(path, cfg)
+    return "reverted (tokenizer_config.json)"
 
 
-def status(tok_path: Path) -> str:
-    cfg = _load(tok_path)
-    template = cfg.get("chat_template", "")
-    if not isinstance(template, str):
-        return "unknown (chat_template not a string)"
-    return "ON (patched)" if CHAT_TEMPLATE_MCQ_PATCH_MARKER in template else "OFF (clean)"
+def status(model_dir: Path) -> str:
+    kind, path = _resolve_layout(model_dir)
+    if kind is None:
+        return "unknown (no chat_template found in either layout)"
+    if kind == "jinja":
+        template = path.read_text(encoding="utf-8")
+    else:
+        template = _load(path).get("chat_template", "") or ""
+    layout = "chat_template.jinja" if kind == "jinja" else "tokenizer_config.json"
+    return f"{'ON (patched)' if CHAT_TEMPLATE_MCQ_PATCH_MARKER in template else 'OFF (clean)'} [{layout}]"
 
 
 def main() -> int:
@@ -95,20 +139,19 @@ def main() -> int:
     args = p.parse_args()
 
     model_dir = Path(args.model_dir).resolve()
-    tok_path = model_dir / "tokenizer_config.json"
-    if not tok_path.exists():
-        print(f"ERROR: {tok_path} does not exist", file=sys.stderr)
+    if not model_dir.exists():
+        print(f"ERROR: {model_dir} does not exist", file=sys.stderr)
         return 2
 
     if args.mode == "status":
-        print(f"[{model_dir}] mcq-thinking patch: {status(tok_path)}")
+        print(f"[{model_dir}] mcq-thinking patch: {status(model_dir)}")
         return 0
     if args.mode == "on":
-        result = apply_patch(tok_path)
+        result = apply_patch(model_dir)
     else:
-        result = revert_patch(tok_path)
+        result = revert_patch(model_dir)
     print(f"[{model_dir}] mode={args.mode}: {result}")
-    print(f"[{model_dir}] now: {status(tok_path)}")
+    print(f"[{model_dir}] now: {status(model_dir)}")
     return 0
 
 
