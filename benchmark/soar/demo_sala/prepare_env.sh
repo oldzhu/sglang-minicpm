@@ -238,7 +238,21 @@ if [[ "$QUANT_MODE" == "gptq" ]]; then
 			DENSE_AS_SPARSE_ARG=" --dense-as-sparse"
 		fi
 	fi
-	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache${BACKEND_ARG} --chunked-prefill-size 32768 --max-prefill-tokens 32768 --prefill-max-requests 1 --max-running-requests 24 --mem-fraction-static 0.84 --schedule-conservativeness 1.0${DENSE_AS_SPARSE_ARG} --quantization gptq_marlin${FORCE_DENSE_ARG} --kv-cache-dtype ${KV_CACHE_DTYPE_ARG}${FUSED_QK_NORM_ROPE_ARG}${TORCH_COMPILE_ARGS} --enable-mixed-chunk"
+	# PROPOSAL_tier1_long_context_retest_20260430: opt-in env switch to retest
+	# the catalog Tier 1 best config (prefill-max-req=4, sched-cons=0.8,
+	# chunk=65536) on the new long-context speed dataset. Defaults to v20
+	# shipped values when SOAR_TIER1_LONG_CONTEXT is unset/0.
+	if [[ "$SOAR_TIER1_LONG_CONTEXT" == "1" || "$SOAR_TIER1_LONG_CONTEXT" == "true" || "$SOAR_TIER1_LONG_CONTEXT" == "TRUE" ]]; then
+		TIER1_CHUNK_SIZE="65536"
+		TIER1_PREFILL_MAX_REQ="4"
+		TIER1_SCHED_CONS="0.8"
+		echo "[prepare_env] SOAR_TIER1_LONG_CONTEXT=1 -> chunk=${TIER1_CHUNK_SIZE}, prefill-max-req=${TIER1_PREFILL_MAX_REQ}, sched-cons=${TIER1_SCHED_CONS}"
+	else
+		TIER1_CHUNK_SIZE="32768"
+		TIER1_PREFILL_MAX_REQ="1"
+		TIER1_SCHED_CONS="1.0"
+	fi
+	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache${BACKEND_ARG} --chunked-prefill-size ${TIER1_CHUNK_SIZE} --max-prefill-tokens ${TIER1_CHUNK_SIZE} --prefill-max-requests ${TIER1_PREFILL_MAX_REQ} --max-running-requests 24 --mem-fraction-static 0.84 --schedule-conservativeness ${TIER1_SCHED_CONS}${DENSE_AS_SPARSE_ARG} --quantization gptq_marlin${FORCE_DENSE_ARG} --kv-cache-dtype ${KV_CACHE_DTYPE_ARG}${FUSED_QK_NORM_ROPE_ARG}${TORCH_COMPILE_ARGS} --enable-mixed-chunk"
 elif [[ "$QUANT_MODE" == "fp8_blockwise" ]]; then
 	# FP8 blockwise: pre-quantized offline weights (N,K) float8_e4m3fn + blockwise scales
 	# Uses SM120 UMMA kernel (fp8_blockwise_scaled_mm) via weight.t() col-major zero-copy
