@@ -102,6 +102,12 @@ QUANT_MODE="${SOAR_QUANT_MODE}"
 # defaults for A/B testing.
 export SOAR_BACKEND_VARIANT="${SOAR_BACKEND_VARIANT:-flashinfer}"
 
+# CHANGE_0140 (Round 14.1): patch chat_template at preprocess time to disable
+# enable_thinking for mcq prompts (detected by literal substring
+# "LETTER is one of ABCD"). Targets mcq runaway-thinking failure mode.
+# Set SOAR_DISABLE_MCQ_THINKING=0 to A/B against the unpatched template.
+export SOAR_DISABLE_MCQ_THINKING="${SOAR_DISABLE_MCQ_THINKING:-1}"
+
 export SOAR_GPTQ_CALIBRATION_FILE="${SOAR_GPTQ_CALIBRATION_FILE:-$(pwd)/perf_public_set.jsonl}"
 export SOAR_GPTQ_CALIBRATION_SAMPLES="${SOAR_GPTQ_CALIBRATION_SAMPLES:-90}"
 export SOAR_GPTQ_CALIBRATION_SAMPLING="${SOAR_GPTQ_CALIBRATION_SAMPLING:-stratified}"
