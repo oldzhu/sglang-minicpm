@@ -19,15 +19,79 @@
 
 | # | Option | Effort | Risk to speed | Expected acc gain | Notes |
 |---|--------|--------|---------------|-------------------|-------|
-| **A** | **mcq stop-token / max-thinking-tokens cap** | XS | None | +1 to +3 pt mean (variance↓) | Pure server / chat-template change. Safest first step. |
-| **B** | **Better generation_config defaults** (temp, top_p, repetition_penalty for non-mcq tasks) | XS | None | +0.5 to +1.5 pt | Per-task overrides via stop tokens, no harness edit. |
-| **C** | **GPTQ recalibration with larger / smarter sample set** (currently 90 stratified) | S | None | +0.5 to +2 pt | One-shot offline; submission-time quant cost ≤ 5h budget. |
+| **A** | **Disable thinking for mcq via chat template** (`preprocess_model.py`) | XS | None | **+5 to +20 pt on mcq** (mean) | Structural fix to runaway generation. See §1a for mechanism. |
+| **B** | **Per-task `max_new_tokens` cap + extra stop sequences via `generation_config.json`** | XS | None | +1 to +3 pt (variance↓) | Companion to A; bounds worst-case output length even if A misses. |
+| **C** | **GPTQ recalibration with larger / length-stratified sample set** (currently 90) | S | None | +0.5 to +2 pt | One-shot offline; budget ≤ 1.5 h confirmed by user. |
 | **D** | **Selective layer keep-bf16** (un-quantize the most acc-sensitive linears) | S | Small (model size, prefill speed) | +1 to +2 pt | Already partial via sparse_qkv_w8; can extend to o_proj, gate. |
-| **E** | **Promote KV from FP8_e5m2 → FP8_e4m3** | XS | Small (kernel support) | +0 to +1 pt | e4m3 has more mantissa, better for KV; need flashinfer support check. |
+| ~~E~~ | ~~Promote KV from FP8_e5m2 → FP8_e4m3~~ | — | — | **TRIED, FAILED** | Test 30 (2026-04-22, 77.96%): mcq collapsed 96.67→53.33%; e4m3 made runaway worse. **Dropped from menu.** |
 | **F** | **Promote KV from FP8 → BF16** with reduced max_running_requests | XS | **Large** (memory, batch↓) | +0.5 to +1.5 pt | Last-resort acc lever; expect S8/Smax to regress. |
 | **G** | **AWQ (instead of GPTQ) calibration** | M | None | unknown ±2 pt | AWQ often better at int4 but our model is mostly w8; gain uncertain. |
 | **H** | **SmoothQuant pre-pass before GPTQ** | M | None | +0.5 to +1.5 pt | Activation smoothing reduces quant error on outlier channels. |
-| **I** | **Speculative decoding (eagle3 / draft-model)** for mcq fast-path | L | Medium (acc could drop if draft is poor) | acc neutral, speed +10–25% | Already scaffolded in CHANGE_0090; revisit after A–E. |
+| **I** | **Speculative decoding (eagle3 / draft-model)** for mcq fast-path | L | Medium (acc could drop if draft is poor) | acc neutral, speed +10–25% | Already scaffolded in CHANGE_0090; revisit after A–D. |
+
+---
+
+## 1a. Why Phase 14.1 (chat-template / generation_config) actually moves accuracy
+
+**User's intuition is right that chat-template tweaks don't change what the model "knows".** They do, however, change **what tokens the model emits and when it stops** — and for this benchmark that is the dominant accuracy lever. Here is the concrete causal chain (all evidence already in repo):
+
+### The mcq runaway pathology (recapped from `PROPOSAL_iteration_A0_mcq_runaway.en.md`)
+
+The MiniCPM-SALA chat template currently sets `enable_thinking=True` by default. For an mcq question the model is supposed to:
+
+```
+<think> brief reasoning ... </think>
+ANSWER: B
+```
+
+The eval harness extractor (`eval_model_001.py:178`) does:
+
+```python
+parts = pred.split('</think>')
+return parts[-1].strip() if len(parts) > 1 else pred
+```
+
+So **scoring depends entirely on whether `</think>` appears in the output.**
+
+Observed in Test 34a (and again in 13f-4 quartet):
+
+| Task | mcq accuracy | mcq avg_out tokens | What happened |
+|---|---|---|---|
+| Lucky run | 96.67% | ≤ 1,000 | Model emitted `</think>` early → extractor returns the letter |
+| Unlucky run | 40–53% | 10,000–11,000 | Thinking chain never closes; either truncates at `max_out_len`, or extractor falls back to the whole blob → no letter found → score 0 |
+
+**This is not random; it is a bimodal failure.** The same binary scores 96% or 53% on mcq depending on whether the sampler happens to emit a single 8-token sequence (`</think>\n\nANSWER:`). That's why 13f-4 quartet showed 40–63% mcq spread on identical config.
+
+### What Option A actually does
+
+`preprocess_model.py` patches the model's `chat_template` (Jinja) so that `enable_thinking` defaults to **False** (or is selected per-task by inspecting the system prompt for `task=mcq`). With thinking disabled the model directly emits:
+
+```
+ANSWER: B
+```
+
+No `</think>` is needed because the extractor's `if len(parts) > 1` branch is bypassed and the entire short answer is returned. **Failure mode eliminated by construction.** Lower bound on expected gain: the current mcq mean is ~50–55% across the 13f-4 quartet; if Option A pushes it to a stable 90–96% (where the lucky runs already land), the **overall** mean accuracy moves +7 to +10pt (mcq is one of 5 tasks, weighted equally).
+
+### What Option B actually does
+
+Even with A, we want a hard ceiling. `generation_config.json` ships in the model directory and is honored by sglang's tokenizer/sampler. We add:
+
+- `max_new_tokens` per-task profile (mcq ≤ 1024, qa ≤ 512, niah ≤ 1024, cwe/fwe ≤ 16384). Controlled via the same chat-template hook that sets `enable_thinking`, by injecting a per-task stop sequence list.
+- Extra stop strings: `"</think>\n\nANSWER:"`, `"\n\nFinal answer:"`, `"<|endoftext|>"` — all already terminator-style; harmless if not present, decisive if present.
+
+B caps the worst-case generation length so even if A's chat-template change misfires on some sample, we can't burn 11k tokens on a single mcq.
+
+### Why this is NOT a harness edit
+
+Both A and B live in files that ship in the submission tarball:
+- `preprocess_model.py` → patches `tokenizer_config.json` / chat_template at submission-prep time
+- `generation_config.json` → ships next to the model weights
+
+`eval_model_001.py` is untouched. The official evaluator runs its own pristine copy of the harness; what changes is what tokens our model emits when the harness asks it to generate. **This is the only legal way to fix the runaway-mcq problem.**
+
+### Bound on the upside
+
+For mcq alone, top-5 teams reportedly land 95%+ stably. Our current 50–60% mean is squarely a generation-control problem, not a knowledge problem (the lucky runs prove the model can answer). So Phase 14.1 has a well-defined ceiling: **lift mcq from ~55% → ~90%** = **+7 pt overall** at zero speed cost. That is the largest single accuracy lever currently on the table.
 
 ---
 
@@ -50,7 +114,8 @@
    - Try: oversample mcq+qa (the two highest-volume tasks).
    - Try: include a small synthetic long-context probe set (8k/16k/24k tokens) to anchor calibration in the regime we will be evaluated on.
    - Re-run preprocess_model.py + accuracy. Keep best.
-4. **Option E**: try `--kv-cache-dtype fp8_e4m3` if flashinfer attention path supports it on SM120 (confirm in sgl-kernel + flashinfer code). Pure runtime flip.
+   - Cost budget confirmed by user: ≤ 1.5 h; 200 samples on fcloud H800-class fits comfortably (~30–45 min for the GPTQ pass + ~30–40 min for one accuracy run).
+4. ~~Option E (fp8_e4m3)~~ — already disproved by Test 30 on 2026-04-22 (77.96% with mcq collapsed to 53.33%). Skip.
 
 **Validation**: 2-3 alternating runs vs Phase 14.1 winner.
 
@@ -74,12 +139,12 @@
 
 ---
 
-## 4. Open questions for the user
+## 4. User decisions (resolved 2026-04-30)
 
-1. **Approve Phase 14.1 first?** It is XS effort, zero speed risk, and addresses the primary variance source. We can package a v20.1 candidate within one fcloud round if it lands.
-2. **Calibration cost budget**: official requires quantization + eval ≤ 5h. Current 90-sample run takes ~20–30 min on fcloud H800-class; 200 samples is still well within budget. Confirm OK.
-3. **KV dtype gamble**: are you OK with us probing `fp8_e4m3` (Option E) as a side-experiment during Phase 14.1? Independent variable.
-4. **Submission cadence**: do you want one official submission per phase (14.1, 14.2, …) or wait until 14.1+14.2 land before re-submitting? Each submission burns one `team-beta` slot; current rank #19 (score 56.63), gap to #5 ≥79.55 = ~40% improvement still needed.
+1. **Phase 14.1 mechanism** — clarified in §1a above: chat-template change is not "hoping the model gets smarter", it deterministically eliminates the `</think>`-emission failure mode that drives the bimodal mcq score (50–96%). Awaiting final go/no-go.
+2. **Calibration cost**: ≤ 1.5 h confirmed acceptable. Phase 14.2 plan fits within budget.
+3. **KV e4m3 (Option E)**: dropped — already disproved (Test 30 → 77.96% with mcq collapse). Will not retest.
+4. **Submission cadence**: official submission **only when both speed and accuracy improve simultaneously** vs the last submitted package. Phase 14.1 alone (acc-only, speed unchanged) → no submission. Bundle 14.1 + a future speed win, OR wait until 14.1+14.2 land and verify speed has not regressed.
 
 ---
 
