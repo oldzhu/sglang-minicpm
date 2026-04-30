@@ -722,7 +722,10 @@ def main():
     p_logs = sub.add_parser("server-logs", help="Show server logs")
     p_logs.add_argument("--lines", type=int, default=100)
 
-    sub.add_parser("shutdown", help="Shut down the fcloud instance")
+    sub.add_parser("shutdown", help="Shut down JupyterLab inside the fcloud instance (does NOT release resources)")
+    sub.add_parser("start-instance", help="Start (resume) the fcloud task via console API (~weekly JWT in ~/.fcloud_console_config)")
+    sub.add_parser("pause-instance", help="Pause (stop) the fcloud task via console API")
+    sub.add_parser("console-token-info", help="Show JWT expiry for ~/.fcloud_console_config")
 
     p_setup = sub.add_parser("setup", help="Bootstrap a clean fcloud instance")
     p_setup.add_argument("--force", action="store_true", help="Re-setup even if paths exist")
@@ -767,6 +770,18 @@ def main():
         print_section("SHUTDOWN")
         fcloud_exec.shutdown_server(base_url, token)
         print("[shutdown] fcloud instance shutdown initiated")
+    elif args.action in ("start-instance", "pause-instance", "console-token-info"):
+        import fcloud_console
+        if args.action == "console-token-info":
+            print_section("CONSOLE TOKEN INFO")
+            cfg = fcloud_console.load_config()
+            info = fcloud_console.check_jwt_freshness(cfg["FCLOUD_CONSOLE_AUTH"])
+            print(json.dumps(info, indent=2, ensure_ascii=False))
+            sys.exit(0 if not info.get("expired", True) else 2)
+        action = "start" if args.action == "start-instance" else "pause"
+        print_section(f"CONSOLE {action.upper()} INSTANCE")
+        result = fcloud_console._do_action(fcloud_console.load_config(), action)
+        sys.exit(fcloud_console._print_result(action, result))
     elif args.action == "setup":
         step_setup(base_url, token, skip_existing=not args.force)
 

@@ -236,7 +236,15 @@ The workspace includes automation scripts for remote testing on the fcloud insta
   - `python3 scripts/fcloud/fcloud_workflow.py speed --variant s1|s8|smax|all` — run speed benchmarks
   - `python3 scripts/fcloud/fcloud_workflow.py full` — sync + restart + accuracy (full pipeline)
   - `python3 scripts/fcloud/fcloud_workflow.py server-logs --lines N` — view server logs
-  - `python3 scripts/fcloud/fcloud_workflow.py shutdown` — shut down the fcloud instance to save cost
+  - `python3 scripts/fcloud/fcloud_workflow.py shutdown` — shut down JupyterLab inside the instance (does NOT release the task / billing)
+  - `python3 scripts/fcloud/fcloud_workflow.py start-instance` — **resume** the paused omnibot task via console API (uses `~/.fcloud_console_config`)
+  - `python3 scripts/fcloud/fcloud_workflow.py pause-instance` — **pause** the omnibot task via console API (releases resources / stops billing)
+  - `python3 scripts/fcloud/fcloud_workflow.py console-token-info` — show expiry of the JWT in `~/.fcloud_console_config`
+- **Console auth (`~/.fcloud_console_config`)** — required for `start-instance` / `pause-instance`:
+  - Captured once from browser DevTools (F12 → Network → click any task start/pause button → copy `authorization` JWT, full `Cookie` header, username, and 32-char job id from URL)
+  - JWT TTL ≈ 1 week. When start/pause returns HTTP 401/403, refresh `FCLOUD_CONSOLE_AUTH` (and Cookie) from a fresh DevTools capture.
+  - Sample: `scripts/fcloud/fcloud_console_config.example`
+  - Run `python3 scripts/fcloud/fcloud_workflow.py console-token-info` to check expiry before a long testing session.
 - **fcloud paths**:
   - Repo: `/root/sglang-minicpm`
   - Models: `/root/models/openbmb/MiniCPM-SALA-90-qa-cwe-mcq-sparse_qkv_w8` (GPTQ), `/root/models/openbmb/MiniCPM-SALA-Copy` (non-quantized)
@@ -248,9 +256,9 @@ The workspace includes automation scripts for remote testing on the fcloud insta
 **IMPORTANT**: Always ask the user for explicit approval before starting any fcloud automated test (sync, restart, accuracy, speed, or full). The fcloud instance is a shared resource — never run tests without user confirmation.
 
 **COST-SAVING RULE (mandatory)**:
-- After each round of automated fcloud testing completes and you have collected all outputs needed for analysis, **immediately shut down the fcloud instance** by running `python3 scripts/fcloud/fcloud_workflow.py shutdown` in the terminal. Do not leave it running while analyzing results or planning next steps.
-- When you need to start a new round of testing, **ask the user to start the fcloud instance** before running any fcloud commands. Do not assume it is already running.
-- Workflow: user starts fcloud → agent runs tests → agent collects output → agent runs shutdown command → agent analyzes results offline → agent proposes next steps → repeat.
+- After each round of automated fcloud testing completes and you have collected all outputs needed for analysis, **immediately pause the fcloud task** by running `python3 scripts/fcloud/fcloud_workflow.py pause-instance` (preferred — releases resources/billing) or `shutdown` (legacy — only stops JupyterLab, does not release billing). Do not leave the instance running while analyzing results or planning next steps.
+- When you need to start a new round of testing, run `python3 scripts/fcloud/fcloud_workflow.py start-instance` (if the console JWT is fresh) — ask the user to confirm first. If the JWT is expired (`console-token-info` reports `expired: true`), ask the user to refresh `~/.fcloud_console_config` (or to start the instance manually from the console).
+- Workflow: agent runs `start-instance` (with user confirmation) → agent runs tests → agent collects output → agent runs `pause-instance` → agent analyzes results offline → agent proposes next steps → repeat.
 
 ## fcloud instance setup / re-setup (mandatory)
 

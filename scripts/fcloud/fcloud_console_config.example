@@ -1,0 +1,16 @@
+# Sample fcloud console config — copy to ~/.fcloud_console_config and fill in.
+#
+# How to capture (refresh ~weekly when JWT expires):
+#   1. Open https://console.cnomnibot.com/omnibot in Chrome/Edge, log in.
+#   2. F12 -> Network tab -> click any task's start/pause button.
+#   3. Find the PUT request to /api/thd/pg/api/v1/jobs/<JOB_ID>/{start|pause}.
+#   4. Copy the values below from the request headers.
+#
+# Token TTL is approximately 1 week. When start/pause returns HTTP 401/403,
+# refresh FCLOUD_CONSOLE_AUTH (and Cookie) here.
+
+FCLOUD_CONSOLE_BASE_URL=https://console.cnomnibot.com
+FCLOUD_CONSOLE_AUTH=<paste the value of the `authorization` header, starts with eyJ...>
+FCLOUD_CONSOLE_COOKIE=<paste the full `Cookie` header value (lang=...; JSESSIONID=...)>
+FCLOUD_CONSOLE_USERNAME=<your login email>
+FCLOUD_CONSOLE_JOB_ID=<32-char hex job id from the request URL>
