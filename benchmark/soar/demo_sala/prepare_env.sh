@@ -95,6 +95,13 @@ PY
 export SOAR_QUANT_MODE="${SOAR_QUANT_MODE:-gptq}"
 QUANT_MODE="${SOAR_QUANT_MODE}"
 
+# v20: default attention backend to stock flashinfer (Round 13f-1 / Round 13f-4
+# variance quantification: equivalent acc to minicpm_flashinfer baseline within
+# ±1pt local noise band, +9% S1 / +8% S8 / +6% Smax speed gain).
+# Override via SOAR_BACKEND_VARIANT=minicpm_flashinfer to revert to v18-line
+# defaults for A/B testing.
+export SOAR_BACKEND_VARIANT="${SOAR_BACKEND_VARIANT:-flashinfer}"
+
 export SOAR_GPTQ_CALIBRATION_FILE="${SOAR_GPTQ_CALIBRATION_FILE:-$(pwd)/perf_public_set.jsonl}"
 export SOAR_GPTQ_CALIBRATION_SAMPLES="${SOAR_GPTQ_CALIBRATION_SAMPLES:-90}"
 export SOAR_GPTQ_CALIBRATION_SAMPLING="${SOAR_GPTQ_CALIBRATION_SAMPLING:-stratified}"
