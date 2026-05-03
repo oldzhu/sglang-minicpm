@@ -242,7 +242,8 @@ The workspace includes automation scripts for remote testing on the fcloud insta
   - `python3 scripts/fcloud/fcloud_workflow.py console-token-info` — show expiry of the JWT in `~/.fcloud_console_config`
 - **Console auth (`~/.fcloud_console_config`)** — required for `start-instance` / `pause-instance`:
   - Captured once from browser DevTools (F12 → Network → click any task start/pause button → copy `authorization` JWT, full `Cookie` header, username, and 32-char job id from URL)
-  - JWT TTL ≈ 1 week. When start/pause returns HTTP 401/403, refresh `FCLOUD_CONSOLE_AUTH` (and Cookie) from a fresh DevTools capture.
+  - JWT TTL ≈ 1 week. When start/pause returns HTTP 401/403, refresh the config — see [docs/soar_2026_changes/HOWTO_refresh_fcloud_console_config.en.md](docs/soar_2026_changes/HOWTO_refresh_fcloud_console_config.en.md) for the canonical procedure.
+  - Recommended fast path: F12 → Network → click Start/Pause → "Save all as HAR with content" → run `python3 scripts/fcloud/refresh_console_config_from_har.py <path/to/console.har>`. The HAR script extracts auth/cookie/job_id, decodes the JWT for username, backs up the old config, and writes the new one.
   - Sample: `scripts/fcloud/fcloud_console_config.example`
   - Run `python3 scripts/fcloud/fcloud_workflow.py console-token-info` to check expiry before a long testing session.
 - **fcloud paths**:
