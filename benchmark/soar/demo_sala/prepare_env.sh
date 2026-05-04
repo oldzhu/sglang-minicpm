@@ -121,13 +121,23 @@ uv pip install --force-reinstall --no-deps --no-build-isolation "${GPTQMODEL_WHE
 # nothing else gets upgraded.
 if [[ "$SOAR_QUANT_PROFILE" == "nvfp4" || "$SOAR_QUANT_PROFILE" == "nvfp4_fos" ]]; then
 	echo "[prepare_env] SOAR_QUANT_PROFILE=${SOAR_QUANT_PROFILE} -> installing nvidia-modelopt (--no-deps)"
-	uv pip install --no-deps "nvidia-modelopt==0.31.0" -v || {
+	# IMPORTANT: modelopt 0.31.0 is incompatible with torch 2.9 (imports torch.onnx._type_utils
+	# which was removed in torch 2.8+). modelopt 0.43.0 is the first release compatible with
+	# torch 2.9. The matching nvidia-modelopt-core (Cython kernels) tops out at 0.33.1 — that
+	# combination is the verified-working set on fcloud (2026-05-04).
+	# All installs use --no-deps so our pinned torch/transformers/huggingface-hub/etc are
+	# untouched. Transitive deps actually exercised by `import modelopt.torch.quantization`:
+	# cppimport, pulp, onnx, pydantic, rich, torchprofile (numpy/scipy/safetensors/tqdm/regex
+	# are already in base image).
+	uv pip install --no-deps "nvidia-modelopt==0.43.0" -v || {
 		echo "[prepare_env] ERROR: nvidia-modelopt install failed — Phase A requires modelopt; rerun with SOAR_QUANT_PROFILE=gptq or fix install." >&2
 		exit 1
 	}
-	# Transitive deps modelopt.torch.quantization needs at import time.
-	# scipy / numpy / safetensors / tqdm / regex / ninja are already in base image.
-	uv pip install --no-deps "cppimport" "pulp" "onnx" "pydantic" -v || {
+	uv pip install --no-deps "nvidia-modelopt-core[cu12]==0.33.1" -v || {
+		echo "[prepare_env] ERROR: nvidia-modelopt-core install failed" >&2
+		exit 1
+	}
+	uv pip install --no-deps "cppimport" "pulp" "onnx" "pydantic" "rich" "torchprofile" -v || {
 		echo "[prepare_env] ERROR: modelopt transitive deps install failed" >&2
 		exit 1
 	}
