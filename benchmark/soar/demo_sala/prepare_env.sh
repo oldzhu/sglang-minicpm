@@ -12,6 +12,18 @@ shopt -u nullglob
 
 echo "[prepare_env] start $(date '+%F %T')"
 
+# === v21 default: enable Tier 1 long-context server args by default ===
+# v21 packaging ships with SOAR_TIER1_LONG_CONTEXT=1 so the official launcher
+# (which sources this file with no env overrides) picks up:
+#   --chunked-prefill-size 65536 / --max-prefill-tokens 65536
+#   --prefill-max-requests 4 / --schedule-conservativeness 0.8
+# Validated 2026-05-04 (Tier1-A vs Tier1-B): zero local short-context
+# regression; accuracy 78.73% identical to v20 baseline (norm 98.42%, C=0.96);
+# expected upside on official long-context speed set (68% in 32K-512K range).
+# To roll back to v20 byte-equivalent: export SOAR_TIER1_LONG_CONTEXT=0.
+: "${SOAR_TIER1_LONG_CONTEXT:=1}"
+export SOAR_TIER1_LONG_CONTEXT
+
 uv pip install --no-deps -e ./sglang/python
 
 if [[ "${#GPTQMODEL_WHEELS[@]}" -ne 1 ]]; then
