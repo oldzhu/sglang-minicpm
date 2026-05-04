@@ -184,7 +184,12 @@ if [[ "$SOAR_SPARSE_MODE" == "1" || "$SOAR_SPARSE_MODE" == "true" || "$SOAR_SPAR
 	TORCH_COMPILE_ARGS=""
 else
 	FORCE_DENSE_ARG=" --force-dense-minicpm"
-	TORCH_COMPILE_ARGS=" --enable-torch-compile --torch-compile-max-bs 8"
+	# PROPOSAL #2-A: env-gated torch-compile-max-bs sweep. Default 8 keeps
+	# v21 byte-equivalent. Setting SOAR_TORCH_COMPILE_MAX_BS=16 (or 24)
+	# extends compiled CUDA graph coverage to higher batch sizes, which is
+	# where the Smax tier (max-running-requests=24) actually decodes.
+	SOAR_TORCH_COMPILE_MAX_BS="${SOAR_TORCH_COMPILE_MAX_BS:-8}"
+	TORCH_COMPILE_ARGS=" --enable-torch-compile --torch-compile-max-bs ${SOAR_TORCH_COMPILE_MAX_BS}"
 fi
 
 if [[ "$QUANT_MODE" == "gptq" ]]; then
