@@ -1008,6 +1008,160 @@ def run_gptq_quantization(
 
 
 # ---------------------------------------------------------------------------
+# Phase A (PROPOSAL_phase_a_nvfp4_baseline_design_20260504): NVFP4 weight
+# quantization via nvidia-modelopt + sglang modelopt_fp4 loader.
+#
+# Output format consumed by sglang's ModelOptFp4Config
+# (python/sglang/srt/layers/quantization/modelopt_quant.py) — the loader
+# auto-detects via hf_quant_config.json or quantization_config.quant_algo=NVFP4.
+# We do NOT modify any sglang source.
+# ---------------------------------------------------------------------------
+
+
+def _nvfp4_default_exclude_patterns() -> List[str]:
+    """Modules that must stay BF16 even in NVFP4 mode.
+
+    Mirrors the GPTQ exclude policy: lightning-attn gating projections
+    (`o_gate`, `z_proj`) and the lm_head / norms / embeddings are highly
+    sensitive to 4-bit quantization in this model. The patterns are glob-style
+    consumed by modelopt's quant config.
+    """
+    return [
+        "*lm_head*",
+        "*o_gate*",
+        "*z_proj*",
+        "*norm*",
+        "*embed_tokens*",
+    ]
+
+
+def run_nvfp4_quantization(
+    src: Path,
+    dst: Path,
+    calibration_file: Path,
+    calibration_samples: int,
+    calibration_field: str,
+) -> None:
+    # Lazy imports so non-NVFP4 runs do not require modelopt.
+    import copy as _copy
+
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError(f"NVFP4 mode requires torch + transformers; got: {exc}")
+
+    try:
+        import modelopt.torch.quantization as mtq
+        from modelopt.torch.export import export_hf_checkpoint
+    except ImportError as exc:
+        raise RuntimeError(
+            "SOAR_QUANT_PROFILE=nvfp4 selected but `nvidia-modelopt` is not installed. "
+            "prepare_env.sh should have installed it; check earlier log for failure. "
+            f"Underlying ImportError: {exc}"
+        )
+
+    if not hasattr(mtq, "NVFP4_DEFAULT_CFG"):
+        raise RuntimeError(
+            "Installed modelopt does not expose NVFP4_DEFAULT_CFG. "
+            "Phase A requires modelopt >= 0.27 with NVFP4 export support."
+        )
+
+    calibration_texts, calibration_summary = load_calibration_texts(
+        calibration_file,
+        max_samples=calibration_samples,
+        text_field=calibration_field,
+    )
+
+    trust_remote_code = _env_truthy("SOAR_TRUST_REMOTE_CODE", default=True)
+    attn_impl = os.environ.get("SOAR_GPTQ_ATTN_IMPL", "flash_attention_2").strip()
+    max_calib_seq_len = _parse_int_env("SOAR_NVFP4_MAX_CALIB_SEQ_LEN", 4096)
+
+    print(
+        "[preprocess] NVFP4 start "
+        f"calibration_samples={len(calibration_texts)} "
+        f"calibration_sampling={json.dumps(calibration_summary, sort_keys=True)} "
+        f"trust_remote_code={trust_remote_code} attn_impl={attn_impl} "
+        f"max_calib_seq_len={max_calib_seq_len}"
+    )
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("NVFP4 mode requires CUDA; no GPU detected.")
+
+    load_src, load_src_tmpdir, _ = _prepare_gptq_load_source(src)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(load_src), trust_remote_code=trust_remote_code
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            str(load_src),
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=trust_remote_code,
+            attn_implementation=attn_impl,
+            device_map="cuda",
+        )
+        model.eval()
+
+        # Build NVFP4 config with our exclude list. NVFP4_DEFAULT_CFG already
+        # excludes lm_head; we add MiniCPM-SALA-specific gating projections.
+        config = _copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
+        quant_cfg = config.setdefault("quant_cfg", {})
+        for pattern in _nvfp4_default_exclude_patterns():
+            quant_cfg[pattern] = {"enable": False}
+        print(
+            f"[preprocess] NVFP4 quant_cfg exclusions={_nvfp4_default_exclude_patterns()}"
+        )
+
+        def forward_loop(m):
+            for idx, text in enumerate(calibration_texts):
+                inputs = tokenizer(
+                    text,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=max_calib_seq_len,
+                )
+                inputs = {k: v.to("cuda") for k, v in inputs.items()}
+                with torch.no_grad():
+                    m(**inputs)
+                if idx == 0 or (idx + 1) % 10 == 0:
+                    print(f"[preprocess] NVFP4 calib forward {idx + 1}/{len(calibration_texts)}")
+
+        mtq.quantize(model, config, forward_loop=forward_loop)
+        print("[preprocess] NVFP4 quantize done; exporting hf checkpoint")
+
+        dst.mkdir(parents=True, exist_ok=True)
+        # save_modelopt_state=False keeps the directory drop-in for sglang's
+        # modelopt_fp4 loader; modelopt's own state is not needed at serve time.
+        export_hf_checkpoint(model, export_dir=str(dst), save_modelopt_state=False)
+    finally:
+        if load_src_tmpdir is not None:
+            load_src_tmpdir.cleanup()
+
+    # Sanity: sglang's modelopt_fp4 loader needs either hf_quant_config.json
+    # or a quantization_config block inside config.json.
+    if not ((dst / "hf_quant_config.json").exists() or _config_json_has_nvfp4(dst)):
+        raise RuntimeError(
+            "NVFP4 export missing hf_quant_config.json AND config.json has no "
+            "quantization_config.quant_algo=NVFP4 marker. sglang's modelopt_fp4 "
+            "loader will fail."
+        )
+
+
+def _config_json_has_nvfp4(dst: Path) -> bool:
+    cfg_path = dst / "config.json"
+    if not cfg_path.exists():
+        return False
+    try:
+        with cfg_path.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return False
+    qc = cfg.get("quantization_config") or {}
+    algo = (qc.get("quant_algo") or qc.get("quant_method") or "").upper()
+    return "NVFP4" in algo or "FP4" in algo
+
+
+# ---------------------------------------------------------------------------
 # CHANGE_0140 — Disable <think> emission for mcq prompts
 # ---------------------------------------------------------------------------
 #
@@ -1205,9 +1359,9 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument(
         "--mode",
-        choices=["copy", "gptq"],
+        choices=["copy", "gptq", "nvfp4"],
         default=None,
-        help="Preprocess mode. If unset, reads SOAR_QUANT_MODE (default: copy).",
+        help="Preprocess mode. If unset, reads SOAR_QUANT_PROFILE then SOAR_QUANT_MODE (default: copy).",
     )
     parser.add_argument(
         "--calibration-file",
@@ -1254,9 +1408,17 @@ def main() -> None:
     if not src.is_dir():
         raise FileNotFoundError(f"Input model dir not found: {src}")
 
-    mode = args.mode or os.environ.get("SOAR_QUANT_MODE", "copy")
+    mode = args.mode
+    if mode is None:
+        # Phase A: SOAR_QUANT_PROFILE takes precedence over SOAR_QUANT_MODE so a
+        # single env switch in prepare_env.sh controls the pipeline.
+        profile = os.environ.get("SOAR_QUANT_PROFILE", "").strip().lower()
+        if profile in {"nvfp4", "nvfp4_fos"}:
+            mode = "nvfp4"
+        else:
+            mode = os.environ.get("SOAR_QUANT_MODE", "copy")
     mode = mode.strip().lower()
-    if mode not in {"copy", "gptq"}:
+    if mode not in {"copy", "gptq", "nvfp4"}:
         raise ValueError(f"Unsupported preprocess mode: {mode}")
 
     if mode == "gptq":
@@ -1277,6 +1439,22 @@ def main() -> None:
         )
         _patch_chat_template_for_mcq(dst)
         print(f"[preprocess] mode={mode} done - quantized model saved to {dst}")
+        return
+
+    if mode == "nvfp4":
+        if not args.calibration_file:
+            raise RuntimeError(
+                "NVFP4 mode requires --calibration-file (or SOAR_GPTQ_CALIBRATION_FILE)."
+            )
+        run_nvfp4_quantization(
+            src=src,
+            dst=dst,
+            calibration_file=Path(args.calibration_file).resolve(),
+            calibration_samples=args.calibration_samples,
+            calibration_field=args.calibration_field,
+        )
+        _patch_chat_template_for_mcq(dst)
+        print(f"[preprocess] mode={mode} done - NVFP4 model saved to {dst}")
         return
 
     count = copy_model(src, dst)

@@ -24,6 +24,27 @@ echo "[prepare_env] start $(date '+%F %T')"
 : "${SOAR_TIER1_LONG_CONTEXT:=1}"
 export SOAR_TIER1_LONG_CONTEXT
 
+# === Phase A (PROPOSAL_phase_a_nvfp4_baseline_design_20260504): NVFP4 weight
+# quantization profile selector. Single env switch controls preprocess pipeline
+# AND server quantization flag. Default 'gptq' = byte-equivalent to v22.
+#   gptq      = current v22 baseline (sparse_qkv_w8 GPTQ W4A16, gptq_marlin loader)
+#   nvfp4     = uniform NVFP4 weights via nvidia-modelopt + sglang modelopt_fp4 loader
+#   nvfp4_fos = NVFP4 with FourOverSix adaptive M=6/M=4 [Phase B, not yet implemented]
+export SOAR_QUANT_PROFILE="${SOAR_QUANT_PROFILE:-gptq}"
+case "$SOAR_QUANT_PROFILE" in
+  gptq|nvfp4|nvfp4_fos) ;;
+  *)
+    echo "[prepare_env] ERROR: SOAR_QUANT_PROFILE='${SOAR_QUANT_PROFILE}' invalid (expected gptq|nvfp4|nvfp4_fos)" >&2
+    exit 1
+    ;;
+esac
+# Note: SOAR_QUANT_MODE is intentionally left at its default "gptq" even when
+# profile is nvfp4* \u2014 that way the gptq server-arg branch below still fires
+# (it builds the canonical Tier1/dense/torch_compile arg set), and Phase A only
+# swaps the --quantization flag inside that branch via QUANT_FLAG_ARG.
+# preprocess_model.py reads SOAR_QUANT_PROFILE directly to pick the
+# quantization function (gptq vs nvfp4); see run_nvfp4_quantization.
+
 uv pip install --no-deps -e ./sglang/python
 
 if [[ "${#GPTQMODEL_WHEELS[@]}" -ne 1 ]]; then
@@ -92,6 +113,36 @@ uv pip install --force-reinstall device-smi -v
 uv pip uninstall -y gptqmodel || true
 echo "[prepare_env] installing gptqmodel wheel: ${GPTQMODEL_WHEELS[0]}"
 uv pip install --force-reinstall --no-deps --no-build-isolation "${GPTQMODEL_WHEELS[0]}" -v
+
+# === Phase A: install nvidia-modelopt (NVFP4 export) only when profile demands it.
+# All installs use --no-deps to avoid touching our pinned torch/transformers/
+# huggingface-hub. The transitive deps below are the minimum required for
+# `import modelopt.torch.quantization` to work; each is also --no-deps so
+# nothing else gets upgraded.
+if [[ "$SOAR_QUANT_PROFILE" == "nvfp4" || "$SOAR_QUANT_PROFILE" == "nvfp4_fos" ]]; then
+	echo "[prepare_env] SOAR_QUANT_PROFILE=${SOAR_QUANT_PROFILE} -> installing nvidia-modelopt (--no-deps)"
+	uv pip install --no-deps "nvidia-modelopt==0.31.0" -v || {
+		echo "[prepare_env] ERROR: nvidia-modelopt install failed — Phase A requires modelopt; rerun with SOAR_QUANT_PROFILE=gptq or fix install." >&2
+		exit 1
+	}
+	# Transitive deps modelopt.torch.quantization needs at import time.
+	# scipy / numpy / safetensors / tqdm / regex / ninja are already in base image.
+	uv pip install --no-deps "cppimport" "pulp" "onnx" "pydantic" -v || {
+		echo "[prepare_env] ERROR: modelopt transitive deps install failed" >&2
+		exit 1
+	}
+	python3 - <<'PY'
+import importlib, json
+try:
+    import modelopt
+    import modelopt.torch.quantization as mtq
+    print(f"[prepare_env] pinned_dependency {json.dumps({'module': 'modelopt', 'version': getattr(modelopt, '__version__', 'unknown'), 'file': getattr(modelopt, '__file__', None)}, ensure_ascii=False, sort_keys=True)}")
+    assert hasattr(mtq, 'NVFP4_DEFAULT_CFG'), 'NVFP4_DEFAULT_CFG missing in installed modelopt — wrong version?'
+except Exception as e:
+    print(f"[prepare_env] ERROR: modelopt import-time check failed: {e!r}")
+    raise SystemExit(1)
+PY
+fi
 
 python3 - <<'PY'
 import importlib
@@ -271,7 +322,14 @@ if [[ "$QUANT_MODE" == "gptq" ]]; then
 		TIER1_PREFILL_MAX_REQ="1"
 		TIER1_SCHED_CONS="1.0"
 	fi
-	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache${BACKEND_ARG} --chunked-prefill-size ${TIER1_CHUNK_SIZE} --max-prefill-tokens ${TIER1_CHUNK_SIZE} --prefill-max-requests ${TIER1_PREFILL_MAX_REQ} --max-running-requests 24 --mem-fraction-static 0.84 --schedule-conservativeness ${TIER1_SCHED_CONS}${DENSE_AS_SPARSE_ARG} --quantization gptq_marlin${FORCE_DENSE_ARG} --kv-cache-dtype ${KV_CACHE_DTYPE_ARG}${FUSED_QK_NORM_ROPE_ARG}${TORCH_COMPILE_ARGS} --enable-mixed-chunk"
+	# Phase A: when SOAR_QUANT_PROFILE selects an NVFP4 variant, swap the loader
+	# flag from gptq_marlin to modelopt_fp4. All other args (Tier1, dense, KV,
+	# torch_compile, mixed-chunk) stay identical to v22 baseline.
+	QUANT_FLAG_ARG=" --quantization gptq_marlin"
+	if [[ "$SOAR_QUANT_PROFILE" == "nvfp4" || "$SOAR_QUANT_PROFILE" == "nvfp4_fos" ]]; then
+		QUANT_FLAG_ARG=" --quantization modelopt_fp4"
+	fi
+	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache${BACKEND_ARG} --chunked-prefill-size ${TIER1_CHUNK_SIZE} --max-prefill-tokens ${TIER1_CHUNK_SIZE} --prefill-max-requests ${TIER1_PREFILL_MAX_REQ} --max-running-requests 24 --mem-fraction-static 0.84 --schedule-conservativeness ${TIER1_SCHED_CONS}${DENSE_AS_SPARSE_ARG}${QUANT_FLAG_ARG}${FORCE_DENSE_ARG} --kv-cache-dtype ${KV_CACHE_DTYPE_ARG}${FUSED_QK_NORM_ROPE_ARG}${TORCH_COMPILE_ARGS} --enable-mixed-chunk"
 elif [[ "$QUANT_MODE" == "fp8_blockwise" ]]; then
 	# FP8 blockwise: pre-quantized offline weights (N,K) float8_e4m3fn + blockwise scales
 	# Uses SM120 UMMA kernel (fp8_blockwise_scaled_mm) via weight.t() col-major zero-copy
@@ -306,6 +364,7 @@ fi
 
 # export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --log-level info"
 
+echo "[prepare_env] SOAR_QUANT_PROFILE=${SOAR_QUANT_PROFILE}"
 echo "[prepare_env] SOAR_QUANT_MODE=${QUANT_MODE}"
 echo "[prepare_env] SOAR_GPTQ_CALIBRATION_FILE=${SOAR_GPTQ_CALIBRATION_FILE}"
 echo "[prepare_env] SOAR_GPTQ_CALIBRATION_SAMPLES=${SOAR_GPTQ_CALIBRATION_SAMPLES}"
