@@ -184,11 +184,13 @@ if [[ "$SOAR_SPARSE_MODE" == "1" || "$SOAR_SPARSE_MODE" == "true" || "$SOAR_SPAR
 	TORCH_COMPILE_ARGS=""
 else
 	FORCE_DENSE_ARG=" --force-dense-minicpm"
-	# PROPOSAL #2-A: env-gated torch-compile-max-bs sweep. Default 8 keeps
-	# v21 byte-equivalent. Setting SOAR_TORCH_COMPILE_MAX_BS=16 (or 24)
-	# extends compiled CUDA graph coverage to higher batch sizes, which is
-	# where the Smax tier (max-running-requests=24) actually decodes.
-	SOAR_TORCH_COMPILE_MAX_BS="${SOAR_TORCH_COMPILE_MAX_BS:-8}"
+	# PROPOSAL #2-A (v22): env-gated torch-compile-max-bs sweep. Default 24
+	# extends compiled CUDA graph coverage to the full Smax range
+	# (max-running-requests=24), eliminating eager-mode fallback for
+	# bs in [9,24]. Validated on fcloud 2026-05-04 (commit 09af88b14):
+	# Smax 33.62s -> 32.54s (-3.2%), acc 79.11% (stable). Set
+	# SOAR_TORCH_COMPILE_MAX_BS=8 to roll back to v21 byte-equivalent.
+	SOAR_TORCH_COMPILE_MAX_BS="${SOAR_TORCH_COMPILE_MAX_BS:-24}"
 	TORCH_COMPILE_ARGS=" --enable-torch-compile --torch-compile-max-bs ${SOAR_TORCH_COMPILE_MAX_BS}"
 fi
 
