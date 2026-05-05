@@ -78,20 +78,23 @@ def main():
             input_scale_inv = 1.0 / input_scale
 
             # Pre-quantize weights once (this is what the loader does)
-            w_fp4, w_scale = fi_fp4_quantize(w_bf16, input_scale_inv)
-            alpha = (input_scale * 1.0).to(torch.float32)
+            # w_bf16 is (N, K). fp4_quantize halves last dim -> wf:(N, K/2).
+            # mm_fp4 expects b shape (K_packed, N) column-major, so pass wf.t().
+            w_fp4_nk, w_scale = fi_fp4_quantize(w_bf16, input_scale_inv)
+            w_fp4_b = w_fp4_nk.t()  # (K/2, N) col-major view
+            alpha = input_scale.to(torch.float32)
 
             # End-to-end: fp4_quantize per call + mm_fp4
             def fp4_e2e():
                 xf, xs = fi_fp4_quantize(x_bf16, input_scale_inv)
-                return fi_mm_fp4(xf, w_fp4, xs, w_scale, alpha,
+                return fi_mm_fp4(xf, w_fp4_b, xs, w_scale, alpha,
                                  torch.bfloat16, backend="cutlass")
 
             # Pre-quantized x: mm_fp4 only
             xf_pre, xs_pre = fi_fp4_quantize(x_bf16, input_scale_inv)
 
             def fp4_mm_only():
-                return fi_mm_fp4(xf_pre, w_fp4, xs_pre, w_scale, alpha,
+                return fi_mm_fp4(xf_pre, w_fp4_b, xs_pre, w_scale, alpha,
                                  torch.bfloat16, backend="cutlass")
 
             def fp4_quant_only():
