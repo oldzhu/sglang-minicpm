@@ -1354,6 +1354,16 @@ def run_nvfp4_quantization(
             mtq.quantize(model, config, forward_loop=forward_loop)
             print("[preprocess] NVFP4 quantize done; exporting hf checkpoint")
 
+            # Calibration leaves activation caches and intermediate buffers
+            # on the GPU; with 90 stratified samples we end up at >80GB used,
+            # which leaves no headroom for modelopt's per-layer fp32
+            # intermediates inside `_cast_fp4` during the export pass. Drop
+            # everything we can before handing off to export_hf_checkpoint.
+            import gc as _gc
+
+            _gc.collect()
+            torch.cuda.empty_cache()
+
             dst.mkdir(parents=True, exist_ok=True)
             # Activate FOS only for the export pass — calibration above used
             # modelopt's default M=6 path (cheaper, identical to non-M=4
