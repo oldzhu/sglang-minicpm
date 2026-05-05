@@ -23,7 +23,7 @@ sys.path.insert(0, str(SUB))
 
 import torch  # noqa: E402
 
-from preprocess_model import _install_four_over_six_patch, _summarize_fos_stats, _FOS_STATS  # noqa: E402
+from preprocess_model import _install_four_over_six_patch, _summarize_fos_stats, _FOS_STATS, _FOS_ACTIVE  # noqa: E402
 
 from modelopt.torch.quantization.qtensor.nvfp4_tensor import NVFP4QTensor  # noqa: E402
 
@@ -62,9 +62,11 @@ def _check_basic_compat():
     # 2. Install patch
     _FOS_STATS.clear()
     restore = _install_four_over_six_patch()
+    _FOS_ACTIVE["on"] = True
     try:
         fos_scale, _ = NVFP4QTensor.get_weights_scaling_factor(W, B, sf2)
     finally:
+        _FOS_ACTIVE["on"] = False
         restore()
 
     print(f"[probe] fos      scale dtype={fos_scale.dtype} shape={tuple(fos_scale.shape)}")
