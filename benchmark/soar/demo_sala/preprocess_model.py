@@ -1035,6 +1035,181 @@ def _nvfp4_default_exclude_patterns() -> List[str]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Phase B (PROPOSAL_phase_b_four_over_six_nvfp4_20260505): FourOverSix
+# adaptive per-block scale selection.
+#
+# At calibration time, for each NVFP4 block of 16 weights we choose the
+# per-block FP8 E4M3 scale `s` from one of two rules:
+#
+#   M = 6 (modelopt default):  s = max(|w_block|) / 6
+#   M = 4 (champion form):     s = fp8_round(s_M6 * 1.5)
+#
+# We pick whichever rule minimizes block reconstruction MSE. Storage layout
+# stays standard NVFP4 — only the scale tensor differs from Phase A. We
+# implement this by monkey-patching modelopt's
+# `NVFP4QTensor.get_weights_scaling_factor` (and its static-quantizer variant)
+# during `mtq.quantize` -> `export_hf_checkpoint`. The FourOverSix-chosen
+# scale flows through modelopt's existing pack/export code unchanged.
+# ---------------------------------------------------------------------------
+
+# Module-level holder so callers can access decision stats after the patch
+# has been torn down.
+_FOS_STATS: List[dict] = []
+
+
+def _install_four_over_six_patch():
+    """Install monkey-patch on modelopt NVFP4 scale-selection methods.
+
+    Returns a teardown callable that restores the originals. The patch
+    keeps modelopt's lattice-rounding / packing logic intact and only
+    swaps the per-block scale chosen at calibration.
+    """
+    import torch  # local
+
+    from modelopt.torch.quantization.qtensor.nvfp4_tensor import NVFP4QTensor
+
+    orig_dynamic = NVFP4QTensor.get_weights_scaling_factor
+    orig_from_q = NVFP4QTensor.get_weights_scaling_factor_from_quantizer
+
+    def _fos_select_scale(
+        weight: torch.Tensor,
+        block_size: int,
+        scaling_factor_2: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute FP8 E4M3 per-block scale via FourOverSix MSE selection."""
+        # Reshape (..., K) -> (..., K/B, B) and work in float32 for MSE.
+        w_blocks = weight.view(*weight.shape[:-1], -1, block_size).float()
+        per_block_amax = w_blocks.abs().amax(dim=-1)
+
+        sf2 = scaling_factor_2.to(per_block_amax.device).float()
+
+        # M=6 path mirrors modelopt default exactly so M=6 winners are
+        # bit-identical to Phase A.
+        scale_m6 = per_block_amax / (6.0 * sf2)
+        # Modelopt's convention: replace zero scales with 1.0 to avoid div-by-0.
+        scale_m6 = torch.where(
+            scale_m6 == 0,
+            torch.ones_like(scale_m6),
+            scale_m6,
+        )
+        scale_m6_fp8 = scale_m6.to(torch.float8_e4m3fn)
+
+        # M=4 derived from already-FP8-rounded M=6 (champion's form).
+        scale_m4_fp8 = (scale_m6_fp8.float() * 1.5).to(torch.float8_e4m3fn)
+
+        # Effective dequant scale = stored_fp8_scale * scaling_factor_2
+        eps = torch.tensor(1e-30, dtype=torch.float32, device=w_blocks.device)
+
+        e2m1_values = NVFP4QTensor.get_e2m1_values(w_blocks.device)
+
+        def _err(scale_fp8: torch.Tensor) -> torch.Tensor:
+            eff = (scale_fp8.float() * sf2).clamp_min(eps).unsqueeze(-1)
+            scaled = w_blocks / eff
+            # Reuse modelopt's exact lattice rounding (returns uint8 codes
+            # in {0..15} with sign bit). _cast_fp4 mutates input via abs_();
+            # pass a copy to avoid corrupting w_blocks.
+            codes = NVFP4QTensor._cast_fp4(scaled.clone())
+            decoded = e2m1_values[codes.long()]
+            return ((decoded * eff - w_blocks) ** 2).mean(dim=-1)
+
+        err_m6 = _err(scale_m6_fp8)
+        err_m4 = _err(scale_m4_fp8)
+        pick_m4 = err_m4 < err_m6
+
+        n_blocks = pick_m4.numel()
+        n_pick_m4 = int(pick_m4.sum().item())
+        _FOS_STATS.append(
+            {
+                "weight_shape": tuple(weight.shape),
+                "n_blocks": int(n_blocks),
+                "n_pick_m4": n_pick_m4,
+                "pct_m4": (100.0 * n_pick_m4 / n_blocks) if n_blocks else 0.0,
+            }
+        )
+
+        final = torch.where(
+            pick_m4,
+            scale_m4_fp8.float(),
+            scale_m6_fp8.float(),
+        ).to(torch.float8_e4m3fn)
+        return final
+
+    @classmethod  # noqa: D401 — match modelopt API
+    def fos_get_weights_scaling_factor(
+        cls,
+        input_tensor,
+        block_size,
+        weights_scaling_factor_2=None,
+        keep_high_precision: bool = False,
+    ):
+        if weights_scaling_factor_2 is None:
+            weights_scaling_factor_2 = cls.get_weights_scaling_factor_2(input_tensor)
+
+        assert input_tensor.shape[-1] % block_size == 0, (
+            "FourOverSix: weight K must be divisible by block_size."
+        )
+
+        scale_fp8 = _fos_select_scale(
+            input_tensor, block_size, weights_scaling_factor_2
+        )
+        if keep_high_precision:
+            return scale_fp8.float(), weights_scaling_factor_2
+        return scale_fp8, weights_scaling_factor_2
+
+    @classmethod  # noqa: D401
+    def fos_get_weights_scaling_factor_from_quantizer(
+        cls,
+        weight_quantizer,
+        weight,
+        weights_scaling_factor_2=None,
+        keep_high_precision: bool = False,
+    ):
+        # If the quantizer is static (per-block amax pre-computed), fall
+        # back to the original implementation — FourOverSix is only safe
+        # when we still have the BF16 weight to recompute MSE from.
+        if cls._is_static_quantizer(weight_quantizer):
+            return orig_from_q.__func__(
+                cls,
+                weight_quantizer,
+                weight,
+                weights_scaling_factor_2,
+                keep_high_precision,
+            )
+        return cls.get_weights_scaling_factor(
+            weight,
+            weight_quantizer.block_sizes[-1],
+            weights_scaling_factor_2,
+            keep_high_precision,
+        )
+
+    NVFP4QTensor.get_weights_scaling_factor = fos_get_weights_scaling_factor
+    NVFP4QTensor.get_weights_scaling_factor_from_quantizer = (
+        fos_get_weights_scaling_factor_from_quantizer
+    )
+
+    def _restore() -> None:
+        NVFP4QTensor.get_weights_scaling_factor = orig_dynamic
+        NVFP4QTensor.get_weights_scaling_factor_from_quantizer = orig_from_q
+
+    return _restore
+
+
+def _summarize_fos_stats() -> dict:
+    """Aggregate per-layer FourOverSix decisions into a summary dict."""
+    if not _FOS_STATS:
+        return {"layers": 0, "blocks": 0, "blocks_m4": 0, "pct_m4": 0.0}
+    layers = len(_FOS_STATS)
+    blocks = sum(s["n_blocks"] for s in _FOS_STATS)
+    blocks_m4 = sum(s["n_pick_m4"] for s in _FOS_STATS)
+    return {
+        "layers": layers,
+        "blocks": blocks,
+        "blocks_m4": blocks_m4,
+        "pct_m4": (100.0 * blocks_m4 / blocks) if blocks else 0.0,
+    }
+
+
 def run_nvfp4_quantization(
     src: Path,
     dst: Path,
@@ -1126,13 +1301,32 @@ def run_nvfp4_quantization(
                 if idx == 0 or (idx + 1) % 10 == 0:
                     print(f"[preprocess] NVFP4 calib forward {idx + 1}/{len(calibration_texts)}")
 
-        mtq.quantize(model, config, forward_loop=forward_loop)
-        print("[preprocess] NVFP4 quantize done; exporting hf checkpoint")
+        fos_enabled = _env_truthy("SOAR_NVFP4_FOUR_OVER_SIX", default=False)
+        fos_restore = None
+        if fos_enabled:
+            print("[preprocess] NVFP4 FourOverSix ENABLED — patching modelopt scale selection")
+            _FOS_STATS.clear()
+            fos_restore = _install_four_over_six_patch()
 
-        dst.mkdir(parents=True, exist_ok=True)
-        # save_modelopt_state=False keeps the directory drop-in for sglang's
-        # modelopt_fp4 loader; modelopt's own state is not needed at serve time.
-        export_hf_checkpoint(model, export_dir=str(dst), save_modelopt_state=False)
+        try:
+            mtq.quantize(model, config, forward_loop=forward_loop)
+            print("[preprocess] NVFP4 quantize done; exporting hf checkpoint")
+
+            dst.mkdir(parents=True, exist_ok=True)
+            # save_modelopt_state=False keeps the directory drop-in for sglang's
+            # modelopt_fp4 loader; modelopt's own state is not needed at serve time.
+            export_hf_checkpoint(model, export_dir=str(dst), save_modelopt_state=False)
+        finally:
+            if fos_restore is not None:
+                fos_restore()
+                summary = _summarize_fos_stats()
+                print(
+                    "[preprocess] NVFP4 FourOverSix summary: "
+                    f"layers={summary['layers']} "
+                    f"blocks={summary['blocks']} "
+                    f"blocks_picked_m4={summary['blocks_m4']} "
+                    f"pct_m4={summary['pct_m4']:.2f}%"
+                )
     finally:
         if load_src_tmpdir is not None:
             load_src_tmpdir.cleanup()

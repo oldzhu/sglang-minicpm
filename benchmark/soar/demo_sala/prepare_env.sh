@@ -29,7 +29,7 @@ export SOAR_TIER1_LONG_CONTEXT
 # AND server quantization flag. Default 'gptq' = byte-equivalent to v22.
 #   gptq      = current v22 baseline (sparse_qkv_w8 GPTQ W4A16, gptq_marlin loader)
 #   nvfp4     = uniform NVFP4 weights via nvidia-modelopt + sglang modelopt_fp4 loader
-#   nvfp4_fos = NVFP4 with FourOverSix adaptive M=6/M=4 [Phase B, not yet implemented]
+#   nvfp4_fos = NVFP4 with FourOverSix adaptive M=6/M=4 [Phase B]
 export SOAR_QUANT_PROFILE="${SOAR_QUANT_PROFILE:-gptq}"
 case "$SOAR_QUANT_PROFILE" in
   gptq|nvfp4|nvfp4_fos) ;;
@@ -38,6 +38,13 @@ case "$SOAR_QUANT_PROFILE" in
     exit 1
     ;;
 esac
+# Phase B: nvfp4_fos profile turns on the FourOverSix scale-selection patch
+# inside preprocess_model.py's run_nvfp4_quantization. Server-side args are
+# identical to nvfp4 (--quantization modelopt_fp4); only the on-disk weights
+# differ.
+if [[ "$SOAR_QUANT_PROFILE" == "nvfp4_fos" ]]; then
+	export SOAR_NVFP4_FOUR_OVER_SIX="${SOAR_NVFP4_FOUR_OVER_SIX:-1}"
+fi
 # Note: SOAR_QUANT_MODE is intentionally left at its default "gptq" even when
 # profile is nvfp4* \u2014 that way the gptq server-arg branch below still fires
 # (it builds the canonical Tier1/dense/torch_compile arg set), and Phase A only
