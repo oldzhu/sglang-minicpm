@@ -1056,6 +1056,12 @@ def _nvfp4_default_exclude_patterns() -> List[str]:
 # Module-level holder so callers can access decision stats after the patch
 # has been torn down.
 _FOS_STATS: List[dict] = []
+# Gate: only run the (more expensive) FOS comparison during export, not
+# during forward-pass fake-quant in the calibration loop. Calibration only
+# needs to learn input/activation amax; the weight scale we choose there is
+# overwritten at export time anyway, so reusing modelopt's M=6 default keeps
+# calibration fast and memory-light.
+_FOS_ACTIVE: dict = {"on": False}
 
 
 def _install_four_over_six_patch():
@@ -1077,62 +1083,87 @@ def _install_four_over_six_patch():
         block_size: int,
         scaling_factor_2: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute FP8 E4M3 per-block scale via FourOverSix MSE selection."""
-        # Reshape (..., K) -> (..., K/B, B) and work in float32 for MSE.
-        w_blocks = weight.view(*weight.shape[:-1], -1, block_size).float()
-        per_block_amax = w_blocks.abs().amax(dim=-1)
+        """Compute FP8 E4M3 per-block scale via FourOverSix MSE selection.
 
-        sf2 = scaling_factor_2.to(per_block_amax.device).float()
+        Memory-conscious: processes the leading dimension in row-chunks so
+        working set stays small even for 13K-row weights.
+        """
+        # Chunk size tunable via env. Default 256 rows keeps peak intermediate
+        # tensors well under 128 MiB even at K=8192, leaving GPU headroom for
+        # cached calibration activations.
+        chunk_rows = int(os.environ.get("SOAR_NVFP4_FOS_CHUNK_ROWS", "256"))
 
-        # M=6 path mirrors modelopt default exactly so M=6 winners are
-        # bit-identical to Phase A.
-        scale_m6 = per_block_amax / (6.0 * sf2)
-        # Modelopt's convention: replace zero scales with 1.0 to avoid div-by-0.
-        scale_m6 = torch.where(
-            scale_m6 == 0,
-            torch.ones_like(scale_m6),
-            scale_m6,
-        )
-        scale_m6_fp8 = scale_m6.to(torch.float8_e4m3fn)
+        sf2 = scaling_factor_2.detach().float()
+        sf2_dev = sf2.to(weight.device)
 
-        # M=4 derived from already-FP8-rounded M=6 (champion's form).
-        scale_m4_fp8 = (scale_m6_fp8.float() * 1.5).to(torch.float8_e4m3fn)
+        leading = weight.shape[:-1]
+        K = weight.shape[-1]
+        # Flatten leading dims so we can chunk on a single axis.
+        flat = weight.reshape(-1, K)
+        N = flat.shape[0]
 
-        # Effective dequant scale = stored_fp8_scale * scaling_factor_2
-        eps = torch.tensor(1e-30, dtype=torch.float32, device=w_blocks.device)
+        out_chunks: List[torch.Tensor] = []
+        n_blocks_total = 0
+        n_pick_m4_total = 0
 
-        e2m1_values = NVFP4QTensor.get_e2m1_values(w_blocks.device)
+        e2m1_values = NVFP4QTensor.get_e2m1_values(weight.device)
+        eps = torch.tensor(1e-30, dtype=torch.float32, device=weight.device)
 
-        def _err(scale_fp8: torch.Tensor) -> torch.Tensor:
-            eff = (scale_fp8.float() * sf2).clamp_min(eps).unsqueeze(-1)
-            scaled = w_blocks / eff
-            # Reuse modelopt's exact lattice rounding (returns uint8 codes
-            # in {0..15} with sign bit). _cast_fp4 mutates input via abs_();
-            # pass a copy to avoid corrupting w_blocks.
-            codes = NVFP4QTensor._cast_fp4(scaled.clone())
-            decoded = e2m1_values[codes.long()]
-            return ((decoded * eff - w_blocks) ** 2).mean(dim=-1)
+        for start in range(0, N, chunk_rows):
+            end = min(start + chunk_rows, N)
+            w_rows = flat[start:end]                       # (c, K) bf16
+            w_blocks = w_rows.view(end - start, K // block_size, block_size).float()
 
-        err_m6 = _err(scale_m6_fp8)
-        err_m4 = _err(scale_m4_fp8)
-        pick_m4 = err_m4 < err_m6
+            per_block_amax = w_blocks.abs().amax(dim=-1)   # (c, K/B) fp32
 
-        n_blocks = pick_m4.numel()
-        n_pick_m4 = int(pick_m4.sum().item())
+            scale_m6 = per_block_amax / (6.0 * sf2_dev)
+            scale_m6 = torch.where(
+                scale_m6 == 0,
+                torch.ones_like(scale_m6),
+                scale_m6,
+            )
+            scale_m6_fp8 = scale_m6.to(torch.float8_e4m3fn)
+            scale_m4_fp8 = (scale_m6_fp8.float() * 1.5).to(torch.float8_e4m3fn)
+
+            def _err(scale_fp8: torch.Tensor) -> torch.Tensor:
+                eff = (scale_fp8.float() * sf2_dev).clamp_min(eps).unsqueeze(-1)
+                scaled = (w_blocks / eff).clone()  # _cast_fp4 mutates input
+                codes = NVFP4QTensor._cast_fp4(scaled)
+                decoded = e2m1_values[codes.long()] * eff
+                diff = decoded - w_blocks
+                return (diff * diff).mean(dim=-1)  # (c, K/B)
+
+            err_m6 = _err(scale_m6_fp8)
+            err_m4 = _err(scale_m4_fp8)
+            pick_m4 = err_m4 < err_m6
+
+            n_blocks_total += pick_m4.numel()
+            n_pick_m4_total += int(pick_m4.sum().item())
+
+            chunk_scale = torch.where(
+                pick_m4,
+                scale_m4_fp8.float(),
+                scale_m6_fp8.float(),
+            ).to(torch.float8_e4m3fn)
+            out_chunks.append(chunk_scale)
+
+            del w_blocks, per_block_amax, scale_m6, scale_m6_fp8, scale_m4_fp8
+            del err_m6, err_m4, pick_m4, chunk_scale
+
+        final = torch.cat(out_chunks, dim=0).reshape(*leading, K // block_size)
+
         _FOS_STATS.append(
             {
                 "weight_shape": tuple(weight.shape),
-                "n_blocks": int(n_blocks),
-                "n_pick_m4": n_pick_m4,
-                "pct_m4": (100.0 * n_pick_m4 / n_blocks) if n_blocks else 0.0,
+                "n_blocks": int(n_blocks_total),
+                "n_pick_m4": int(n_pick_m4_total),
+                "pct_m4": (
+                    100.0 * n_pick_m4_total / n_blocks_total
+                    if n_blocks_total
+                    else 0.0
+                ),
             }
         )
-
-        final = torch.where(
-            pick_m4,
-            scale_m4_fp8.float(),
-            scale_m6_fp8.float(),
-        ).to(torch.float8_e4m3fn)
         return final
 
     @classmethod  # noqa: D401 — match modelopt API
@@ -1143,6 +1174,17 @@ def _install_four_over_six_patch():
         weights_scaling_factor_2=None,
         keep_high_precision: bool = False,
     ):
+        if not _FOS_ACTIVE["on"]:
+            # Cheap path: defer to the original modelopt implementation while
+            # the quantize() forward loop is running.
+            return orig_dynamic.__func__(
+                cls,
+                input_tensor,
+                block_size,
+                weights_scaling_factor_2,
+                keep_high_precision,
+            )
+
         if weights_scaling_factor_2 is None:
             weights_scaling_factor_2 = cls.get_weights_scaling_factor_2(input_tensor)
 
@@ -1313,10 +1355,17 @@ def run_nvfp4_quantization(
             print("[preprocess] NVFP4 quantize done; exporting hf checkpoint")
 
             dst.mkdir(parents=True, exist_ok=True)
+            # Activate FOS only for the export pass — calibration above used
+            # modelopt's default M=6 path (cheaper, identical to non-M=4
+            # winners anyway).
+            if fos_enabled:
+                _FOS_ACTIVE["on"] = True
+                print("[preprocess] NVFP4 FourOverSix activating for export pass")
             # save_modelopt_state=False keeps the directory drop-in for sglang's
             # modelopt_fp4 loader; modelopt's own state is not needed at serve time.
             export_hf_checkpoint(model, export_dir=str(dst), save_modelopt_state=False)
         finally:
+            _FOS_ACTIVE["on"] = False
             if fos_restore is not None:
                 fos_restore()
                 summary = _summarize_fos_stats()
