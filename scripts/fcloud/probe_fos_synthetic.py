@@ -34,25 +34,23 @@ def _check_basic_compat():
     K = 64
     B = 16
     W = torch.zeros(4, K, dtype=torch.bfloat16, device="cuda")
+    dev = "cuda"
 
     # Row 0: each block has one outlier ~6, others ~0.05 → M=6 friendly.
-    W[0] = 0.05 * torch.randn(K)
+    W[0] = (0.05 * torch.randn(K, device=dev)).to(W.dtype)
     for blk in range(K // B):
         W[0, blk * B] = 6.0 if blk % 2 == 0 else -6.0
 
-    # Row 1: each block dense ~3.5..6 (top-heavy) → M=4 friendly (lattice
-    # has 4/6 between max and 2/3 of max so we want finer top quantization).
-    W[1] = 3.5 + 2.5 * torch.rand(K)
-    sign = (torch.rand(K) > 0.5).float() * 2 - 1
-    W[1] = W[1] * sign
+    # Row 1: each block dense ~3.5..6 (top-heavy) → M=4 friendly.
+    r1 = (3.5 + 2.5 * torch.rand(K, device=dev))
+    sign = (torch.rand(K, device=dev) > 0.5).float() * 2 - 1
+    W[1] = (r1 * sign).to(W.dtype)
 
     # Row 2: dead block (all zeros) — should default to scale=1, no errors.
     W[2] = 0.0
 
     # Row 3: ordinary noise.
-    W[3] = 0.3 * torch.randn(K)
-
-    W = W.cuda()
+    W[3] = (0.3 * torch.randn(K, device=dev)).to(W.dtype)
 
     sf2 = NVFP4QTensor.get_weights_scaling_factor_2(W)
     print(f"[probe] sf2={sf2.item():.6e}")
