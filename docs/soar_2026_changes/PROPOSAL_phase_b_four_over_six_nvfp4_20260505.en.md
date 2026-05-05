@@ -22,34 +22,49 @@ S1/S8/Smax on fcloud, then decide whether to submit or layer FP8 KV / fused norm
 
 ## 1. Background
 
-### NVFP4 lattice and the M parameter
+### NVFP4 storage and what "M" actually is
 
-NVFP4 represents each weight in a block of 16 as a signed 4-bit code drawn from the
-lattice `{0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}`. Each block has a single FP8 E4M3 scale.
-The block-level scale `s` is conventionally chosen so that the max absolute value in
-the block maps to the lattice extreme **M = 6**:
+NVFP4 stores **two** quantized things per 16-weight block:
 
-```
-s_M6 = max(|w_block|) / 6
-```
+1. **Per-element 4-bit codes** — 16 of them, drawn from the fixed lattice
+   `{0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}`. They are packed two per byte, so a `(N, K)`
+   weight tensor becomes a `uint8` tensor of shape `(N, K/2)`.
+2. **Per-block scale `s`** — exactly one FP8 E4M3 number per 16-element block,
+   shape `(N, K/16)`, dtype `float8_e4m3fn`. Dequant is just `w ≈ code · s`.
 
-The champion blog's observation (and folklore from FP8 literature) is that for a
-non-trivial fraction of blocks, especially in attention projections and outlier-free
-parts of FFNs, the block's distribution doesn't actually contain values near ±6. For
-those blocks, mapping the block-max to **M = 4** instead halves the quantization step
-near zero (which is where most weights live):
+The lattice is fixed by the NVFP4 standard (and is what `flashinfer.mm_fp4` /
+`cutlass_scaled_fp4_mm` decodes in hardware). **`M` is not stored anywhere** — it is
+only the **calibration-time rule** for choosing `s`:
 
 ```
-s_M4 = max(|w_block|) / 4
+M = 6 rule:   s = max(|w_block|) / 6     # block-max maps to lattice extreme ±6
+M = 4 rule:   s = max(|w_block|) / 4     # block-max maps to lattice point ±4;
+                                         # anything > 4·s gets clipped
 ```
 
-The trade-off is that any value between (4·s_M4) and (6·s_M4) — i.e. between max and
-1.5×max in the original block — gets clipped to ±4·s_M4. This is fine if the block has
-no such outliers (very common for well-behaved layers), and disastrous if it does
-(e.g. attention output proj spike rows).
+Same lattice, same storage layout — only `s` differs. The kernel doesn't care which
+rule was used; it just sees a per-block FP8 scale.
 
-**FourOverSix** = pick per block, at quantization time, the M ∈ {4, 6} that minimizes
-block-level MSE. The champion blog reports ~40–43 % of blocks pick M=4.
+### When does each rule win?
+
+The block-MSE function decides; the intuition cuts both ways:
+
+- **M=6 wins** when the block has one outlier and most values are tiny. Smaller `s`
+  preserves near-zero resolution; the lone outlier still rounds to lattice point ±6.
+- **M=4 wins** when the block is "dense at the top" — many values clustered near the
+  block-max. M=6 stretches the lattice all the way to ±6 even though codes ±5, ±6 are
+  barely used, so most active values round between widely-spaced points {±2, ±3, ±4}.
+  M=4 packs the lattice {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4} entirely inside the active
+  range and rounds those mid values to closer points. The cost is values strictly
+  between `4·s_M4` and `max` get clipped to ±4·s_M4, but if the block-max itself was
+  the only such value, the clipping error is small.
+
+The champion blog reports ~40–43 % of blocks pick M=4 in their LLaMA / Qwen runs;
+how the split looks on MiniCPM-SALA-90 is empirical.
+
+**FourOverSix** = at calibration time, for each block independently pick
+`M ∈ {4, 6}` that minimizes the per-block reconstruction MSE
+`||round_to_lattice(w/s) · s − w||²`.
 
 The result is still standard NVFP4 storage (uint8 packed codes + FP8 E4M3 scale per
 block), so `flashinfer.fp4_quantize` / `mm_fp4` / `cutlass_scaled_fp4_mm` all still
@@ -109,6 +124,11 @@ Phase B is primarily about **unblocking** the speed measurement, not chasing mor
 
 ### 4.1 Two candidate code paths
 
+**Both produce the identical checkpoint** (NVFP4 with FourOverSix-chosen scales) —
+they only differ in *where in the call stack* the per-block M choice is made. Since
+FourOverSix needs only the weight tensor (no activations), there is no calibration-data
+benefit to running it inside modelopt's loop.
+
 **(B1) Override modelopt's NVFP4 quantizer (deeper)**
 - Subclass `modelopt.torch.quantization.qtensor.nvfp4_tensor.NVFP4QTensor` (or whatever
   the 0.43 path is — to be verified during impl) and replace its scale-selection logic.
@@ -118,10 +138,11 @@ Phase B is primarily about **unblocking** the speed measurement, not chasing mor
 
 **(B2) Post-hoc scale rewrite (shallower) — recommended**
 - Let modelopt do its standard NVFP4 calibration end-to-end (same as Phase A).
-- Right before `export_hf_checkpoint`, walk every weight quantizer module, read its
-  current per-block scale and original BF16 weight, and **rewrite** the scale tensor
-  in-place by selecting M=4 vs M=6 per block based on which one minimizes
-  `||round_to_nvfp4_lattice(w / s) * s − w||²`.
+- Right before `export_hf_checkpoint`, walk every weight quantizer module, read the
+  original BF16 weight, recompute the per-block scale by FourOverSix, **rewrite both
+  the FP8 E4M3 scale tensor and the uint8 4-bit code tensor in-place**, then export.
+  (We rewrite the codes too because changing `s` changes which lattice point each
+  weight rounds to. Storage layout stays standard NVFP4.)
 - Pro: completely isolated to our code; simple to test in a notebook with a single
   weight tensor; trivially rollback-able.
 - Con: We do roughly 2× the per-block work at calibration end (compute MSE for both
