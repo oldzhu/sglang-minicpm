@@ -52,10 +52,33 @@
 在长生成上崩溃。这与冠军博客的明确警告吻合：必须先引入 **FourOverSix 块级自适应**
 模型才可用。我们当前的实现就是无 FOS 的基线，本就预期会过度有损。
 
-**关键发现 2（速度）：** 模型用 `modelopt_fp4` 加载后，长上下文的延迟比 GPTQ 基线
-明显更差。可能原因：sglang 自带的 `modelopt_fp4` 加载器并 **没有** 走 SM120 的 FP4 Tensor
-Core 内核，每次线性计算都把权重反量化回 BF16（加载时打印的 "experimental and subject to
-change" 也佐证）。后续需要量化这个内核走向。
+**关键发现 2（速度）：** 模型用 `modelopt_fp4` 加载后，长上下文延迟比 GPTQ 基线明显更差。
+最初的猜测（退回 BF16 反量化）**是错的** —— 走查
+`python/sglang/srt/layers/quantization/modelopt_quant.py` 后确认 `ModelOptFp4LinearMethod.apply`
+实际执行：
+
+1. `x_fp4, x_scale = fp4_quantize(x, layer.input_scale_inv)` —— 每步把 BF16 激活动态 cast
+   到 NVFP4（SM120 上走 flashinfer `fp4_quantize`，其它走 sgl-kernel `scaled_fp4_quant`，
+   由 `is_sm120_supported()` 在 import 时分发）。
+2. `out = fp4_gemm(x_fp4, w_fp4, x_scale, w_scale, alpha, out_dtype, w_n)` —— 调用
+   flashinfer `mm_fp4`（cutlass 后端），落到 SM120 的 FP4 cutlass GEMM。assert 确认
+   `weight.dtype == uint8`（FP4 打包）、`weight_scale.dtype == float8_e4m3fn`，
+   **权重全程不会被反量化回 BF16。**
+3. 内核把 BF16/FP16 输出回写给下一层。
+
+所以 FP4 Tensor Core **确实被用上了**。长上下文慢的真正原因，按优先级：
+
+1. **质量崩塌 → 生成失控。** 统一 NVFP4 输出乱码，mcq/qa 不会自然停在答案上，会一路生成
+   到 `max_tokens=65536`。"5 分钟/条" 大概率是单条吐了 ~65k token，而不是 token 慢。
+   与冒烟测试 "Paris → unedoc.com/abc/u.com..." 是同一种失效模式。
+2. **逐步激活再量化开销。** 每个线性、每一步都做 BF16→FP4。短 prompt 上很便宜，但
+   chunk=65536 × prefill_max_requests=4 时可能把 FP4 GEMM 的提速吃掉。
+3. **注意力还是 BF16。** Q/K/V 投影是 FP4 GEMM，但 flashinfer 注意力内核吃 BF16，
+   所以 attention 前后还要 FP4↔BF16 来回转。
+
+第 1 项大概率主导，必须先用 FourOverSix 救回质量才能独立衡量第 2/3 项。后续把
+（a）nsys 内核分发验证、（b）`fp4_quantize` 与 `mm_fp4` 时间比、（c）`max_tokens=512`
+下的短上下文 mcq 探针放进调研任务清单。
 
 ## 新增/修改的文件
 
@@ -77,9 +100,10 @@ change" 也佐证）。后续需要量化这个内核走向。
 4. 两个可行的下一步方向：
    - **Phase B（FourOverSix）** —— 在自定义的 modelopt `forward_loop` 内实现块级 M=6/M=4
      自适应，目标达到冠军那条 ≥99% 的精度线。
-   - **排查内核路径** —— 确认 SM120 上 sglang 的 `modelopt_fp4` 加载器是否真的用了 FP4
-     Tensor Core；如果它退回到 BF16 反量化，那预期的 FP4 速度收益就是空头，需要加自定义内核
-     （类似 CHANGE_0090 的 W4A8 FP8 GEMM）。
+   - **排查内核路径** —— 代码走查已经证实 FP4 Tensor Core **确实被用**（不会走 Marlin
+     也不会反量化回 BF16）。剩下的未知项：在 nsys 时间线里实际看到 `cutlass_scaled_fp4_mm`
+     的内核占比、`fp4_quantize` 相对 `mm_fp4` 的开销比、以及只跑短上下文 mcq 看精度，
+     用来把质量崩塌和内核速度两个因素拆开。
 
 ## 验证命令
 

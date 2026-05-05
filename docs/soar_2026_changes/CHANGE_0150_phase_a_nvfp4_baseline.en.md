@@ -59,10 +59,34 @@ be too lossy.
 
 **Key finding 2 — speed at long context:** even after the model is loaded with
 `modelopt_fp4`, the latency on long-context items is dramatically worse than the GPTQ
-baseline. Likely cause: sglang's stock `modelopt_fp4` loader does **not** route through
-the SM120 FP4 tensor-core kernel; it dequantizes back to BF16 per linear (the
-"experimental and subject to change" log line on load supports this). Quantification
-of the kernel path is a follow-up.
+baseline. Initial hypothesis (BF16 dequant fallback) was **wrong** — code review of
+`python/sglang/srt/layers/quantization/modelopt_quant.py` shows `ModelOptFp4LinearMethod.apply`
+actually does:
+
+1. `x_fp4, x_scale = fp4_quantize(x, layer.input_scale_inv)` — BF16→NVFP4 cast on every step
+   (flashinfer `fp4_quantize` on SM120, sgl-kernel `scaled_fp4_quant` elsewhere; gated by
+   `is_sm120_supported()` at import time).
+2. `out = fp4_gemm(x_fp4, w_fp4, x_scale, w_scale, alpha, out_dtype, w_n)` — flashinfer
+   `mm_fp4` (cutlass backend) → SM120 FP4 cutlass GEMM. Asserts confirm `weight.dtype == uint8`
+   (packed FP4) and `weight_scale.dtype == float8_e4m3fn`. **Weights are never dequantized.**
+3. The kernel writes BF16/FP16 output for the next layer.
+
+So the FP4 tensor cores **are** being used. The likely real causes of long-context slowness,
+in priority order:
+
+1. **Quality collapse → runaway generation.** Uniform NVFP4 produces gibberish, so mcq/qa items
+   hit `max_tokens=65536` instead of stopping at the answer. The ">5 min/item" observations are
+   most likely items generating ~65k tokens before timeout, not slow tokens. Same failure mode
+   as the "Paris → unedoc.com/abc/u.com..." degeneration on the 6-token smoke test.
+2. **Per-token activation re-quantization overhead.** BF16→FP4 cast happens on every linear,
+   every step. Cheap on short prompts but at chunk=65536 × prefill_max_requests=4 it could
+   swamp the FP4 GEMM gain.
+3. **Attention is BF16, not FP4.** Q/K/V projections do FP4 GEMM but the flashinfer attention
+   kernel consumes BF16, so we still pay FP4→BF16 round-trips around attention.
+
+Cause #1 likely dominates and can only be separated from #2/#3 after FourOverSix restores
+quality. Probes (a) nsys kernel dispatch verification, (b) `fp4_quantize` vs `mm_fp4` time
+ratio, (c) short-context mcq probe with `max_tokens=512` are queued as investigation tasks.
 
 ## Files added/changed
 
@@ -88,10 +112,10 @@ of the kernel path is a follow-up.
    - **Phase B (FourOverSix)** — implement adaptive M=6/M=4 per-block scaling inside
      a custom modelopt `forward_loop`, target the ≥99 % accuracy point the champion
      achieved.
-   - **Investigate kernel path** — confirm whether sglang's `modelopt_fp4` loader on
-     SM120 actually uses FP4 tensor cores; if it falls back to BF16 dequant, the
-     speed gain we expect from FP4 is illusory until we add a custom kernel (similar
-     to how we added the W4A8 FP8 GEMM in CHANGE_0090).
+   - **Investigate kernel path** — code review confirms FP4 tensor cores **are** used
+     (no Marlin / no BF16 dequant). Remaining unknowns: actual `cutlass_scaled_fp4_mm`
+     residency in nsys timeline, ratio of `fp4_quantize` overhead vs `mm_fp4` time, and
+     a short-context-only accuracy probe to separate quality collapse from kernel speed.
 
 ## Validation commands
 
