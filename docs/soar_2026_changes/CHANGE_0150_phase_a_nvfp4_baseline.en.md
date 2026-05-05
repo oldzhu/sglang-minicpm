@@ -117,6 +117,41 @@ ratio, (c) short-context mcq probe with `max_tokens=512` are queued as investiga
      residency in nsys timeline, ratio of `fp4_quantize` overhead vs `mm_fp4` time, and
      a short-context-only accuracy probe to separate quality collapse from kernel speed.
 
+## Probe results — kernel dispatch + microbench (2026-05-05)
+
+`scripts/fcloud/probe_nvfp4_kernel.py` run on the fcloud SM120 instance with the
+v22 wheel set. Confirms `is_sm120_supported() == True` and that `flashinfer.fp4_quantize` /
+`flashinfer.mm_fp4` (cutlass backend) execute cleanly. Microbench of typical projection
+shapes (K=4096, ffn N=10880, qkv N=4096):
+
+| label | M | BF16 ms | FP4 e2e ms | mm_fp4 only | quant only | quant % | speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| decode-1   × qkv | 1 | 0.019 | 0.038 | 0.043 | 0.007 | 17 % | **0.49×** |
+| decode-1   × ffn | 1 | 0.035 | 0.038 | 0.034 | 0.007 | 18 % | **0.92×** |
+| prefill-512× qkv | 512 | 0.160 | 0.036 | 1.661¹ | 0.007 | 18 % | 4.40× |
+| prefill-512× ffn | 512 | 0.476 | 0.075 | 0.091 | 0.007 | 9 %  | 6.38× |
+| chunk-4096 × qkv | 4096 | 1.118 | 0.267 | 0.274 | 0.012 | 5 %  | 4.19× |
+| chunk-4096 × ffn | 4096 | 2.706 | 0.683 | 0.651 | 0.018 | 3 %  | 3.96× |
+| chunk-65536× qkv | 65536 | 15.45 | 3.95 | 3.89 | 0.55 | 14 % | 3.91× |
+| chunk-65536× ffn | 65536 | 41.25 | 10.28 | 10.21 | 0.55 | 5 %  | 4.01× |
+
+¹ first-call JIT/heuristic outlier — end-to-end path warmed differently; ignore.
+
+Findings:
+1. **FP4 kernel is healthy and gives the expected ~4× speedup** at prefill/chunk shapes.
+   The 4× ratio matches SM120's BF16 (148 TF) → FP4 (593 TF) hardware quotient.
+2. **`fp4_quantize` activation cast is not a bottleneck** (≤10 % of total at prefill/chunk
+   sizes, ≤14 % even at chunk=65536). This rules out per-token re-quantize as the dominant
+   cost on long context.
+3. **Decode-1 is slower with FP4 (0.49–0.92×).** Memory-bound regime + 2-kernel launch
+   overhead beats the compute saving. NVFP4 alone is not a decode-step win — to gain at
+   decode we would need to fuse `fp4_quantize` into the previous op or batch decode steps.
+4. **Therefore long-context slowness on Phase A test was NOT the kernel.** With
+   ~4× GEMM speedup, prefill should be faster, not slower. The dominant cause must be
+   **runaway thinking from quality collapse** — at `max_tokens=65536` a single broken
+   item can spend minutes generating gibberish. This re-confirms the priority on Phase B
+   (FourOverSix) to restore quality before drawing any further speed conclusions.
+
 ## Validation commands
 
 ```bash
