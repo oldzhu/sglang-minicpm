@@ -1257,10 +1257,91 @@ def _install_four_over_six_patch():
 
     NVFP4QTensor._cast_fp4 = chunked_cast_fp4
 
+    # Also chunk modelopt's `NVFP4QTensor.quantize` so the full per-layer
+    # path (scale → cast → pack) never holds a full-size fp32 weight copy.
+    # Memory at this point is ~82 GB; even after _cast_fp4 chunking the
+    # subsequent `(q[1::2]<<4)|q[0::2]` pack tries to allocate full-size
+    # uint8 intermediates and OOMs.
+    orig_quantize = NVFP4QTensor.quantize
+    chunk_rows_q = int(os.environ.get("SOAR_NVFP4_QUANT_CHUNK_ROWS", "512"))
+
+    @classmethod  # noqa: D401
+    def chunked_quantize(
+        cls,
+        input,
+        block_size: int = 16,
+        weights_scaling_factor=None,
+        weights_scaling_factor_2=None,
+        keep_high_precision: bool = False,
+        try_tensorrt: bool = False,
+    ):
+        # If small or 1D, fall through.
+        if input.dim() < 2 or input.shape[0] <= chunk_rows_q:
+            return orig_quantize.__func__(
+                cls,
+                input,
+                block_size,
+                weights_scaling_factor,
+                weights_scaling_factor_2,
+                keep_high_precision,
+                try_tensorrt,
+            )
+        if weights_scaling_factor_2 is None:
+            weights_scaling_factor_2 = cls.get_weights_scaling_factor_2(input)
+        if weights_scaling_factor is None:
+            weights_scaling_factor, _ = cls.get_weights_scaling_factor(
+                input, block_size, weights_scaling_factor_2
+            )
+        if keep_high_precision:
+            # Rare path; just defer.
+            return orig_quantize.__func__(
+                cls,
+                input,
+                block_size,
+                weights_scaling_factor,
+                weights_scaling_factor_2,
+                keep_high_precision,
+                try_tensorrt,
+            )
+
+        original_shape = input.shape
+        input_dtype = input.dtype
+        n = input.shape[0]
+        K = input.shape[-1]
+
+        wsf = weights_scaling_factor.to(torch.float32)
+        wsf2 = weights_scaling_factor_2.to(torch.float32)
+
+        packed_chunks = []
+        for i in range(0, n, chunk_rows_q):
+            j = min(i + chunk_rows_q, n)
+            x = input[i:j]
+            sf = wsf[i:j]
+            x_blocks = x.view(j - i, K // block_size, block_size).float()
+            denom = (sf * wsf2).unsqueeze(-1)
+            scaled = (x_blocks / denom).view(j - i, K)
+            del x_blocks, denom
+            q = orig_cast_fp4(scaled)  # uint8 same shape (j-i, K)
+            del scaled
+            packed = (q[..., 1::2] << 4) | q[..., 0::2]
+            del q
+            packed_chunks.append(packed)
+        packed_weight = torch.cat(packed_chunks, dim=0)
+        del packed_chunks
+
+        return (
+            cls(original_shape, input_dtype, packed_weight),
+            weights_scaling_factor,
+            weights_scaling_factor_2,
+        )
+
+    NVFP4QTensor.quantize = chunked_quantize
+
     def _restore() -> None:
         NVFP4QTensor.get_weights_scaling_factor = orig_dynamic
         NVFP4QTensor.get_weights_scaling_factor_from_quantizer = orig_from_q
         NVFP4QTensor._cast_fp4 = staticmethod(orig_cast_fp4)
+        NVFP4QTensor.quantize = orig_quantize
 
     return _restore
 
