@@ -1720,10 +1720,21 @@ def run_nvfp4_quantization(
                 if _p is None:
                     continue
                 cpu_state_dict[_pname] = _p.detach().to("cpu")
+            # Build set of (module_path, local_buf_name) for non-persistent
+            # buffers so we can skip them (e.g. rotary cos_cached/sin_cached
+            # which are recomputed on load and would bloat the checkpoint by
+            # ~16 GiB for this model).
+            _non_persistent = set()
+            for _mname, _mod in model.named_modules():
+                for _lb in getattr(_mod, "_non_persistent_buffers_set", set()):
+                    _full = f"{_mname}.{_lb}" if _mname else _lb
+                    _non_persistent.add(_full)
             for _bname, _buf in model.named_buffers(remove_duplicate=False):
                 # Skip quantizer internal buffers (e.g. _amax we already dropped,
                 # or that survived on non-Linear modules).
                 if "_quantizer." in _bname or _bname.endswith("._amax"):
+                    continue
+                if _bname in _non_persistent:
                     continue
                 if _bname in cpu_state_dict:
                     continue
