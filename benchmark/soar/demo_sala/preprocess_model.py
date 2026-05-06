@@ -1461,63 +1461,76 @@ def run_nvfp4_quantization(
 
         try:
             mtq.quantize(model, config, forward_loop=forward_loop)
-            print("[preprocess] NVFP4 quantize done; exporting hf checkpoint")
+            print("[preprocess] NVFP4 quantize done; preparing for export", flush=True)
 
-            # Calibration leaves activation caches and intermediate buffers
-            # on the GPU; with 90 stratified samples we end up at >80GB used,
-            # which leaves no headroom for modelopt's per-layer fp32
-            # intermediates inside `_cast_fp4` during the export pass. Drop
-            # everything we can before handing off to export_hf_checkpoint.
+            # ------------------------------------------------------------------
+            # Aggressive pre-export GPU cleanup.
+            # `mtq.quantize` leaves behind:
+            #   * cached activation amax buffers inside each TensorQuantizer
+            #     (large for big hidden dims; modelopt frees these implicitly
+            #     once weights are compressed but holds them through export)
+            #   * the calibration text/tokenizer/forward_loop closure references
+            # The export path itself needs scratch room for fp16->fp4 packing
+            # plus per-block fp8 scale tensors. We free everything we can and
+            # log free/peak memory so that any future OOM is diagnosable.
+            # ------------------------------------------------------------------
             import gc as _gc
 
-            _gc.collect()
-            torch.cuda.empty_cache()
-
-            # Activate FOS so export-pass quantization picks the FOS scale.
-            # We deliberately avoid `mtq.compress` because it produces a
-            # weight_scale layout (K/32 columns) that is incompatible with
-            # sglang's NVFP4 loader (expects K/group_size = K/16 columns).
-            # Instead we move the model to CPU before export to free GPU
-            # memory while keeping the standard NVFP4 export layout.
-            if fos_enabled:
-                _FOS_ACTIVE["on"] = True
-                print("[preprocess] NVFP4 FourOverSix activating for export")
-
-            print("[preprocess] NVFP4 moving model to CPU before export to free GPU memory")
-            model.to("cpu")
-            _gc.collect()
-            torch.cuda.empty_cache()
             try:
-                free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024)
-                print(f"[preprocess] NVFP4 post-CPU-move free GPU mem: {free_mb:.0f} MiB")
+                del forward_loop  # closure pinning tokenizer + calibration_texts
             except Exception:
                 pass
-
-            # modelopt's export runs a tiny dummy forward (input shape [1,2])
-            # to discover modules that share the same input (for layernorm
-            # prequant fusion). MiniCPM-SALA's modeling uses both flash_attn
-            # AND `fused_recurrent_simple_gla` (Triton kernels) which only
-            # work on CUDA. Since we move the model to CPU to free memory,
-            # bypass the fusion-detection step entirely. NVFP4 (non-AWQ) does
-            # not require pre-quant scale fusion, so this is safe.
-            from modelopt.torch.export import unified_export_hf as _ue
-
-            _orig_resmooth = _ue.requantize_resmooth_fused_llm_layers
-
-            def _resmooth_noop(model):
-                print("[preprocess] NVFP4 skipping requantize_resmooth_fused_llm_layers (CPU export)")
-                return None
-
-            _ue.requantize_resmooth_fused_llm_layers = _resmooth_noop
             try:
-                dst.mkdir(parents=True, exist_ok=True)
-                # save_modelopt_state=False keeps the directory drop-in for sglang's
-                # modelopt_fp4 loader; modelopt's own state is not needed at serve time.
-                export_hf_checkpoint(
-                    model, export_dir=str(dst), save_modelopt_state=False
-                )
-            finally:
-                _ue.requantize_resmooth_fused_llm_layers = _orig_resmooth
+                del tokenizer
+            except Exception:
+                pass
+            try:
+                del calibration_texts
+            except Exception:
+                pass
+            _gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                try:
+                    free_b, total_b = torch.cuda.mem_get_info()
+                    peak_b = torch.cuda.max_memory_allocated()
+                    print(
+                        f"[preprocess] NVFP4 pre-export GPU mem: "
+                        f"free={free_b / 1024**3:.2f} GiB / "
+                        f"total={total_b / 1024**3:.2f} GiB, "
+                        f"peak_allocated={peak_b / 1024**3:.2f} GiB",
+                        flush=True,
+                    )
+                    torch.cuda.reset_peak_memory_stats()
+                except Exception:
+                    pass
+
+            # Activate FOS so export-pass quantization picks the FOS scale.
+            # We use modelopt's standard `export_hf_checkpoint` (no
+            # `mtq.compress`) so the on-disk layout matches sglang's
+            # modelopt_fp4 loader (weight_scale shape == (N, K/group_size)).
+            if fos_enabled:
+                _FOS_ACTIVE["on"] = True
+                print("[preprocess] NVFP4 FourOverSix activating for export", flush=True)
+
+            print("[preprocess] NVFP4 calling export_hf_checkpoint", flush=True)
+            dst.mkdir(parents=True, exist_ok=True)
+            # save_modelopt_state=False keeps the directory drop-in for sglang's
+            # modelopt_fp4 loader; modelopt's own state is not needed at serve time.
+            export_hf_checkpoint(
+                model, export_dir=str(dst), save_modelopt_state=False
+            )
+            print("[preprocess] NVFP4 export_hf_checkpoint done", flush=True)
+            if torch.cuda.is_available():
+                try:
+                    peak_b = torch.cuda.max_memory_allocated()
+                    print(
+                        f"[preprocess] NVFP4 export peak GPU alloc: "
+                        f"{peak_b / 1024**3:.2f} GiB",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
         finally:
             _FOS_ACTIVE["on"] = False
             if fos_restore is not None:
@@ -1843,13 +1856,21 @@ def main() -> None:
             raise RuntimeError(
                 "NVFP4 mode requires --calibration-file (or SOAR_GPTQ_CALIBRATION_FILE)."
             )
-        run_nvfp4_quantization(
-            src=src,
-            dst=dst,
-            calibration_file=Path(args.calibration_file).resolve(),
-            calibration_samples=args.calibration_samples,
-            calibration_field=args.calibration_field,
-        )
+        try:
+            run_nvfp4_quantization(
+                src=src,
+                dst=dst,
+                calibration_file=Path(args.calibration_file).resolve(),
+                calibration_samples=args.calibration_samples,
+                calibration_field=args.calibration_field,
+            )
+        except BaseException:
+            import traceback as _tb
+            import sys as _sys
+            print("[preprocess] NVFP4 run_nvfp4_quantization raised:", flush=True)
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise
         _patch_chat_template_for_mcq(dst)
         print(f"[preprocess] mode={mode} done - NVFP4 model saved to {dst}")
         return
@@ -1861,4 +1882,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import faulthandler as _fh
+    import sys as _sys
+    _fh.enable(file=_sys.stderr, all_threads=True)
+    try:
+        main()
+    except BaseException:
+        import traceback as _tb
+        print("[preprocess] top-level exception:", flush=True)
+        _tb.print_exc(file=_sys.stderr)
+        _sys.stderr.flush()
+        raise
