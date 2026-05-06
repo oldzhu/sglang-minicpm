@@ -1601,16 +1601,15 @@ def run_nvfp4_quantization(
                 _fmt = _get_quantization_format(_sub)
                 if _fmt == _QUANTIZATION_NONE:
                     continue
+                if not _ue.is_quantlinear(_sub):
+                    # Container modules (the root model, decoder layers, MLPs)
+                    # all bubble up a non-NONE format because they have
+                    # quantized children. Skip them; we'll visit the leaf
+                    # Linear children directly via named_modules().
+                    continue
                 if _fmt != _QUANTIZATION_NVFP4:
                     raise NotImplementedError(
                         f"manual streaming export only supports NVFP4 (got {_fmt} on {_name})"
-                    )
-                if not _ue.is_quantlinear(_sub):
-                    # Llama4TextExperts / GptOssExperts not used by MiniCPM-SALA.
-                    raise NotImplementedError(
-                        f"manual streaming export does not support module type "
-                        f"{type(_sub).__name__} (at {_name}). Only Linear-style "
-                        f"quantized modules are handled."
                     )
 
                 _attrs = _quantizer_attr_names("weight")
