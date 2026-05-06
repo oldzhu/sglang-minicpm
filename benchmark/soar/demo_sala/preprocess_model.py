@@ -1364,6 +1364,17 @@ def run_nvfp4_quantization(
             _gc.collect()
             torch.cuda.empty_cache()
 
+            # Move model to CPU for export. modelopt's NVFP4 export does
+            # full-weight fp32 + int32 intermediates per layer which can OOM
+            # on an 84GB GPU when fake-quant scales for all 306 layers are
+            # already resident. CPU export is slower but reliable.
+            cpu_export = _env_truthy("SOAR_NVFP4_CPU_EXPORT", default=True)
+            if cpu_export:
+                print("[preprocess] NVFP4 moving model to CPU before export")
+                model.to("cpu")
+                _gc.collect()
+                torch.cuda.empty_cache()
+
             dst.mkdir(parents=True, exist_ok=True)
             # Activate FOS only for the export pass — calibration above used
             # modelopt's default M=6 path (cheaper, identical to non-M=4
