@@ -628,6 +628,10 @@ class MiniCPMSALAForCausalLM(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
+            if "weight_quantizer." in name or "input_quantizer." in name:
+                # Skip modelopt-internal quantizer buffers (e.g. _double_scale)
+                # produced by mtq.compress; not needed for inference.
+                continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
 
