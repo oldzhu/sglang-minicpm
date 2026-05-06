@@ -1473,13 +1473,28 @@ def run_nvfp4_quantization(
             _gc.collect()
             torch.cuda.empty_cache()
 
-            dst.mkdir(parents=True, exist_ok=True)
-            # Activate FOS only for the export pass — calibration above used
-            # modelopt's default M=6 path (cheaper, identical to non-M=4
-            # winners anyway).
+            # Activate FOS *before* mtq.compress so the in-place weight
+            # compression uses our scale selection. compress() replaces the
+            # bf16 fake-quant buffers with packed NVFP4 tensors which both
+            # frees ~half the GPU memory AND is a prerequisite for
+            # export_hf_checkpoint to fit. Without compress() the
+            # subsequent export call holds the bf16 model + fake-quant
+            # state simultaneously and OOMs at 82GB.
             if fos_enabled:
                 _FOS_ACTIVE["on"] = True
-                print("[preprocess] NVFP4 FourOverSix activating for export pass")
+                print("[preprocess] NVFP4 FourOverSix activating for compress + export")
+
+            print("[preprocess] NVFP4 calling mtq.compress to materialize NVFP4 weights")
+            mtq.compress(model)
+            _gc.collect()
+            torch.cuda.empty_cache()
+            try:
+                free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024)
+                print(f"[preprocess] NVFP4 post-compress free GPU mem: {free_mb:.0f} MiB")
+            except Exception:
+                pass
+
+            dst.mkdir(parents=True, exist_ok=True)
             # save_modelopt_state=False keeps the directory drop-in for sglang's
             # modelopt_fp4 loader; modelopt's own state is not needed at serve time.
             export_hf_checkpoint(model, export_dir=str(dst), save_modelopt_state=False)
