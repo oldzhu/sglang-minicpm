@@ -1473,24 +1473,23 @@ def run_nvfp4_quantization(
             _gc.collect()
             torch.cuda.empty_cache()
 
-            # Activate FOS *before* mtq.compress so the in-place weight
-            # compression uses our scale selection. compress() replaces the
-            # bf16 fake-quant buffers with packed NVFP4 tensors which both
-            # frees ~half the GPU memory AND is a prerequisite for
-            # export_hf_checkpoint to fit. Without compress() the
-            # subsequent export call holds the bf16 model + fake-quant
-            # state simultaneously and OOMs at 82GB.
+            # Activate FOS so export-pass quantization picks the FOS scale.
+            # We deliberately avoid `mtq.compress` because it produces a
+            # weight_scale layout (K/32 columns) that is incompatible with
+            # sglang's NVFP4 loader (expects K/group_size = K/16 columns).
+            # Instead we move the model to CPU before export to free GPU
+            # memory while keeping the standard NVFP4 export layout.
             if fos_enabled:
                 _FOS_ACTIVE["on"] = True
-                print("[preprocess] NVFP4 FourOverSix activating for compress + export")
+                print("[preprocess] NVFP4 FourOverSix activating for export")
 
-            print("[preprocess] NVFP4 calling mtq.compress to materialize NVFP4 weights")
-            mtq.compress(model)
+            print("[preprocess] NVFP4 moving model to CPU before export to free GPU memory")
+            model.to("cpu")
             _gc.collect()
             torch.cuda.empty_cache()
             try:
                 free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024)
-                print(f"[preprocess] NVFP4 post-compress free GPU mem: {free_mb:.0f} MiB")
+                print(f"[preprocess] NVFP4 post-CPU-move free GPU mem: {free_mb:.0f} MiB")
             except Exception:
                 pass
 
