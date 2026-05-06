@@ -1514,116 +1514,260 @@ def run_nvfp4_quantization(
                 print("[preprocess] NVFP4 FourOverSix activating for export", flush=True)
 
             # ------------------------------------------------------------------
-            # Streaming-export monkey-patch (Plan-A2).
+            # Plan-B: manual streaming export bypassing modelopt's
+            # `export_hf_checkpoint` entirely.
             #
-            # Empirically, modelopt's `_process_quantized_modules` runs
-            # `_export_quantized_weight` per Linear, and across ~560 quantized
-            # Linears in MiniCPM-SALA the GPU allocator grows from 38 GiB to
-            # 82 GiB (+44 GiB / +80 MiB per Linear) before OOMing. The fp16
-            # original is replaced with a uint8-packed Parameter via setattr,
-            # but the old fp16 storage is held alive long enough that the
-            # allocator can't reclaim it (per-step `torch.cuda.empty_cache()`
-            # only releases freed blocks, not still-referenced ones). For a
-            # ~14 GiB model with 560 Linears the steady-state never recovers.
+            # Why bypass modelopt's path:
+            #   * On-GPU export grew from 38 GiB to 82 GiB and OOM'd at layer
+            #     307/~560. Each `_export_quantized_weight` call leaks ~148 MiB
+            #     (≈ the fp16 weight size) — the original Parameter is held by
+            #     some hidden ref inside modelopt that the caching allocator
+            #     can't reclaim.
+            #   * The CPU-stream workaround was killed by the fcloud cgroup
+            #     CPU memory cap (64 GiB) on `model.to("cpu")`.
             #
-            # Fix: stream module-by-module through the GPU. Move the whole
-            # model to CPU once (after the fp16 + activation calibration is
-            # done), then for each quantized Linear: lift to CUDA, call the
-            # ORIGINAL `_export_quantized_weight` (FOS scale-selection still
-            # fires inside it), drop back to CPU, empty_cache. Peak GPU usage
-            # during export becomes one Linear (≤200 MiB).
+            # What we do instead, per quantized Linear (still on CUDA):
+            #   1. Compute weight_scale_2 (per-tensor fp32 scalar)
+            #   2. Compute weight_scale (per-block fp8) — FOS hook fires here
+            #      via NVFP4QTensor.get_weights_scaling_factor monkey-patch.
+            #   3. Pack the weight to uint8 (N, K/2)
+            #   4. Compute input_scale (per-tensor fp32 scalar) if input
+            #      quantizer is enabled.
+            #   5. Append entries to a CPU state_dict and IMMEDIATELY drop:
+            #        sub_module._parameters["weight"] = None
+            #        wq._amax / wq._scale / iq._amax
+            #      then gc.collect() + empty_cache().
             #
-            # NOTE: we do NOT patch `requantize_resmooth_fused_llm_layers`.
-            # That step needs a CUDA dummy forward (Triton fla kernels). It
-            # runs once before our patched `_process_quantized_modules`, so
-            # the model is still on CUDA at that moment.
+            # Net effect: GPU peak during export ~ one Linear's worth (a few
+            # hundred MiB); CPU growth ~ packed_weight + scale per Linear
+            # (~64 MiB + 8 MiB) × ~560 = ~40 GiB, comfortably under the 64 GiB
+            # cgroup cap (process baseline ~26 GiB).
+            #
+            # The fused-layer resmoothing (modelopt's
+            # `requantize_resmooth_fused_llm_layers`) runs once before the
+            # streaming loop, while the model is still fully on CUDA, so the
+            # Triton fla kernels in the dummy forward work correctly.
             # ------------------------------------------------------------------
             from modelopt.torch.export import unified_export_hf as _ue
+            from modelopt.torch.export.quant_utils import (
+                get_quant_config as _get_quant_config,
+                get_quantization_format as _get_quantization_format,
+                get_weight_block_size as _get_weight_block_size,
+                get_activation_scaling_factor as _get_activation_scaling_factor,
+                QUANTIZATION_NONE as _QUANTIZATION_NONE,
+                QUANTIZATION_NVFP4 as _QUANTIZATION_NVFP4,
+                to_quantized_weight as _to_quantized_weight,
+            )
+            from modelopt.torch.quantization.qtensor.nvfp4_tensor import (
+                NVFP4QTensor as _NVFP4QTensor,
+            )
+            from modelopt.torch.quantization.utils import (
+                quantizer_attr_names as _quantizer_attr_names,
+            )
 
-            _orig_pqm = _ue._process_quantized_modules
+            print(
+                "[preprocess] NVFP4 running modelopt.requantize_resmooth_fused_llm_layers (CUDA)",
+                flush=True,
+            )
+            _ue.requantize_resmooth_fused_llm_layers(model)
 
-            def _streaming_process_quantized_modules(
-                model, dtype, is_modelopt_qlora=False
-            ):
-                import gc as __gc
+            # Build hf_quant_config BEFORE we destroy quantizer state.
+            print("[preprocess] NVFP4 building hf_quant_config", flush=True)
+            hf_quant_config = _get_quant_config(model)
+            try:
+                from modelopt.torch.export.convert_hf_config import (
+                    convert_hf_quant_config_format as _convert_hf_quant_config_format,
+                )
+                quantization_config_for_config_json = _convert_hf_quant_config_format(
+                    hf_quant_config
+                )
+            except Exception as _e:
+                print(
+                    f"[preprocess] NVFP4 convert_hf_quant_config_format failed: {_e}; "
+                    "falling back to raw hf_quant_config dict",
+                    flush=True,
+                )
+                quantization_config_for_config_json = hf_quant_config
 
-                print("[preprocess] NVFP4 streaming export: moving model to CPU", flush=True)
-                model.to("cpu")
-                __gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            # Streaming export: per-Linear quantize → CPU state_dict → free GPU.
+            export_dtype = torch.bfloat16  # match model dtype
+            cpu_state_dict: dict = {}
+            quantized_module_names: list = []
+            processed = 0
+            import gc as _sgc
+
+            print("[preprocess] NVFP4 streaming export start (per-Linear)", flush=True)
+            for _name, _sub in list(model.named_modules()):
+                _fmt = _get_quantization_format(_sub)
+                if _fmt == _QUANTIZATION_NONE:
+                    continue
+                if _fmt != _QUANTIZATION_NVFP4:
+                    raise NotImplementedError(
+                        f"manual streaming export only supports NVFP4 (got {_fmt} on {_name})"
+                    )
+                if not _ue.is_quantlinear(_sub):
+                    # Llama4TextExperts / GptOssExperts not used by MiniCPM-SALA.
+                    raise NotImplementedError(
+                        f"manual streaming export does not support module type "
+                        f"{type(_sub).__name__} (at {_name}). Only Linear-style "
+                        f"quantized modules are handled."
+                    )
+
+                _attrs = _quantizer_attr_names("weight")
+                _wq = getattr(_sub, _attrs.weight_quantizer)
+                _iq = getattr(_sub, _attrs.input_quantizer, None)
+                _block_size = _get_weight_block_size(_sub, "weight")
+
+                _w = _sub.weight  # (N, K), bf16, on cuda
+
+                # weight_scale_2 (per-tensor fp32 scalar)
+                _ws2 = _NVFP4QTensor.get_weights_scaling_factor_2_from_quantizer(_wq)
+                # weight_scale (per-block fp8) — FOS picks scale here via patch
+                _ws = _NVFP4QTensor.get_weights_scaling_factor(
+                    _w,
+                    block_size=_block_size,
+                    weights_scaling_factor_2=_ws2.to(_w.device),
+                )[0]
+                # packed weight (uint8, shape (N, K/2))
+                _qw = _to_quantized_weight(
+                    _w.to(export_dtype),
+                    _ws,
+                    _QUANTIZATION_NVFP4,
+                    _ws2.to(_w.device),
+                    _block_size,
+                )
+
+                # input_scale (per-tensor fp32 scalar) if input quantizer enabled
+                _is = None
+                if (
+                    _iq is not None
+                    and "disabled" not in repr(_iq)
+                    and getattr(_iq, "amax", None) is not None
+                ):
+                    _is = _get_activation_scaling_factor(
+                        _sub, input_quantizer_name=_attrs.input_quantizer
+                    ).squeeze()
+
+                # Move outputs to CPU and store in state_dict.
+                cpu_state_dict[_name + ".weight"] = _qw.detach().to("cpu")
+                cpu_state_dict[_name + "." + _attrs.weight_scale] = _ws.detach().to("cpu")
+                cpu_state_dict[_name + "." + _attrs.weight_scale_2] = (
+                    _ws2.detach().to("cpu").reshape(())
+                )
+                if _is is not None:
+                    cpu_state_dict[_name + "." + _attrs.input_scale] = (
+                        _is.detach().to("cpu").reshape(())
+                    )
+
+                # Bias is not quantized; preserve it.
+                if getattr(_sub, "bias", None) is not None:
+                    cpu_state_dict[_name + ".bias"] = _sub.bias.detach().to("cpu")
+                    _sub._parameters["bias"] = None
+
+                # Drop GPU-resident state for this Linear.
+                _sub._parameters["weight"] = None
+                if hasattr(_wq, "_amax"):
                     try:
-                        free_b, total_b = torch.cuda.mem_get_info()
-                        print(
-                            f"[preprocess] NVFP4 streaming-export start "
-                            f"free={free_b / 1024**3:.2f} GiB / total={total_b / 1024**3:.2f} GiB",
-                            flush=True,
-                        )
+                        del _wq._amax
+                    except Exception:
+                        pass
+                if hasattr(_wq, "_scale"):
+                    try:
+                        del _wq._scale
+                    except Exception:
+                        pass
+                if _iq is not None and hasattr(_iq, "_amax"):
+                    try:
+                        del _iq._amax
                     except Exception:
                         pass
 
-                processed = 0
-                for name, sub_module in model.named_modules():
-                    if is_modelopt_qlora and hasattr(sub_module, "base_layer"):
-                        continue
-                    if hasattr(sub_module, "weight_packed") or (
-                        "QuantFP8Linear" in type(sub_module).__name__
-                        and getattr(sub_module, "weight", None) is not None
-                        and sub_module.weight.element_size() <= 1
-                    ):
-                        sub_module.unpack_weight()
-                    if _ue.get_quantization_format(sub_module) == _ue.QUANTIZATION_NONE:
-                        continue
-                    if not _ue.is_quantlinear(sub_module):
-                        # Llama4TextExperts / GptOssExperts not used by MiniCPM-SALA.
-                        # Fall back to original handling for safety.
-                        try:
-                            _orig_pqm(sub_module, dtype, is_modelopt_qlora)
-                        except Exception as _e:
-                            print(
-                                f"[preprocess] NVFP4 streaming-export: fallback for "
-                                f"{name} ({type(sub_module).__name__}) raised: {_e}",
-                                flush=True,
-                            )
-                            raise
-                        continue
-                    sub_module.to("cuda")
-                    try:
-                        _ue._export_quantized_weight(sub_module, dtype)
-                    finally:
-                        sub_module.to("cpu")
-                        __gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    processed += 1
-                    if processed % 50 == 0:
+                quantized_module_names.append(_name)
+                processed += 1
+                del _w, _ws, _ws2, _qw, _is, _wq, _iq, _attrs
+
+                if processed % 64 == 0:
+                    _sgc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                         try:
                             free_b, _ = torch.cuda.mem_get_info()
                             print(
-                                f"[preprocess] NVFP4 streaming-export {processed} linears done; "
-                                f"free={free_b / 1024**3:.2f} GiB",
+                                f"[preprocess] NVFP4 streaming export {processed} "
+                                f"linears done; gpu_free={free_b / 1024**3:.2f} GiB",
                                 flush=True,
                             )
                         except Exception:
                             pass
-                print(
-                    f"[preprocess] NVFP4 streaming-export complete: {processed} linears",
-                    flush=True,
-                )
 
-            _ue._process_quantized_modules = _streaming_process_quantized_modules
+            _sgc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(
+                f"[preprocess] NVFP4 streaming export complete: "
+                f"{processed} linears quantized",
+                flush=True,
+            )
 
-            print("[preprocess] NVFP4 calling export_hf_checkpoint", flush=True)
+            # Collect non-quantized parameters/buffers (embed_tokens, lm_head,
+            # norms, gate proj, etc.) onto CPU in the state_dict.
+            print(
+                "[preprocess] NVFP4 collecting non-quantized params/buffers",
+                flush=True,
+            )
+            for _pname, _p in model.named_parameters(remove_duplicate=False):
+                if _pname in cpu_state_dict:
+                    continue
+                if _p is None:
+                    continue
+                cpu_state_dict[_pname] = _p.detach().to("cpu")
+            for _bname, _buf in model.named_buffers(remove_duplicate=False):
+                # Skip quantizer internal buffers (e.g. _amax we already dropped,
+                # or that survived on non-Linear modules).
+                if "_quantizer." in _bname or _bname.endswith("._amax"):
+                    continue
+                if _bname in cpu_state_dict:
+                    continue
+                cpu_state_dict[_bname] = _buf.detach().to("cpu")
+            _sgc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Save: use model.save_pretrained with our state_dict so that
+            # transformers handles the safetensors sharding + config.json.
+            print(
+                f"[preprocess] NVFP4 saving {len(cpu_state_dict)} tensors to {dst}",
+                flush=True,
+            )
             dst.mkdir(parents=True, exist_ok=True)
+            # Write hf_quant_config.json (modelopt-style, for backward compat).
+            with open(dst / "hf_quant_config.json", "w") as _f:
+                _json_for_quant = json.dumps(hf_quant_config, indent=4, default=str)
+                _f.write(_json_for_quant)
+            # Patch modelopt's revert_weight_conversion (scalar tensors break it).
+            _patches = _ue._patch_revert_weight_conversion()
             try:
-                # save_modelopt_state=False keeps the directory drop-in for sglang's
-                # modelopt_fp4 loader; modelopt's own state is not needed at serve time.
-                export_hf_checkpoint(
-                    model, export_dir=str(dst), save_modelopt_state=False
+                # Remove hf_quantizer to allow save_pretrained to drop quant cfg.
+                if getattr(model, "hf_quantizer", None) is not None:
+                    model.hf_quantizer = None
+                model.save_pretrained(
+                    str(dst),
+                    state_dict=cpu_state_dict,
+                    save_modelopt_state=False,
                 )
             finally:
-                _ue._process_quantized_modules = _orig_pqm
-            print("[preprocess] NVFP4 export_hf_checkpoint done", flush=True)
+                _ue._unpatch_revert_weight_conversion(_patches)
+
+            # Add quantization_config block to config.json (sglang's
+            # modelopt_fp4 loader reads it from there).
+            _cfg_path = dst / "config.json"
+            with open(_cfg_path) as _f:
+                _cfg = json.load(_f)
+            _cfg["quantization_config"] = quantization_config_for_config_json
+            with open(_cfg_path, "w") as _f:
+                json.dump(_cfg, _f, indent=4)
+
+            print("[preprocess] NVFP4 manual export complete", flush=True)
             if torch.cuda.is_available():
                 try:
                     peak_b = torch.cuda.max_memory_allocated()
