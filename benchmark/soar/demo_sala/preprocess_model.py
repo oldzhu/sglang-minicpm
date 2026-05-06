@@ -1493,10 +1493,66 @@ def run_nvfp4_quantization(
             except Exception:
                 pass
 
-            dst.mkdir(parents=True, exist_ok=True)
-            # save_modelopt_state=False keeps the directory drop-in for sglang's
-            # modelopt_fp4 loader; modelopt's own state is not needed at serve time.
-            export_hf_checkpoint(model, export_dir=str(dst), save_modelopt_state=False)
+            # modelopt's export runs a tiny dummy forward (input shape [1,2])
+            # to discover modules that share the same input (for layernorm
+            # prequant fusion). MiniCPM-SALA's modeling code calls
+            # `flash_attn_func` directly which only has a CUDA backend, so
+            # the forward fails on CPU. Stub flash_attn with a zero-tensor
+            # shim for the duration of the export — fusion detection only
+            # uses input identity, not attention output values.
+            import flash_attn as _fa  # type: ignore
+
+            _orig_fa_func = _fa.flash_attn_func
+            _orig_fa_varlen = getattr(_fa, "flash_attn_varlen_func", None)
+
+            def _fa_stub(q, k, v, *args, **kwargs):
+                # flash_attn_func returns (attn_output, [softmax_lse, ...]) or
+                # just attn_output depending on `return_attn_probs`. Use the
+                # simple-output path; export's dummy forward sets no extra
+                # flags, so a single zero tensor suffices.
+                return torch.zeros_like(q)
+
+            def _fa_varlen_stub(q, k, v, *args, **kwargs):
+                return torch.zeros_like(q)
+
+            _fa.flash_attn_func = _fa_stub
+            if _orig_fa_varlen is not None:
+                _fa.flash_attn_varlen_func = _fa_varlen_stub
+
+            # Modelopt's modeling-cache may have already imported
+            # `flash_attn_func` directly into the trust_remote_code module
+            # namespace. Patch those copies too.
+            import sys as _sys
+
+            _patched_modules: List[Tuple[Any, str, Any]] = []
+            for _mod_name, _mod in list(_sys.modules.items()):
+                if _mod is None:
+                    continue
+                for _attr in ("flash_attn_func", "flash_attn_varlen_func"):
+                    if hasattr(_mod, _attr) and getattr(_mod, _attr) in (
+                        _orig_fa_func,
+                        _orig_fa_varlen,
+                    ):
+                        _patched_modules.append((_mod, _attr, getattr(_mod, _attr)))
+                        setattr(
+                            _mod,
+                            _attr,
+                            _fa_stub if _attr == "flash_attn_func" else _fa_varlen_stub,
+                        )
+
+            try:
+                dst.mkdir(parents=True, exist_ok=True)
+                # save_modelopt_state=False keeps the directory drop-in for sglang's
+                # modelopt_fp4 loader; modelopt's own state is not needed at serve time.
+                export_hf_checkpoint(
+                    model, export_dir=str(dst), save_modelopt_state=False
+                )
+            finally:
+                _fa.flash_attn_func = _orig_fa_func
+                if _orig_fa_varlen is not None:
+                    _fa.flash_attn_varlen_func = _orig_fa_varlen
+                for _mod, _attr, _orig in _patched_modules:
+                    setattr(_mod, _attr, _orig)
         finally:
             _FOS_ACTIVE["on"] = False
             if fos_restore is not None:
