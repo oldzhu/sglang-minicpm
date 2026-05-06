@@ -1513,13 +1513,116 @@ def run_nvfp4_quantization(
                 _FOS_ACTIVE["on"] = True
                 print("[preprocess] NVFP4 FourOverSix activating for export", flush=True)
 
+            # ------------------------------------------------------------------
+            # Streaming-export monkey-patch (Plan-A2).
+            #
+            # Empirically, modelopt's `_process_quantized_modules` runs
+            # `_export_quantized_weight` per Linear, and across ~560 quantized
+            # Linears in MiniCPM-SALA the GPU allocator grows from 38 GiB to
+            # 82 GiB (+44 GiB / +80 MiB per Linear) before OOMing. The fp16
+            # original is replaced with a uint8-packed Parameter via setattr,
+            # but the old fp16 storage is held alive long enough that the
+            # allocator can't reclaim it (per-step `torch.cuda.empty_cache()`
+            # only releases freed blocks, not still-referenced ones). For a
+            # ~14 GiB model with 560 Linears the steady-state never recovers.
+            #
+            # Fix: stream module-by-module through the GPU. Move the whole
+            # model to CPU once (after the fp16 + activation calibration is
+            # done), then for each quantized Linear: lift to CUDA, call the
+            # ORIGINAL `_export_quantized_weight` (FOS scale-selection still
+            # fires inside it), drop back to CPU, empty_cache. Peak GPU usage
+            # during export becomes one Linear (≤200 MiB).
+            #
+            # NOTE: we do NOT patch `requantize_resmooth_fused_llm_layers`.
+            # That step needs a CUDA dummy forward (Triton fla kernels). It
+            # runs once before our patched `_process_quantized_modules`, so
+            # the model is still on CUDA at that moment.
+            # ------------------------------------------------------------------
+            from modelopt.torch.export import unified_export_hf as _ue
+
+            _orig_pqm = _ue._process_quantized_modules
+
+            def _streaming_process_quantized_modules(
+                model, dtype, is_modelopt_qlora=False
+            ):
+                import gc as __gc
+
+                print("[preprocess] NVFP4 streaming export: moving model to CPU", flush=True)
+                model.to("cpu")
+                __gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    try:
+                        free_b, total_b = torch.cuda.mem_get_info()
+                        print(
+                            f"[preprocess] NVFP4 streaming-export start "
+                            f"free={free_b / 1024**3:.2f} GiB / total={total_b / 1024**3:.2f} GiB",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
+
+                processed = 0
+                for name, sub_module in model.named_modules():
+                    if is_modelopt_qlora and hasattr(sub_module, "base_layer"):
+                        continue
+                    if hasattr(sub_module, "weight_packed") or (
+                        "QuantFP8Linear" in type(sub_module).__name__
+                        and getattr(sub_module, "weight", None) is not None
+                        and sub_module.weight.element_size() <= 1
+                    ):
+                        sub_module.unpack_weight()
+                    if _ue.get_quantization_format(sub_module) == _ue.QUANTIZATION_NONE:
+                        continue
+                    if not _ue.is_quantlinear(sub_module):
+                        # Llama4TextExperts / GptOssExperts not used by MiniCPM-SALA.
+                        # Fall back to original handling for safety.
+                        try:
+                            _orig_pqm(sub_module, dtype, is_modelopt_qlora)
+                        except Exception as _e:
+                            print(
+                                f"[preprocess] NVFP4 streaming-export: fallback for "
+                                f"{name} ({type(sub_module).__name__}) raised: {_e}",
+                                flush=True,
+                            )
+                            raise
+                        continue
+                    sub_module.to("cuda")
+                    try:
+                        _ue._export_quantized_weight(sub_module, dtype)
+                    finally:
+                        sub_module.to("cpu")
+                        __gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    processed += 1
+                    if processed % 50 == 0:
+                        try:
+                            free_b, _ = torch.cuda.mem_get_info()
+                            print(
+                                f"[preprocess] NVFP4 streaming-export {processed} linears done; "
+                                f"free={free_b / 1024**3:.2f} GiB",
+                                flush=True,
+                            )
+                        except Exception:
+                            pass
+                print(
+                    f"[preprocess] NVFP4 streaming-export complete: {processed} linears",
+                    flush=True,
+                )
+
+            _ue._process_quantized_modules = _streaming_process_quantized_modules
+
             print("[preprocess] NVFP4 calling export_hf_checkpoint", flush=True)
             dst.mkdir(parents=True, exist_ok=True)
-            # save_modelopt_state=False keeps the directory drop-in for sglang's
-            # modelopt_fp4 loader; modelopt's own state is not needed at serve time.
-            export_hf_checkpoint(
-                model, export_dir=str(dst), save_modelopt_state=False
-            )
+            try:
+                # save_modelopt_state=False keeps the directory drop-in for sglang's
+                # modelopt_fp4 loader; modelopt's own state is not needed at serve time.
+                export_hf_checkpoint(
+                    model, export_dir=str(dst), save_modelopt_state=False
+                )
+            finally:
+                _ue._process_quantized_modules = _orig_pqm
             print("[preprocess] NVFP4 export_hf_checkpoint done", flush=True)
             if torch.cuda.is_available():
                 try:
