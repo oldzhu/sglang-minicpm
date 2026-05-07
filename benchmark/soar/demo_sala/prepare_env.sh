@@ -44,6 +44,18 @@ esac
 # differ.
 if [[ "$SOAR_QUANT_PROFILE" == "nvfp4_fos" ]]; then
 	export SOAR_NVFP4_FOUR_OVER_SIX="${SOAR_NVFP4_FOUR_OVER_SIX:-1}"
+	# Phase B iter 2: longer calibration context for long-context model.
+	# Default in preprocess_model.py is 4096 — too short to exercise
+	# attention activation distribution on 32k–128k samples. Bump to 16384.
+	export SOAR_NVFP4_MAX_CALIB_SEQ_LEN="${SOAR_NVFP4_MAX_CALIB_SEQ_LEN:-16384}"
+	# Phase B iter 2: switch to conservative scheduling (Test 12 family)
+	# to eliminate the run-to-run accuracy variance observed in iter 1
+	# (75.98% vs 70.27% on the same ckpt — runaway-think on mcq under
+	# aggressive scheduling). chunk=32K, prefill-max-req=1, sched-cons=1.0,
+	# torch-compile-max-bs=8. Note: this overrides the default
+	# SOAR_TIER1_LONG_CONTEXT=1 set above.
+	export SOAR_TIER1_LONG_CONTEXT=0
+	export SOAR_TORCH_COMPILE_MAX_BS="${SOAR_TORCH_COMPILE_MAX_BS:-8}"
 fi
 # Note: SOAR_QUANT_MODE is intentionally left at its default "gptq" even when
 # profile is nvfp4* \u2014 that way the gptq server-arg branch below still fires
