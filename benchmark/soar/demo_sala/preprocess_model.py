@@ -601,6 +601,109 @@ def _clear_minicpm_default_rope_state(config: Any) -> List[str]:
     return changes
 
 
+# ---------------------------------------------------------------------------
+# OpenBMB MiniCPM-SALA upstream PR #10 (commit f28de5e4) — _init_rope fix for
+# transformers>=4.43 / 5.x compatibility.  The shipped modeling_minicpm_sala.py
+# crashes on load with:
+#     ValueError: Unknown RoPE scaling type default
+# because newer transformers auto-fills missing rope_scaling to
+# {"rope_type": "default", "factor": 1.0}.  The upstream fix treats
+# None/"default" as no-scaling and accepts both legacy "type" and new
+# "rope_type" keys.  This in-place patcher applies the same edit to the
+# shipped trust_remote_code file in the model directory so it is correct at
+# both quant time and runtime serving time.
+# ---------------------------------------------------------------------------
+_INIT_ROPE_PATCH_MARKER = "transformers>=4.43 standardizes rope_scaling"
+
+_INIT_ROPE_OLD_HEADER = (
+    "    def _init_rope(self):\n"
+    "        if self.config.rope_scaling is None:\n"
+)
+
+_INIT_ROPE_NEW_HEADER = (
+    "    def _init_rope(self):\n"
+    "        # transformers>=4.43 standardizes rope_scaling: a missing/None\n"
+    "        # rope_scaling is auto-filled to {\"rope_type\": \"default\", \"factor\": 1.0}\n"
+    "        # at config-load time. Treat both the original None case and the\n"
+    "        # standardized \"default\" as no scaling so loading does not raise on\n"
+    "        # newer transformers releases.\n"
+    "        rope_scaling = self.config.rope_scaling\n"
+    "        scaling_type = None\n"
+    "        if isinstance(rope_scaling, dict):\n"
+    "            scaling_type = rope_scaling.get(\"type\") or rope_scaling.get(\"rope_type\")\n"
+    "        if rope_scaling is None or scaling_type in (None, \"default\"):\n"
+)
+
+_INIT_ROPE_OLD_ELSE = (
+    "        else:\n"
+    "            scaling_type = self.config.rope_scaling[\"rope_type\"]\n"
+    "            scaling_factor = self.config.rope_scaling.get(\"factor\", None)\n"
+)
+
+_INIT_ROPE_NEW_ELSE = (
+    "        else:\n"
+    "            scaling_factor = rope_scaling.get(\"factor\", None)\n"
+)
+
+
+def _patch_modeling_init_rope_inplace(model_dir: Path, label: str) -> None:
+    """Apply OpenBMB PR #10 _init_rope fix in-place to modeling_minicpm_sala.py.
+
+    Idempotent: skipped if marker comment already present, or if the file
+    does not exist (model uses bundled implementation).
+    """
+    target = model_dir / "modeling_minicpm_sala.py"
+    if not target.exists():
+        print(f"[preprocess][init-rope-patch] {label}: {target} not found; skip")
+        return
+
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"[preprocess][init-rope-patch] {label}: cannot read {target}: {exc}; skip")
+        return
+
+    if _INIT_ROPE_PATCH_MARKER in text:
+        print(f"[preprocess][init-rope-patch] {label}: {target} already patched; skip")
+        return
+
+    header_count = text.count(_INIT_ROPE_OLD_HEADER)
+    else_count = text.count(_INIT_ROPE_OLD_ELSE)
+    if header_count == 0 or else_count == 0:
+        print(
+            f"[preprocess][init-rope-patch] {label}: expected patterns not found in {target} "
+            f"(header_count={header_count}, else_count={else_count}); skip"
+        )
+        return
+
+    patched = text.replace(_INIT_ROPE_OLD_HEADER, _INIT_ROPE_NEW_HEADER)
+    patched = patched.replace(_INIT_ROPE_OLD_ELSE, _INIT_ROPE_NEW_ELSE)
+    # Convert remaining self.config.rope_scaling[...] subscript accesses (only
+    # reachable inside the LongRoPE branch of both _init_rope methods) to use
+    # the new local var.  All other references to self.config.rope_scaling in
+    # the file are method-call style (.get(...)) or top-level attribute reads
+    # untouched by this rewrite; the bracket-subscript form only appears in
+    # _init_rope.
+    patched = patched.replace(
+        "self.config.rope_scaling[", "rope_scaling["
+    )
+
+    if patched == text:
+        print(f"[preprocess][init-rope-patch] {label}: no changes computed for {target}; skip")
+        return
+
+    try:
+        target.write_text(patched, encoding="utf-8")
+    except OSError as exc:
+        print(f"[preprocess][init-rope-patch] {label}: cannot write {target}: {exc}; skip")
+        return
+
+    print(
+        f"[preprocess][init-rope-patch] {label}: patched {target} "
+        f"(replaced {header_count} _init_rope headers, {else_count} else-branches)"
+    )
+
+
 def _print_dependency_versions(prefix: str) -> None:
     import gptqmodel
     import transformers
@@ -2105,6 +2208,7 @@ def main() -> None:
             batch_size=args.gptq_batch_size,
         )
         _patch_chat_template_for_mcq(dst)
+        _patch_modeling_init_rope_inplace(dst, label=f"mode={mode} dst")
         print(f"[preprocess] mode={mode} done - quantized model saved to {dst}")
         return
 
@@ -2129,11 +2233,13 @@ def main() -> None:
             _sys.stderr.flush()
             raise
         _patch_chat_template_for_mcq(dst)
+        _patch_modeling_init_rope_inplace(dst, label=f"mode={mode} dst")
         print(f"[preprocess] mode={mode} done - NVFP4 model saved to {dst}")
         return
 
     count = copy_model(src, dst)
     _patch_chat_template_for_mcq(dst)
+    _patch_modeling_init_rope_inplace(dst, label=f"mode={mode} dst")
 
     print(f"[preprocess] mode={mode} done - copied {count} files from {src} to {dst}")
 
