@@ -54,7 +54,11 @@ if [[ "$SOAR_QUANT_PROFILE" == "nvfp4_fos" ]]; then
 	# aggressive scheduling). chunk=32K, prefill-max-req=1, sched-cons=1.0,
 	# torch-compile-max-bs=8. Note: this overrides the default
 	# SOAR_TIER1_LONG_CONTEXT=1 set above.
-	export SOAR_TIER1_LONG_CONTEXT=0
+	# Iter 3 (NVFP4-FOS-3): respect caller-provided SOAR_TIER1_LONG_CONTEXT so we
+	# can A/B iter-1 scheduling (Tier1, tcmb=24) against iter-2 (conservative,
+	# tcmb=8) on the SAME ckpt to isolate scheduling vs calibration as the
+	# variance source.
+	export SOAR_TIER1_LONG_CONTEXT="${SOAR_TIER1_LONG_CONTEXT:-0}"
 	export SOAR_TORCH_COMPILE_MAX_BS="${SOAR_TORCH_COMPILE_MAX_BS:-8}"
 fi
 # Note: SOAR_QUANT_MODE is intentionally left at its default "gptq" even when
