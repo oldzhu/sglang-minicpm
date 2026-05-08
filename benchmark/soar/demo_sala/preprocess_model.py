@@ -1885,8 +1885,13 @@ def run_nvfp4_quantization(
             # AutoTokenizer.from_pretrained(dst) fails with
             #   "Unrecognized configuration class ...MiniCPMSALAConfig...".
             # Persist the tokenizer files so the NVFP4 dst is self-contained.
+            # Note: the calibration tokenizer was `del`-ed earlier (to release
+            # the closure pinning calibration_texts), so we re-load from src.
             try:
-                tokenizer.save_pretrained(str(dst))
+                _tok_for_save = AutoTokenizer.from_pretrained(
+                    str(src), trust_remote_code=trust_remote_code
+                )
+                _tok_for_save.save_pretrained(str(dst))
                 print(
                     "[preprocess] NVFP4 tokenizer.save_pretrained complete",
                     flush=True,
