@@ -1880,6 +1880,25 @@ def run_nvfp4_quantization(
             with open(_cfg_path, "w") as _f:
                 json.dump(_cfg, _f, indent=4)
 
+            # CHANGE_0151_004 (iter-5 follow-up Option C): the streaming-export
+            # path above does not save tokenizer files. Without these, sglang's
+            # AutoTokenizer.from_pretrained(dst) fails with
+            #   "Unrecognized configuration class ...MiniCPMSALAConfig...".
+            # Persist the tokenizer files so the NVFP4 dst is self-contained.
+            try:
+                tokenizer.save_pretrained(str(dst))
+                print(
+                    "[preprocess] NVFP4 tokenizer.save_pretrained complete",
+                    flush=True,
+                )
+            except Exception as _tok_exc:
+                print(
+                    f"[preprocess] NVFP4 tokenizer.save_pretrained FAILED: "
+                    f"{_tok_exc!r}",
+                    flush=True,
+                )
+                raise
+
             print("[preprocess] NVFP4 manual export complete", flush=True)
             if torch.cuda.is_available():
                 try:
