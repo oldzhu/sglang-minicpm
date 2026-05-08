@@ -138,25 +138,34 @@ def step_sync(base_url, token):
 
     # Diff against the pre-pull SHA so we see every file changed across ALL
     # commits that were just pulled, not only the most recent commit.
-    if pre_sha and post_sha and pre_sha != post_sha and len(pre_sha) >= 7:
+    if pre_sha and post_sha and pre_sha == post_sha and len(pre_sha) >= 7:
+        # No new commits pulled — nothing to copy from remote.
+        print("[changed files]\n(no new commits)")
+        changed = ""
+    elif pre_sha and post_sha and pre_sha != post_sha and len(pre_sha) >= 7:
         diff_cmd = (
             f"cd /root/sglang-minicpm && "
             f"git diff --name-only {pre_sha} {post_sha} 2>/dev/null || echo 'DIFF_FAILED'"
         )
+        _, changed = fcloud_run(base_url, token, diff_cmd, timeout=30)
+        print(f"[changed files]\n{changed}")
     else:
         # No pull advance — still compute last-commit diff as a safety net
         diff_cmd = (
             "cd /root/sglang-minicpm && "
             "git diff --name-only HEAD~1 HEAD 2>/dev/null || echo 'DIFF_FAILED'"
         )
+        _, changed = fcloud_run(base_url, token, diff_cmd, timeout=30)
+        print(f"[changed files]\n{changed}")
 
-    _, changed = fcloud_run(base_url, token, diff_cmd, timeout=30)
-    print(f"[changed files]\n{changed}")
-
-    if "DIFF_FAILED" in changed or not changed.strip():
+    if "DIFF_FAILED" in changed:
         print("[sync] Could not determine changed files via diff; falling back to "
               "force-copy of python/ and benchmark/soar/demo_sala/ trees")
         changed_files = None  # sentinel for fallback
+    elif not changed.strip():
+        # No new commits and no changed files — skip copy and sgl-kernel build.
+        print("[sync] No remote changes — nothing to copy.")
+        changed_files = []
     else:
         changed_files = [f.strip() for f in changed.strip().split("\n") if f.strip()]
 
@@ -528,39 +537,24 @@ def step_setup(base_url, token, skip_existing=True):
             _setup_incremental_sync(base_url, token)
             return
 
-    # Step 2: Upload repo tarball (faster than git clone on slow networks)
+    # Step 2: Git clone the public mirror so that future `sync` runs can use
+    # `git pull` to fetch the latest commits we pushed to minicpm-src. Earlier
+    # versions of this script uploaded a tarball without .git which made the
+    # instance repo non-syncable (force-copy fallback) — see CHANGE_0151
+    # iter-4 chat log for the failure mode.
+    REPO_URL = "https://github.com/oldzhu/sglang-minicpm.git"
+    REPO_BRANCH = "mixed_minicpm_cudagraph"
     if needs_repo:
-        print("[setup] Step 2: Uploading repo tarball...")
-        # Create a minimal tarball of needed files
-        import subprocess, tempfile
-        repo_tar = os.path.join(tempfile.gettempdir(), "sglang-minicpm-repo.tar.gz")
-        print(f"  Creating tarball from {LOCAL_REPO_ROOT}...")
-        subprocess.run(
-            ["tar", "czf", repo_tar,
-             "--exclude=*.tar", "--exclude=*.tar.gz",
-             "--exclude=.git", "--exclude=test", "--exclude=docs",
-             "--exclude=3rdparty", "--exclude=sgl-kernel/benchmark",
-             "--exclude=sgl-kernel/tests",
-             "python/", "benchmark/soar/demo_sala/", "scripts/fcloud/"],
-            cwd=LOCAL_REPO_ROOT, check=True,
-        )
-        tar_size = os.path.getsize(repo_tar)
-        print(f"  Tarball size: {tar_size / 1024 / 1024:.1f} MB")
-        # Clean up any partial clone first
+        print(f"[setup] Step 2: Cloning {REPO_URL} (branch={REPO_BRANCH}) ...")
+        # Clean up any partial path first
         fcloud_run(base_url, token, "rm -rf /root/sglang-minicpm 2>/dev/null; true", timeout=30)
-        ok = fcloud_exec.upload_file(base_url, token, repo_tar, "/root/sglang-minicpm-repo.tar.gz")
-        if not ok:
-            print("  ERROR: Repo tarball upload failed")
-            return
-        print("[setup]   Extracting...")
         _, out = fcloud_run(
             base_url, token,
-            "mkdir -p /root/sglang-minicpm && cd /root/sglang-minicpm && "
-            "tar xzf /root/sglang-minicpm-repo.tar.gz && rm -f /root/sglang-minicpm-repo.tar.gz && echo OK",
-            timeout=120,
+            f"git clone --depth 1 --branch {REPO_BRANCH} {REPO_URL} /root/sglang-minicpm 2>&1 | tail -10 && "
+            f"cd /root/sglang-minicpm && git rev-parse HEAD",
+            timeout=600,
         )
         print(f"  {out}")
-        os.unlink(repo_tar)
     else:
         print("[setup] Step 2: Repo exists, syncing latest files...")
         _setup_incremental_sync(base_url, token)

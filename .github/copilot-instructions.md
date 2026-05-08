@@ -277,7 +277,13 @@ python3 scripts/fcloud/fcloud_workflow.py setup --force   # re-setup everything
 
 **What setup does** (7 steps):
 1. Check if `/root/sglang-minicpm`, `/root/submission_sim`, `/root/data` exist — skip if yes
-2. `git clone https://github.com/oldzhu/sglang-minicpm.git /root/sglang-minicpm`
+2. `git clone --depth 1 --branch mixed_minicpm_cudagraph https://github.com/oldzhu/sglang-minicpm.git /root/sglang-minicpm` — **must be a real git clone** (not a tarball extract) so that `fcloud_workflow.py sync` can `git pull` newly-pushed commits. Earlier versions of the script uploaded a tarball without `.git`, which silently broke `sync` (force-copy fallback only). If a future re-setup ever leaves `/root/sglang-minicpm` without a `.git` directory, replace it manually:
+   ```bash
+   python3 scripts/fcloud/fcloud_exec.py exec \
+     'rm -rf /root/sglang-minicpm && \
+      git clone --depth 1 --branch mixed_minicpm_cudagraph \
+        https://github.com/oldzhu/sglang-minicpm.git /root/sglang-minicpm'
+   ```
 3. Upload `submission_sim.tar` to instance, extract to `/root/submission_sim`
 4. Copy all files under `/root/sglang-minicpm/python/` to `/root/submission_sim/sglang/python/`
 5. Sync `gptqmodel_minicpm_sala.py`, `preprocess_model.py`, `prepare_env.sh`, `prepare_model.sh`, `perf_public_set.jsonl` from `/root/sglang-minicpm/benchmark/soar/demo_sala/` to `/root/submission_sim/`
