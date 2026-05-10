@@ -424,6 +424,10 @@ class ServerArgs:
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
+    # SOAR 2026 — Medusa Phase R1 (MiniCPM-SALA). Number of Medusa heads K.
+    # R1 default K=1 gives a chain (no tree fan-out) for the smallest blast
+    # radius. See CHANGE_0153_medusa_phase_r1_design.
+    speculative_num_medusa_heads: int = 1
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -2213,6 +2217,38 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+        # SOAR 2026 — Medusa Phase R1 post-init (MiniCPM-SALA, CHANGE_0153).
+        # Mirrors NGRAM in disabling features known to clash with verify-tree;
+        # R1b will refine these once the worker is functional.
+        if self.speculative_algorithm == "MEDUSA":
+            if not self.device.startswith("cuda"):
+                raise ValueError(
+                    "Medusa speculative decoding currently only supports CUDA device."
+                )
+            if self.max_running_requests is None:
+                self.max_running_requests = 24
+                logger.warning(
+                    "max_running_requests reset to 24 for Medusa speculative decoding. "
+                    "Override with --max-running-requests if needed."
+                )
+            # R1: keep overlap scheduler off; verify-tree path is not overlap-safe yet.
+            self.disable_overlap_schedule = True
+            # R1: mixed-chunk and verify-tree have not been co-validated; disable for safety.
+            self.enable_mixed_chunk = False
+            # R1 default: chain of length K+1 (1 base + K head predictions).
+            if self.speculative_num_draft_tokens is None:
+                self.speculative_num_draft_tokens = self.speculative_num_medusa_heads + 1
+            logger.warning(
+                "Medusa speculative decoding R1: overlap scheduler and mixed chunked prefill "
+                "are disabled; num_draft_tokens=%d (K=%d heads + 1 base).",
+                self.speculative_num_draft_tokens,
+                self.speculative_num_medusa_heads,
+            )
+            if self.enable_dp_attention:
+                raise ValueError(
+                    "Currently Medusa speculative decoding does not support dp attention."
+                )
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -3459,7 +3495,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "MEDUSA"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -3502,6 +3538,15 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-num-medusa-heads",
+            type=int,
+            help=(
+                "SOAR 2026 (MiniCPM-SALA, CHANGE_0153): number of Medusa heads K. "
+                "Only used when --speculative-algorithm MEDUSA. R1 default 1 = chain (no tree fan-out)."
+            ),
+            default=ServerArgs.speculative_num_medusa_heads,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

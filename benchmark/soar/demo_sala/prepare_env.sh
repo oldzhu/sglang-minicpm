@@ -395,6 +395,33 @@ elif [[ "$QUANT_MODE" == "noquant" ]]; then
 	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 32768 --max-prefill-tokens 32768 --prefill-max-requests 1 --max-running-requests 8 --mem-fraction-static 0.78 --schedule-conservativeness 1.0 --kv-cache-dtype fp8_e5m2${FUSED_QK_NORM_ROPE_ARG} --enable-mixed-chunk"
 fi
 
+# === SOAR 2026 Phase R1a (CHANGE_0153): Medusa speculative decoding opt-in.
+# Default 0 → no behavior change vs v22 baseline. When 1, append the
+# verify-tree args. R1a only registers scaffolding (worker raises
+# NotImplementedError until R1b lands), so SOAR_SPEC_MEDUSA=1 will fail loudly
+# on server start until R1b — intentional, so accidental enablement is
+# impossible during normal benchmarks.
+export SOAR_SPEC_MEDUSA="${SOAR_SPEC_MEDUSA:-0}"
+export SOAR_SPEC_MEDUSA_HEADS="${SOAR_SPEC_MEDUSA_HEADS:-1}"
+if [[ "$SOAR_SPEC_MEDUSA" == "1" || "$SOAR_SPEC_MEDUSA" == "true" || "$SOAR_SPEC_MEDUSA" == "TRUE" ]]; then
+	NUM_DRAFT_TOKENS=$(( SOAR_SPEC_MEDUSA_HEADS + 1 ))
+	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS} --speculative-algorithm MEDUSA --speculative-num-medusa-heads ${SOAR_SPEC_MEDUSA_HEADS} --speculative-num-draft-tokens ${NUM_DRAFT_TOKENS}"
+fi
+
+# === SOAR 2026 (RESEARCH_speculative_decoding_survey_001 §5.2): NGRAM opt-in.
+# Free-insurance speculative path; zero training, zero submission size, zero
+# GLA-fork concern (n-gram draft has no recurrent state). Default 0 keeps
+# behavior byte-identical to v22 baseline. Tunable knobs use sglang's existing
+# server-arg defaults; override per-test if needed.
+export SOAR_SPEC_NGRAM="${SOAR_SPEC_NGRAM:-0}"
+if [[ "$SOAR_SPEC_NGRAM" == "1" || "$SOAR_SPEC_NGRAM" == "true" || "$SOAR_SPEC_NGRAM" == "TRUE" ]]; then
+	if [[ "$SOAR_SPEC_MEDUSA" == "1" || "$SOAR_SPEC_MEDUSA" == "true" || "$SOAR_SPEC_MEDUSA" == "TRUE" ]]; then
+		echo "[prepare_env] WARNING: SOAR_SPEC_NGRAM and SOAR_SPEC_MEDUSA both set; using MEDUSA (mutually exclusive in sglang)." >&2
+	else
+		export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS} --speculative-algorithm NGRAM"
+	fi
+fi
+
 # export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --log-level info"
 
 echo "[prepare_env] SOAR_QUANT_PROFILE=${SOAR_QUANT_PROFILE}"
@@ -423,5 +450,8 @@ echo "[prepare_env] SGLANG_FLA_CHUNK_SIZE=${SGLANG_FLA_CHUNK_SIZE}"
 echo "[prepare_env] SOAR_W4A8_FP8_GEMM=${SOAR_W4A8_FP8_GEMM}"
 echo "[prepare_env] SOAR_SPARSE_DENSE_LEN=${SOAR_SPARSE_DENSE_LEN:-<unset>}"
 echo "[prepare_env] SOAR_BACKEND_VARIANT=${SOAR_BACKEND_VARIANT:-<unset>}"
+echo "[prepare_env] SOAR_SPEC_MEDUSA=${SOAR_SPEC_MEDUSA}"
+echo "[prepare_env] SOAR_SPEC_MEDUSA_HEADS=${SOAR_SPEC_MEDUSA_HEADS}"
+echo "[prepare_env] SOAR_SPEC_NGRAM=${SOAR_SPEC_NGRAM}"
 echo "[prepare_env] SGLANG_SERVER_ARGS=${SGLANG_SERVER_ARGS}"
 echo "[prepare_env] done"

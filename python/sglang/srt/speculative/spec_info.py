@@ -18,6 +18,10 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    # SOAR 2026 — Medusa speculative decoding for MiniCPM-SALA (Phase R1).
+    # Heads attached to the main model's last hidden state; no separate draft
+    # model. See CHANGE_0153_medusa_phase_r1_design.{en,zh}.md.
+    MEDUSA = auto()
     NONE = auto()
 
     @classmethod
@@ -44,6 +48,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
+
+    def is_medusa(self) -> bool:
+        return self == SpeculativeAlgorithm.MEDUSA
 
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
@@ -83,6 +90,18 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+        elif self.is_medusa():
+            # Phase R1a registers the worker class so server_args validation
+            # and worker dispatch succeed. The actual forward_batch_generation
+            # implementation lands in Phase R1b (state-scatter + tree verify).
+            if enable_overlap:
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap worker creation."
+                )
+
+            from sglang.srt.speculative.medusa_worker import MedusaWorker
+
+            return MedusaWorker
 
         raise ValueError("Unreachable code path in create_worker.")
 
@@ -93,6 +112,9 @@ class SpecInputType(IntEnum):
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
     NGRAM_VERIFY = auto()
+    # SOAR 2026 — Medusa (MiniCPM-SALA Phase R1). Verify-only; heads are not a
+    # separate draft model so no MEDUSA_DRAFT counterpart is needed.
+    MEDUSA_VERIFY = auto()
 
 
 class SpecInput(ABC):
@@ -108,6 +130,7 @@ class SpecInput(ABC):
         return self.spec_input_type in {
             SpecInputType.EAGLE_VERIFY,
             SpecInputType.NGRAM_VERIFY,
+            SpecInputType.MEDUSA_VERIFY,
         }
 
     @abstractmethod
