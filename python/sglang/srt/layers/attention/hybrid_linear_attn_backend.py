@@ -1580,6 +1580,86 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
             return
         layer_cache.temporal[mamba_indices, :] = final_state
 
+    # ------------------------------------------------------------------
+    # SOAR 2026 Medusa Phase R1b (CHANGE_0153 / CHANGE_0154).
+    #
+    # SimpleGLA stores recurrent state IN-PLACE per layer. When a speculative
+    # TARGET_VERIFY forward runs K+1 tokens but only `accept_len < K+1` are
+    # accepted, the state is over-advanced and must be rewound before the
+    # next step. Unlike Mamba2 which has an intermediate-step buffer
+    # (`intermediate_ssm[layer, req, step, :]`) and a dedicated scatter
+    # (`update_mamba_state_after_mtp_verify`), SimpleGLA has no per-step
+    # buffer.
+    #
+    # R1b strategy: snapshot the active rows of `layer_cache.temporal` for
+    # all GLA layers BEFORE the verify forward; if any request has a
+    # partial-accept after verify, restore the snapshot and re-run an extend
+    # forward of length `accept_len` to advance state correctly. The
+    # snapshot footprint is `num_gla_layers * bs * state_dim * dtype` which
+    # at MiniCPM-SALA 24 GLA layers, bs=24 is bounded (state_dim is small
+    # for GLA = head_v_dim per token, not head_v_dim**2).
+    #
+    # These helpers are NO-OPS unless `snapshot_state_for_spec()` has been
+    # called this step; the default decode/extend path is unaffected.
+    # ------------------------------------------------------------------
+
+    def snapshot_state_for_spec(self, mamba_indices: torch.Tensor) -> None:
+        """Take an in-memory snapshot of the active GLA states across all layers.
+
+        Called by `MedusaWorker.forward_batch_generation` immediately before
+        the TARGET_VERIFY target-model forward. Stores one cloned slice per
+        layer keyed by `layer_id`.
+
+        Args:
+            mamba_indices: int32/int64 tensor of cache row indices for the
+                requests in the current batch. Same shape/order as the batch's
+                `req_pool_indices` mapping for active GLA rows.
+        """
+        if mamba_indices is None or mamba_indices.numel() == 0:
+            self._spec_state_snapshot = None
+            self._spec_snapshot_indices = None
+            return
+        snapshot = {}
+        gather_idx = mamba_indices.to(dtype=torch.int64)
+        for layer_id in self.layer_cache_indices.keys():
+            layer_cache = self._get_layer_cache(layer_id)
+            # `index_select` produces a contiguous clone — safe to keep across
+            # the verify forward which writes back into `layer_cache.temporal`.
+            snapshot[layer_id] = torch.index_select(
+                layer_cache.temporal, 0, gather_idx
+            ).clone()
+        self._spec_state_snapshot = snapshot
+        self._spec_snapshot_indices = gather_idx
+
+    def restore_state_for_spec(self) -> None:
+        """Restore the snapshot taken by `snapshot_state_for_spec`.
+
+        Called by `MedusaWorker.forward_batch_generation` after the verify
+        forward if any request had `accept_len < num_draft_tokens`. After
+        restore, the caller must re-run an extend forward over the accepted
+        prefix tokens to re-advance state to the correct position.
+
+        Clears the snapshot after restoring; idempotent if called twice.
+        """
+        snapshot = getattr(self, "_spec_state_snapshot", None)
+        if snapshot is None:
+            return
+        scatter_idx = self._spec_snapshot_indices
+        for layer_id, saved in snapshot.items():
+            layer_cache = self._get_layer_cache(layer_id)
+            layer_cache.temporal.index_copy_(0, scatter_idx, saved)
+        self._spec_state_snapshot = None
+        self._spec_snapshot_indices = None
+
+    def clear_state_snapshot_for_spec(self) -> None:
+        """Discard any held snapshot without restoring.
+
+        Called when all requests in the batch had `accept_len == num_draft_tokens`
+        (perfect speculation) — the live state is already correct.
+        """
+        self._spec_state_snapshot = None
+        self._spec_snapshot_indices = None
+
     def _select_mode(self, forward_batch: ForwardBatch) -> str:
         if forward_batch.forward_mode.is_decode():
             return "fused_recurrent"
