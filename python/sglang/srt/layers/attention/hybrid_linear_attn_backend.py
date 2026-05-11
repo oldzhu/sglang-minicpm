@@ -1668,6 +1668,13 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
     def _select_mode(self, forward_batch: ForwardBatch) -> str:
         if forward_batch.forward_mode.is_decode():
             return "fused_recurrent"
+        # SOAR 2026 / Medusa Stage 3: target-verify forwards (spec-v1) reuse the
+        # decode-shaped cuda-graph buckets. During capture, `extend_seq_lens` is
+        # not populated (only `seq_lens` is). Each request only carries
+        # `draft_token_num` tokens (<=12 for NGRAM, K+1 for Medusa), which is
+        # well below `recurrent_threshold` (>=64), so fused_recurrent is correct.
+        if forward_batch.extend_seq_lens is None:
+            return "fused_recurrent"
         seq_len = int(torch.max(forward_batch.extend_seq_lens).item())
         if seq_len < self.recurrent_threshold:
             return "fused_recurrent"
