@@ -146,7 +146,28 @@ class MedusaWorker:
         ``capture_hidden_mode``. The output is therefore byte-identical to
         running the server with ``--speculative-algorithm NONE``.
         """
+        # Stage 2 debug: log the incoming batch state to diagnose
+        # "forward_decode called on prefill" mismatch.
+        logger.info(
+            "[MedusaWorker.fbg] batch.forward_mode=%s batch_size=%s "
+            "input_ids_len=%s seq_lens=%s extend_num_tokens=%s "
+            "spec_algorithm=%s spec_info=%s",
+            batch.forward_mode,
+            batch.batch_size(),
+            int(batch.input_ids.numel()) if batch.input_ids is not None else None,
+            batch.seq_lens.tolist() if batch.seq_lens is not None else None,
+            batch.extend_num_tokens,
+            batch.spec_algorithm,
+            type(batch.spec_info).__name__ if batch.spec_info is not None else None,
+        )
         model_worker_batch = batch.get_model_worker_batch()
+        logger.info(
+            "[MedusaWorker.fbg] mwb.forward_mode=%s mwb.input_ids_len=%s "
+            "mwb.spec_algorithm=%s",
+            model_worker_batch.forward_mode,
+            int(model_worker_batch.input_ids.numel()),
+            model_worker_batch.spec_algorithm,
+        )
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
 
         return GenerationBatchResult(
