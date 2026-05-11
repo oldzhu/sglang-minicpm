@@ -395,13 +395,16 @@ elif [[ "$QUANT_MODE" == "noquant" ]]; then
 	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 32768 --max-prefill-tokens 32768 --prefill-max-requests 1 --max-running-requests 8 --mem-fraction-static 0.78 --schedule-conservativeness 1.0 --kv-cache-dtype fp8_e5m2${FUSED_QK_NORM_ROPE_ARG} --enable-mixed-chunk"
 fi
 
-# === SOAR 2026 Phase R1a (CHANGE_0153): Medusa speculative decoding opt-in.
-# Default 0 → no behavior change vs v22 baseline. When 1, append the
-# verify-tree args. R1a only registers scaffolding (worker raises
-# NotImplementedError until R1b lands), so SOAR_SPEC_MEDUSA=1 will fail loudly
-# on server start until R1b — intentional, so accidental enablement is
-# impossible during normal benchmarks.
-export SOAR_SPEC_MEDUSA="${SOAR_SPEC_MEDUSA:-0}"
+# === SOAR 2026 Phase R1b Stage 2 (CHANGE_0155): Medusa speculative decoding.
+# Default 1 for v23-medusa-passthrough submission: exercises MedusaWorker
+# pass-through on official hardware to de-risk Stage 3 infrastructure
+# (spec launch args accepted, cuda-graph capture across 16 buckets with
+# spec enabled, worker pass-through compatible with eval harness).
+# MedusaWorker.forward_batch_generation permanently flips
+# batch.spec_algorithm = NONE before get_model_worker_batch(), so runtime
+# behavior is bit-equivalent to v22 baseline; expected score ≈ v22.
+# Set SOAR_SPEC_MEDUSA=0 to fall back to the pure v22 path.
+export SOAR_SPEC_MEDUSA="${SOAR_SPEC_MEDUSA:-1}"
 export SOAR_SPEC_MEDUSA_HEADS="${SOAR_SPEC_MEDUSA_HEADS:-1}"
 if [[ "$SOAR_SPEC_MEDUSA" == "1" || "$SOAR_SPEC_MEDUSA" == "true" || "$SOAR_SPEC_MEDUSA" == "TRUE" ]]; then
 	NUM_DRAFT_TOKENS=$(( SOAR_SPEC_MEDUSA_HEADS + 1 ))
