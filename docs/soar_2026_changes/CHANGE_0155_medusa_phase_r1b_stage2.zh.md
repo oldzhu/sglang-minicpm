@@ -293,3 +293,61 @@ if batch.forward_mode.is_decode():
 - [CHANGE_0153_medusa_phase_r1_design.zh.md](CHANGE_0153_medusa_phase_r1_design.zh.md)
 - [CHANGE_0154_medusa_phase_r1b_design.zh.md](CHANGE_0154_medusa_phase_r1b_design.zh.md)
 - 参考实现:[ngram_worker.py L213](../../python/sglang/srt/speculative/ngram_worker.py#L213)(forward_batch_generation 模式)
+
+## 12. Stage 2 fcloud 启动补丁 #3 — decode 死循环 / output_ids 永不追加（2026-05-11）
+
+**补丁 #2 之后重测**消除了崩溃，却暴露出更严重的问题：
+**所有 decode 永不停止**。warmup 请求（`max_new_tokens=30`）生成了
+**28000+ tokens**，吞吐约 85 tok/s，只有手动杀掉 scheduler 才会停下来。
+
+**根因。** scheduler 侧另一个针对 `spec_algorithm` 的分支：
+[scheduler_output_processor_mixin.py L398-L405](../../python/sglang/srt/managers/scheduler_output_processor_mixin.py#L398-L405)
+
+```python
+if batch.spec_algorithm.is_none():
+    req.output_ids.append(next_token_id)
+elif batch.is_spec_v2:
+    req.output_ids.extend(next_token_id)
+    new_accepted_len = len(next_token_id)
+# 否则：什么都不做 —— req.output_ids 永远不会被追加
+```
+
+Medusa v1 既不满足 `is_none()`，也不满足 `is_spec_v2`，因此
+`req.output_ids` 永远不增长。紧跟其后的
+`req.check_finished(new_accepted_len=1)` 看到的 `len(output_ids)` 始终为零，
+`max_new_tokens` / EOS 检查永远不触发 → 无限解码。
+
+**修复。** Stage 2 是**纯透传**，没有真正的投机活动，因此在
+`MedusaWorker.forward_batch_generation` 入口处**永久**将
+`batch.spec_algorithm` 翻转为 `NONE`。这样：
+
+1. `process_batch_result_decode` 走 `is_none()` 分支 →
+   `req.output_ids.append(next_token_id)` 正确执行 → `check_finished()` 生效。
+2. **下一次迭代** `scheduler.update_running_batch` 调用 `prepare_for_decode`
+   时，`spec_algorithm = NONE`，完整 body 正常运行（首次以后无需手动补做）。
+3. 跳过 `update_spec_metrics`（实际上没有投机活动 —— 跳过是正确的）。
+
+补丁 #2 中的首次 decode 字段补全仍然需要保留，因为 scheduler 在调用我们 worker
+之前就已经用早 return 形式调过一次 `prepare_for_decode`：
+
+```python
+needs_redo_prep = (
+    batch.forward_mode.is_decode() and not batch.spec_algorithm.is_none()
+)
+if not batch.spec_algorithm.is_none():
+    batch.spec_algorithm = SpeculativeAlgorithm.NONE  # 永久翻转
+if needs_redo_prep:
+    batch.prepare_for_decode()  # 补完 scheduler 跳过的工作
+```
+
+**Stage 3 不受影响。** Stage 3 有真正的 draft + verify 循环，会在调用我们 worker
+之前安装自己的 `_prepare_for_speculative_decoding`，将 `forward_mode` 翻转到
+`TARGET_VERIFY`。verify 模式下 `is_decode()` 为 False，`needs_redo_prep` 也为
+False，spec_algorithm 翻转分支也被 `is_none()` 检查跳过（Stage 3 进入时
+`spec_algorithm` 不会是 `NONE`，因为那时会走 Medusa 自己处理 `is_spec_v2`
+或等价机制的路径）。
+
+**本次改动文件（delta #3）。**
+- [python/sglang/srt/speculative/medusa_worker.py](../../python/sglang/srt/speculative/medusa_worker.py)
+  — 入口处永久翻转 `spec_algorithm = NONE`；只有当 prep 被跳过时才在首次 decode
+  补做 `prepare_for_decode`。

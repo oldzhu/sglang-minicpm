@@ -315,3 +315,66 @@ that point. So this Stage 2 patch does not block Stage 3.
 - [python/sglang/srt/speculative/medusa_worker.py](../../python/sglang/srt/speculative/medusa_worker.py)
   — finish the scheduler-skipped `prepare_for_decode` when the batch is in
   decode mode.
+
+## 12. Stage 2 fcloud bring-up addendum #3 — runaway decode / output_ids never appended (2026-05-11)
+
+**Re-test after addendum #2** removed the crash but exposed a worse bug:
+**every decode runs forever**. The warmup request (configured for
+`max_new_tokens=30`) generated **28,000+ tokens** at ~85 tok/s and only
+stopped when the scheduler was killed manually.
+
+**Root cause.** A *second* scheduler-side gate on `spec_algorithm`:
+[scheduler_output_processor_mixin.py L398-L405](../../python/sglang/srt/managers/scheduler_output_processor_mixin.py#L398-L405)
+
+```python
+if batch.spec_algorithm.is_none():
+    req.output_ids.append(next_token_id)
+elif batch.is_spec_v2:
+    req.output_ids.extend(next_token_id)
+    new_accepted_len = len(next_token_id)
+# else: NOTHING — req.output_ids is never appended
+```
+
+Medusa v1 satisfies **neither** `is_none()` **nor** `is_spec_v2`, so
+`req.output_ids` is never grown. The very next line
+`req.check_finished(new_accepted_len=1)` therefore sees `len(output_ids)` stuck
+at zero and never fires `max_new_tokens` / EOS conditions → infinite decode.
+
+**Fix.** Stage 2 is a *pure pass-through* with no real spec activity, so
+we flip `batch.spec_algorithm = NONE` **permanently** on entry to
+`MedusaWorker.forward_batch_generation`. This:
+
+1. Makes `process_batch_result_decode` take the `is_none()` branch →
+   `req.output_ids.append(next_token_id)` runs → `check_finished()` works.
+2. Makes `scheduler.update_running_batch` call `prepare_for_decode` on the
+   **next** iteration with `spec_algorithm = NONE` → full body runs natively
+   (no manual re-run needed for iterations after the first).
+3. Skips `update_spec_metrics` (no spec is actually happening — accurate).
+
+The first-decode prep gap from addendum #2 still needs handling because
+the scheduler already called the early-return form before our worker was
+entered. So we keep the conditional `prepare_for_decode()` re-run for the
+first decode call:
+
+```python
+needs_redo_prep = (
+    batch.forward_mode.is_decode() and not batch.spec_algorithm.is_none()
+)
+if not batch.spec_algorithm.is_none():
+    batch.spec_algorithm = SpeculativeAlgorithm.NONE  # permanent flip
+if needs_redo_prep:
+    batch.prepare_for_decode()  # finish what scheduler skipped
+```
+
+**Why Stage 3 is unaffected.** Stage 3 has a real draft + verify loop. It
+will install its own `_prepare_for_speculative_decoding` that flips
+`forward_mode` to `TARGET_VERIFY` *before* our worker is entered. The
+`is_decode()` gate above is False in verify mode, so `needs_redo_prep` is
+False and the spec_algorithm flip is bypassed by `is_none()` check too
+(it'll never be `NONE` going in because Stage 3 sets up a Medusa-specific
+processing path that respects `is_spec_v2` or equivalent).
+
+**Files touched (delta #3).**
+- [python/sglang/srt/speculative/medusa_worker.py](../../python/sglang/srt/speculative/medusa_worker.py)
+  — flip `spec_algorithm` to NONE permanently on entry; keep first-decode
+  `prepare_for_decode` re-run only when prep was skipped.

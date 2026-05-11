@@ -142,32 +142,43 @@ class MedusaWorker:
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Stage 2: pure passthrough to the target worker.
 
-        We do NOT modify ``batch.forward_mode``, ``batch.spec_info`` or
-        ``capture_hidden_mode``. The output is therefore byte-identical to
-        running the server with ``--speculative-algorithm NONE``.
+        IMPORTANT (Stage 2 bring-up): Two scheduler-side code paths gate on
+        ``batch.spec_algorithm.is_none()`` and break a pure pass-through:
 
-        IMPORTANT (Stage 2 bring-up): ``scheduler.update_running_batch`` calls
-        ``batch.prepare_for_decode()`` before our worker is invoked for a
-        decode step. But ``ScheduleBatch.prepare_for_decode`` early-returns
-        when ``spec_algorithm != NONE`` (schedule_batch.py L1948), because
-        EAGLE/NGRAM workers prepare the decode/verify batch themselves
-        (via ``_prepare_for_speculative_decoding`` → ``prepare_for_verify``).
-        Stage 2 has no draft and no verify — we just want a plain decode.
-        So we finish the skipped prep ourselves by temporarily setting
-        ``spec_algorithm = NONE`` and calling ``prepare_for_decode`` once
-        more (idempotent w.r.t. the already-flipped forward_mode).
+        1. ``ScheduleBatch.prepare_for_decode`` (schedule_batch.py L1948)
+           early-returns when ``spec_algorithm != NONE``, leaving stale
+           prefill ``input_ids``/``seq_lens`` on the batch.
+
+        2. ``Scheduler.process_batch_result_decode``
+           (scheduler_output_processor_mixin.py L400-405) appends
+           ``next_token_id`` to ``req.output_ids`` **only** when
+           ``spec_algorithm.is_none()`` (or ``is_spec_v2``). For Medusa-v1
+           neither branch fires, so ``req.output_ids`` never grows,
+           ``check_finished`` never triggers, and the decode runs forever.
+
+        Stage 2 has no real draft / verify activity, so we flip
+        ``batch.spec_algorithm`` to ``NONE`` permanently for each batch.
+        This makes both paths above behave normally. On the **first** decode
+        the scheduler already ran the early-return form of
+        ``prepare_for_decode``, so we re-run the body ourselves after the
+        flip; on subsequent decodes the scheduler will run the full body
+        natively (because ``spec_algorithm`` is now ``NONE``).
         """
-        if batch.forward_mode.is_decode():
-            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-            saved_spec_algo = batch.spec_algorithm
+        needs_redo_prep = (
+            batch.forward_mode.is_decode() and not batch.spec_algorithm.is_none()
+        )
+
+        # Permanently disable spec processing on this batch (Stage 2 is a
+        # pure pass-through; no draft heads are consumed).
+        if not batch.spec_algorithm.is_none():
             batch.spec_algorithm = SpeculativeAlgorithm.NONE
-            try:
-                # Runs the full body skipped by the scheduler-side call:
-                # input_ids = output_ids, alloc_for_decode, seq_lens += 1, etc.
-                batch.prepare_for_decode()
-            finally:
-                batch.spec_algorithm = saved_spec_algo
+
+        if needs_redo_prep:
+            # Finish the prep that scheduler-side prepare_for_decode skipped:
+            # input_ids = output_ids, alloc_for_decode, seq_lens += 1, etc.
+            batch.prepare_for_decode()
 
         model_worker_batch = batch.get_model_worker_batch()
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
