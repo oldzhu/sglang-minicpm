@@ -153,39 +153,15 @@ If 3a passes (correctness validated):
 - **Stage 3b**: re-enable cuda-graph for TARGET_VERIFY + DECODE; measure real speed gain ceiling.
 - **Stage 3c** (deferred, may require model retraining): initialize heads from `lm_head` (CHANGE_0154 §6) or train heads on eval distribution — push acceptance rate above the 100%-on-zero-init invariant (which only holds because heads predict identity to target).
 
-## 11. Blocker discovered (2026-05-11)
+## 11. Backend probe correction (2026-05-11)
 
-During Stage 3a code-up, the source dive revealed:
+During Stage 3a code-up I read `minicpm_backend.py:521` and saw `NotImplementedError` on `is_target_verify()`, and briefly concluded Stage 3 was blocked. **That conclusion was wrong.** User pointed out that `prepare_env.sh` line 199 sets `SOAR_BACKEND_VARIANT=flashinfer` by default, which rewrites the launch arg to `--attention-backend flashinfer` (the stock backend, not the custom `minicpm_flashinfer`). The `NotImplementedError` only fires if someone explicitly overrides `SOAR_BACKEND_VARIANT=minicpm_flashinfer`.
 
-```python
-# python/sglang/srt/layers/attention/minicpm_backend.py:521
-def init_forward_metadata(self, forward_batch: ForwardBatch):
-    if forward_batch.forward_mode.is_target_verify():
-        raise NotImplementedError(
-            "MiniCPM backend does not support speculative decoding (target verify)"
-        )
-    if forward_batch.forward_mode.is_draft_extend(include_v2=True):
-        raise NotImplementedError(
-            "MiniCPM backend does not support speculative decoding (draft extend)"
-        )
-```
-
-The `minicpm_flashinfer` attention backend used by our v22 baseline does **not** implement the `TARGET_VERIFY` metadata path. The Stage 2 risk-bullet I flagged as "medium probability" is in fact **certain**: any `forward_mode=TARGET_VERIFY` request hits the `NotImplementedError` at server-runtime.
-
-This kills the originally planned Stage 3 implementation (which assumed the backend already supported verify, as the eagle/ngram code path implies for other backends).
-
-### Options
-
-| Option | Description | Effort | Risk |
-|--------|-------------|--------|------|
-| **A** — Implement `is_target_verify()` metadata in `minicpm_backend.py` | Add multi-query-per-req metadata, custom tree mask, KV indices for verify; integrate with sparse attention path. | High (likely multi-session) | High — sparse attention sliding window + tree mask interaction is non-trivial. |
-| **B** — Spec-only fallback to vanilla flashinfer backend | Switch to plain flashinfer when `SOAR_SPEC_MEDUSA=1`. Loses minicpm-specific dense/sparse routing optimization but unblocks spec immediately. | Medium | Medium — vanilla flashinfer may be slower on our config; net spec gain could be negative. |
-| **C** — Scaffold-only Stage 3 | MedusaWorker runs heads on every step as a side observer, validates `argmax(heads(h)) == target_argmax`, but never calls TARGET_VERIFY. No real speedup, just validation that head forward is healthy. | Low | Low — pure observer. |
-| **D** — Defer Medusa, pivot to other optimization | Park Medusa until backend can be extended; focus on kernels/scheduling/quantization. | None on Medusa | Loses Medusa as a speed lever entirely. |
+**Stock flashinfer fully supports `TARGET_VERIFY`** — it is the canonical backend for sglang's eagle and ngram paths. So Stage 3 is not blocked; the original §1-10 plan stands and the §6 risk "minicpm_flashinfer TARGET_VERIFY untested on hybrid GLA" simply does not apply because we don't use that backend by default.
 
 ### Lesson logged
 
-The correct discovery path was to first run **NGRAM** (`SOAR_SPEC_NGRAM=1`, already wired, no new code) on fcloud as a 1-step de-risk. It would have hit the same `NotImplementedError` in seconds and saved this proposal cycle. For any future spec-path work on this backend, **probe the backend layer first** before designing worker code.
+Reading a source file's `NotImplementedError` without first confirming which backend is actually used at runtime is a false-alarm pattern. Always check `prepare_env.sh` defaults before concluding a code path is blocked.
 
-This proposal's Stage 3a code is therefore **not implemented in this session**. Pending user decision on A / B / C / D, the proposal will be revised into a CHANGE_0156 doc.
+Proceeding with Stage 3a implementation against stock flashinfer.
 
