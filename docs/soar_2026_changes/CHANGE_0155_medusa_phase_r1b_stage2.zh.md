@@ -351,3 +351,31 @@ False，spec_algorithm 翻转分支也被 `is_none()` 检查跳过（Stage 3 进
 - [python/sglang/srt/speculative/medusa_worker.py](../../python/sglang/srt/speculative/medusa_worker.py)
   — 入口处永久翻转 `spec_algorithm = NONE`；只有当 prep 被跳过时才在首次 decode
   补做 `prepare_for_decode`。
+
+## 13. Stage 2 fcloud 启动补丁 #4 — log_decode_stats 中的 ZeroDivisionError（2026-05-11）
+
+**补丁 #3 之后重测**消除了 decode 死循环（已能在 `max_new_tokens` 停止），但 accuracy 跑出 `0.00%`，所有 prediction 为空。根因在 `scheduler_metrics_mixin.py::log_decode_stats`：
+
+```
+ZeroDivisionError: division by zero
+  File ".../scheduler_metrics_mixin.py", line 341, in log_decode_stats
+    self.spec_num_accepted_tokens / self.spec_num_forward_ct
+```
+
+scheduler 层 `self.spec_algorithm` 是 `MEDUSA`（来自 `--speculative-algorithm MEDUSA`），所以走 else 分支。但补丁 #3 把 `batch.spec_algorithm` 翻转为 `NONE`，导致 `process_batch_result_decode` 不会调用 `update_spec_metrics`（其条件是 `not batch.spec_algorithm.is_none()`）。结果：`self.spec_num_forward_ct` 始终为 0 → 第一次 decode 日志时除零 → scheduler 崩溃 → 整个 eval 中断。
+
+**修复。** 在 `scheduler_metrics_mixin.py` 中加一行防护：
+
+```python
+spec_accept_length = (
+    self.spec_num_accepted_tokens / self.spec_num_forward_ct
+    if self.spec_num_forward_ct > 0
+    else 0
+)
+```
+
+Stage 3 将通过真实 verify 路径正确累加这些计数器。
+
+**本次改动文件（delta #4）。**
+- [python/sglang/srt/managers/scheduler_metrics_mixin.py](../../python/sglang/srt/managers/scheduler_metrics_mixin.py)
+  — 当 spec_algorithm 启用但 spec 计数尚未递增时，避免除零。

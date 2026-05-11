@@ -378,3 +378,31 @@ processing path that respects `is_spec_v2` or equivalent).
 - [python/sglang/srt/speculative/medusa_worker.py](../../python/sglang/srt/speculative/medusa_worker.py)
   — flip `spec_algorithm` to NONE permanently on entry; keep first-decode
   `prepare_for_decode` re-run only when prep was skipped.
+
+## 13. Stage 2 fcloud bring-up addendum #4 — ZeroDivisionError in log_decode_stats (2026-05-11)
+
+**Re-test after addendum #3** showed the runaway-decode bug fixed (decode now stops at `max_new_tokens`), but the accuracy run produced `0.00%` with all predictions empty. Root cause was in `scheduler_metrics_mixin.py::log_decode_stats`:
+
+```
+ZeroDivisionError: division by zero
+  File ".../scheduler_metrics_mixin.py", line 341, in log_decode_stats
+    self.spec_num_accepted_tokens / self.spec_num_forward_ct
+```
+
+The scheduler-level `self.spec_algorithm` is `MEDUSA` (from `--speculative-algorithm MEDUSA`), so the `else` branch executes. But our addendum #3 fix flips `batch.spec_algorithm = NONE` per-batch, which makes `process_batch_result_decode` skip `update_spec_metrics` (gated on `not batch.spec_algorithm.is_none()`). Result: `self.spec_num_forward_ct` stays 0 → div-by-zero on the first decode-stats log → scheduler crashes → server stops responding mid-eval.
+
+**Fix.** Guard the division in `scheduler_metrics_mixin.py` (1-line change):
+
+```python
+spec_accept_length = (
+    self.spec_num_accepted_tokens / self.spec_num_forward_ct
+    if self.spec_num_forward_ct > 0
+    else 0
+)
+```
+
+Stage 3 will properly increment these counters via the real verify path.
+
+**Files touched (delta #4).**
+- [python/sglang/srt/managers/scheduler_metrics_mixin.py](../../python/sglang/srt/managers/scheduler_metrics_mixin.py)
+  — guard div-by-zero when spec_algorithm is enabled but spec metrics are not yet incremented.

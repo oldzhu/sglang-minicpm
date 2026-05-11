@@ -337,8 +337,16 @@ class SchedulerMetricsMixin:
             spec_accept_length = 0
             spec_accept_rate = 0
         else:
+            # SOAR Medusa Stage 2 (CHANGE_0155): MedusaWorker pass-through
+            # flips batch.spec_algorithm to NONE, so update_spec_metrics is
+            # never called and spec_num_forward_ct stays 0 even though the
+            # scheduler-level self.spec_algorithm is MEDUSA. Guard the
+            # division to avoid a ZeroDivisionError; Stage 3 will increment
+            # these counters properly once the verify path runs.
             spec_accept_length = (
                 self.spec_num_accepted_tokens / self.spec_num_forward_ct
+                if self.spec_num_forward_ct > 0
+                else 0
             )
             # Calculate acceptance rate: accepted tokens / total draft tokens
             draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1
