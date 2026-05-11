@@ -165,3 +165,47 @@ Reading a source file's `NotImplementedError` without first confirming which bac
 
 Proceeding with Stage 3a implementation against stock flashinfer.
 
+## 12. NGRAM probe finding (2026-05-11) — Stage 3b cuda-graph blocker located in advance
+
+Before writing any Medusa Stage 3a code, we ran a zero-code-change NGRAM speculative probe on fcloud to validate that our exact config (stock flashinfer + GPTQ + FP8 KV + dense + mixed-chunk + torch.compile + 16-bs cuda-graph buckets) can host any TARGET_VERIFY workload end-to-end.
+
+### Probe outcome
+
+Server boot reached cuda-graph capture and **crashed on the first verify-shape bucket**:
+
+```
+File "python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py", line 515, in _capture_metadata
+    if forward_mode.is_target_verify() and spec_info.topk > 1:
+AttributeError: 'NgramVerifyInput' object has no attribute 'topk'
+```
+
+Same check at line 575 in `_replay_metadata` uses `spec_info.topk` and `spec_info.draft_token_num` unconditionally.
+
+### Why this matters for Medusa
+
+- `MedusaInput` (`python/sglang/srt/speculative/medusa_info.py`) has **neither `topk` nor `draft_token_num`** attributes — confirmed via grep.
+- The hybrid GLA backend's `_capture_metadata` / `_replay_metadata` were written assuming spec_info has Eagle's shape (tree-mask with `topk`, `draft_token_num`, `retrive_next_token`, etc.).
+- Therefore **Stage 3b (Medusa + cuda-graph) will hit the identical AttributeError** the moment we re-enable cuda-graph for TARGET_VERIFY. The crash is not Medusa-specific — it is a hybrid-backend gap that affects any non-Eagle speculative algorithm (NGRAM, Medusa, future standalone draft) on this backend.
+
+### Implications
+
+1. **Stage 3a (eager) is still safe to write** — the crash is inside cuda-graph capture, which Stage 3a disables via `SOAR_SPEC_MEDUSA_EAGER=1`. We can validate correctness in eager mode without touching the hybrid backend.
+2. **Stage 3b (cuda-graph) now has a known prerequisite fix in `hybrid_linear_attn_backend.py`** before any speed gain can materialize:
+   - Lines 515 / 575: gate the eagle-tree-mask branch on `getattr(spec_info, "topk", 1) > 1` (linear K-token verify has effective topk=1, no tree).
+   - Line 570: replace `spec_info.draft_token_num` with `getattr(spec_info, "draft_token_num", None) or self.speculative_num_draft_tokens` (or read it from the worker's static config).
+   - This is a ~5-line tolerance patch, low risk, and benefits NGRAM + Medusa + any future linear-verify algorithm symmetrically.
+3. **Submission risk for v23**: v23 has `SOAR_SPEC_MEDUSA=1` default-on. Stage 2 medusa_worker.py is pure pass-through (flips `spec_algorithm=NONE` before `get_model_worker_batch`), so we never enter TARGET_VERIFY at runtime — the hybrid-backend gap does NOT affect v23. v23 stays safe.
+
+### Probe verdict
+
+**Highly positive ROI.** A 5-minute probe (zero new code) located the exact line that would block Stage 3b cuda-graph speed gains, and confirmed Stage 3a (eager-only) infrastructure is sound up to that crash point (model load, KV alloc, hybrid pool init, KV dtype fp8_e5m2, all succeeded). The lesson from §11 is reinforced: cheap end-to-end probes before speculative code-writing save hours of false-positive debugging.
+
+### Stage plan update
+
+| Stage | Was | Now |
+|-------|-----|-----|
+| 3a | Write Medusa worker + run with `SOAR_SPEC_MEDUSA_EAGER=1` | Same (no change) |
+| 3b | Disable EAGER toggle → cuda-graph back on → measure speed | **Prerequisite**: patch `hybrid_linear_attn_backend.py` `_capture_metadata` + `_replay_metadata` to tolerate Medusa-shape spec_info, then disable EAGER toggle and measure |
+
+This finding will be reflected in `CHANGE_0156` when Stage 3 work starts.
+

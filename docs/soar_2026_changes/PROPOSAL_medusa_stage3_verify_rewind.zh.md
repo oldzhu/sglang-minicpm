@@ -164,3 +164,47 @@ Stage 3a 编码中我读到 `minicpm_backend.py:521` 的 `NotImplementedError` �
 看到源文件的 NotImplementedError 就下结论「被阻」，却不先确认运行时用的是哪个 backend —— 典型的假警报。以后任何「后端不支持」的结论之前，必须先查 `prepare_env.sh` 的默认值。
 
 继续 Stage 3a 实现，针对 stock flashinfer 后端。
+
+## 12. NGRAM 探路发现（2026-05-11）—— 提前定位 Stage 3b cuda-graph 阻塞点
+
+在写任何 Medusa Stage 3a 代码之前，我们在 fcloud 上跑了一次「零代码改动」的 NGRAM speculative 探路，用来验证我们这套配置（stock flashinfer + GPTQ + FP8 KV + dense + mixed-chunk + torch.compile + 16 个 bs 的 cuda-graph buckets）能否端到端承载任何 TARGET_VERIFY 工作。
+
+### 探路结果
+
+服务启动跑到 cuda-graph capture，**在第一个 verify-shape bucket 就崩了**：
+
+```
+File "python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py", line 515, in _capture_metadata
+    if forward_mode.is_target_verify() and spec_info.topk > 1:
+AttributeError: 'NgramVerifyInput' object has no attribute 'topk'
+```
+
+第 575 行 `_replay_metadata` 里也直接用了 `spec_info.topk` 和 `spec_info.draft_token_num`。
+
+### 对 Medusa 的影响
+
+- `MedusaInput`（`python/sglang/srt/speculative/medusa_info.py`）**既没有 `topk` 也没有 `draft_token_num`** —— grep 已确认。
+- hybrid GLA backend 的 `_capture_metadata` / `_replay_metadata` 写的时候默认 spec_info 是 Eagle 形状（tree-mask 带 `topk`、`draft_token_num`、`retrive_next_token` 等）。
+- 所以 **Stage 3b（Medusa + cuda-graph）一旦把 cuda-graph 重新开起来跑 TARGET_VERIFY，就会撞到同一个 AttributeError**。这个崩溃不是 Medusa 专属的 —— 它是 hybrid backend 的一个缺口，影响所有非 Eagle 的 speculative 算法（NGRAM、Medusa、未来的 standalone draft）。
+
+### 含义
+
+1. **Stage 3a（eager）仍然可以放心写** —— 崩溃发生在 cuda-graph capture 里，Stage 3a 用 `SOAR_SPEC_MEDUSA_EAGER=1` 关掉 cuda-graph，所以不会触发，可以单独验证正确性。
+2. **Stage 3b（cuda-graph）现在多了一个已知前置修复点**，要在 `hybrid_linear_attn_backend.py` 里：
+   - 第 515 / 575 行：把 eagle-tree-mask 分支用 `getattr(spec_info, "topk", 1) > 1` 守起来（线性 K-token verify 等价 topk=1，无 tree）。
+   - 第 570 行：把 `spec_info.draft_token_num` 改成 `getattr(spec_info, "draft_token_num", None) or self.speculative_num_draft_tokens`（或从 worker 静态配置读）。
+   - 这是个约 5 行的容错补丁，风险低，NGRAM + Medusa + 未来任意 linear-verify 算法都受益。
+3. **对 v23 提交包没有影响**：v23 默认开 `SOAR_SPEC_MEDUSA=1`，但 Stage 2 medusa_worker.py 是纯 pass-through（`get_model_worker_batch` 前把 `spec_algorithm` 翻成 NONE），运行时根本进不到 TARGET_VERIFY —— 上面那个 hybrid-backend 缺口对 v23 不生效。v23 安全。
+
+### 探路结论
+
+**ROI 非常高。** 一次 5 分钟、零新代码的探路，准确定位了将来 Stage 3b cuda-graph 速度收益的拦路石，同时也证实了 Stage 3a（eager-only）路径上模型加载、KV 分配、hybrid pool 初始化、KV dtype fp8_e5m2 等所有基础设施都正常。再次印证 §11 的教训：「写 speculative 代码前先跑便宜的端到端探路」能省下数小时的假阳性调试。
+
+### Stage 计划更新
+
+| Stage | 原计划 | 现计划 |
+|-------|--------|--------|
+| 3a | 写 Medusa worker，跑 `SOAR_SPEC_MEDUSA_EAGER=1` | 不变 |
+| 3b | 关闭 EAGER → cuda-graph 重新开 → 测速 | **前置**：先给 `hybrid_linear_attn_backend.py` 的 `_capture_metadata` + `_replay_metadata` 打容错补丁，让它能吃 Medusa 形状的 spec_info，然后再关 EAGER 测速 |
+
+Stage 3 启动时，本节将转入 `CHANGE_0156`。
