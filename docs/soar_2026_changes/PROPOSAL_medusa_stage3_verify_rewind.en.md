@@ -239,3 +239,89 @@ No change to line 570 yet: `spec_info.draft_token_num` is already present on `Ng
 
 The patch only widens tolerance — it does NOT prove the non-tree branch is functionally correct on the hybrid backend for verify-shape attention. The NGRAM re-probe is the only way to validate. If the probe still fails after the patch, we'll add a Stage 3 prerequisite document to track the additional fix.
 
+## 14. NGRAM re-probe result: GLA state mismatch confirmed (2026-05-12)
+
+### Test details
+
+- **Commit**: `a91a0a068` (two patches applied: `getattr` topk tolerance + `_select_mode` None guard)
+- **Config**: `SOAR_SPEC_MEDUSA=0 SOAR_SPEC_NGRAM=1` (stock NGRAM, K=12 draft tokens)
+- **Test**: `quick-accuracy --tasks mcq --per-task 20` (20 MCQ samples from `perf_public_set.jsonl`)
+- **fcloud instance**: `ai-e7e98a7c52`
+
+### Results
+
+| Metric | Value | Expected (baseline) |
+|--------|-------|---------------------|
+| MCQ accuracy | **0.00%** (0/20 correct) | ~60–65% |
+| avg output tokens | **44,916** / sample | ~10–50 |
+| Total output tokens | **898,327** for 20 samples | ~400 |
+| Generation time | 339.9 s | ~30 s |
+
+The server ran successfully (NGRAM draft + verify, accept_len ~5–6, accept_rate ~0.44–0.51, cuda_graph: True from yesterday's session). All 16 cuda-graph capture buckets completed. The accuracy result proves the verify pipeline is functionally broken at the output level.
+
+### Root cause analysis
+
+The GLA (lightning-attn / mamba2) layers maintain a **recurrent hidden state** that accumulates tokens sequentially. During the NGRAM verify forward:
+
+1. The model processes all K=12 draft tokens in a single verify pass.
+2. `_select_mode` returns `"fused_recurrent"` for GLA layers (correct — extend_seq_lens is None, no chunked-prefill mode needed for a small seq_len increment).
+3. The GLA recurrent state **advances by all 12 draft tokens**.
+4. After the verify accept walk, only k<12 tokens are accepted (accept_rate 0.44–0.51 → k≈5–6).
+5. The GLA state has advanced 12-k extra "ghost" tokens beyond what was actually accepted.
+6. On the next decode step, the GLA state is **k-ahead** of the correct position → wrong next-token distribution.
+7. The MCQ model starts generating garbage tokens that never converge to a letter answer, running until the 65,536 `max_tokens` limit.
+
+This is why yesterday's full accuracy eval was running "too slow" — each of the ~150 questions was generating tens of thousands of garbage tokens. The 5 minute sample run confirms 0% accuracy in ~340 s (17 s/sample average).
+
+### Std-attn layers are unaffected
+
+The 8 standard-attention layers use FlashInfer KV-cache with `out_cache_loc` rewinding after partial accept — their KV is already correctly trimmed to the accepted prefix by `NgramVerifyInput.verify()`. The bug is purely in the GLA recurrent state management, which has no equivalent "trim" path.
+
+### Fix required: snapshot / restore + selective re-advance
+
+The required fix is a 3-step protocol around each verify forward:
+
+```
+[before verify forward]
+  gla_backend.snapshot_state_for_spec()   # saves GLA hidden state per layer
+
+[verify forward: target model runs all K draft tokens]
+
+[after verify accept walk]
+  if accept_len == K:
+      gla_backend.clear_state_snapshot_for_spec()   # all accepted, state correct
+  else:
+      gla_backend.restore_state_snapshot_for_spec() # rewind to pre-verify state
+      run a "correction forward" with exactly (accept_len + 1) tokens
+      # this re-advances GLA by the correct number of tokens
+      gla_backend.clear_state_snapshot_for_spec()
+```
+
+The scaffolded methods `snapshot_state_for_spec`, `restore_state_snapshot_for_spec`, `clear_state_snapshot_for_spec` in `hybrid_linear_attn_backend.py` (from Stage 3b planning) implement exactly this.
+
+### Updated Stage 3a plan
+
+Stage 3a must now include the GLA snapshot/restore protocol, not just the Medusa head forward. The implementation order is:
+
+1. **Validate snapshot/restore methods** in `hybrid_linear_attn_backend.py` (check they handle both GLA and std-attn, or GLA-only since std-attn is already handled by KV rewind).
+2. **Implement in `ngram_worker.py` first** as proof-of-concept — it's simpler (no head training, pure rewind validation).
+3. **Re-run the NGRAM quick-accuracy MCQ probe** with the rewind — target ≥ 60% MCQ accuracy (matching baseline).
+4. **Port to `medusa_worker.py`** for Stage 3a Medusa verify.
+
+This is consistent with the §4 plan ("reuse NGRAM verify pipeline as reference") — we now also use NGRAM as the reference implementation for the GLA rewind fix.
+
+### Impact on Stage 3a timeline
+
+The snapshot/restore calls are small (3–5 lines), but the "correction forward" after partial accept is a non-trivial decode step. For the K=1 zero-init Medusa head (always accept), there is no partial accept — so the correction forward is not needed for the initial submission. We only need:
+
+1. Snapshot before verify.
+2. On accept_len == K (always, with K=1 zero-init heads): clear snapshot.
+
+This is a much simpler first-pass implementation. We'll add the partial-accept correction forward in Stage 3b when we test with K>1 real trained heads.
+
+### Documentation updates following this finding
+
+- `TEST_RESULTS_TRACKING.md`: new row `NGRAM-reprobe-quick` added.
+- This section §14 documents the diagnosis + fix plan.
+- Next step: propose concrete code changes for `ngram_worker.py` (rewind prototype) and `medusa_worker.py` (Stage 3a with GLA rewind for K=1 accept).
+

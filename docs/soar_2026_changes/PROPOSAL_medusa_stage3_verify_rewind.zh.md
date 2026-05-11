@@ -238,3 +238,89 @@ Stage 3 启动时，本节将转入 `CHANGE_0156`。
 ### 风险提示
 
 补丁只是「打开了容错」，并不能证明非 tree 分支在 hybrid backend 的 verify-shape attention 上功能上是正确的。只有 NGRAM 重探路能验证。若补丁后探路仍坏，再增补丁。
+
+## 14. NGRAM 重探路结果：GLA 状态错位已确认（2026-05-12）
+
+### 测试详情
+
+- **Commit**: `a91a0a068`（两个补丁：`getattr` topk 容错 + `_select_mode` None 守卫）
+- **配置**: `SOAR_SPEC_MEDUSA=0 SOAR_SPEC_NGRAM=1`（标准 NGRAM，K=12 草稿 token）
+- **测试**: `quick-accuracy --tasks mcq --per-task 20`（从 `perf_public_set.jsonl` 取 20 道 MCQ）
+- **fcloud 实例**: `ai-e7e98a7c52`
+
+### 结果
+
+| 指标 | 实测值 | 预期（基线） |
+|------|-------|------------|
+| MCQ 精度 | **0.00%**（0/20 正确）| ~60–65% |
+| 平均输出 token 数 | **44,916** / 条 | ~10–50 |
+| 20 条总输出 token | **898,327** | ~400 |
+| 生成耗时 | 339.9 s | ~30 s |
+
+服务器运行正常（NGRAM 草稿+验证，昨天的日志：accept_len ~5–6，accept_rate ~0.44–0.51，cuda_graph: True）。全部 16 个 cuda-graph capture bucket 均已完成。精度结果证明 verify 流水线在输出层面完全破坏了模型输出。
+
+### 根因分析
+
+GLA（lightning-attn / mamba2）层维护着一个**循环隐藏状态**，按顺序累积 token。NGRAM verify forward 期间：
+
+1. 模型在一次 verify pass 中处理全部 K=12 草稿 token。
+2. `_select_mode` 对 GLA 层返回 `"fused_recurrent"`（正确——extend_seq_lens 为 None，短 seq_len 增量不需要 chunked-prefill 模式）。
+3. GLA 循环状态**前进了全部 12 个草稿 token**。
+4. verify 接受游走后，只有 k<12 个 token 被接受（accept_rate 0.44–0.51 → k≈5–6）。
+5. GLA 状态多走了 12-k 个"幽灵"token。
+6. 下一次 decode 时，GLA 状态比实际生成位置**超前 k 步** → 下一 token 分布错误。
+7. MCQ 模型开始生成无意义 token，不收敛到字母答案，直到耗尽 65,536 `max_tokens` 上限。
+
+这就是昨天全量精度评估"异常缓慢"的原因——每个问题都在生成几万个垃圾 token。5 分钟采样跑确认：20 条 0% 精度，耗时 340 s（均值 17 s/条）。
+
+### 标准注意力层不受影响
+
+8 个标准注意力层使用 FlashInfer KV-cache，`NgramVerifyInput.verify()` 通过 `out_cache_loc` 回溯已将 KV 正确裁剪到接受的前缀。Bug 纯粹在 GLA 循环状态管理中，标准注意力层无对应"裁剪"路径。
+
+### 修复方案：快照 / 恢复 + 选择性重前进
+
+每次 verify forward 需要三步协议：
+
+```
+[verify forward 之前]
+  gla_backend.snapshot_state_for_spec()   # 按层保存 GLA 隐藏状态
+
+[verify forward：目标模型跑完全部 K 草稿 token]
+
+[verify 接受游走完成后]
+  if accept_len == K:
+      gla_backend.clear_state_snapshot_for_spec()   # 全接受，状态正确
+  else:
+      gla_backend.restore_state_snapshot_for_spec() # 回滚到 verify 前状态
+      再跑一次"校正 forward"，只含 (accept_len + 1) 个 token
+      # 这样 GLA 按正确步数前进
+      gla_backend.clear_state_snapshot_for_spec()
+```
+
+`hybrid_linear_attn_backend.py` 中已搭建的 `snapshot_state_for_spec`、`restore_state_snapshot_for_spec`、`clear_state_snapshot_for_spec`（来自 Stage 3b 规划）正好实现了这套协议。
+
+### 更新后的 Stage 3a 计划
+
+Stage 3a 现在必须包含 GLA 快照/恢复协议，而不仅仅是 Medusa head forward。实施顺序：
+
+1. **验证 `hybrid_linear_attn_backend.py` 中的快照/恢复方法**（确认只针对 GLA 层，标准注意力由 KV 回溯处理）。
+2. **先在 `ngram_worker.py` 中实现**作为原型——更简单（无 head 训练，纯回溯验证）。
+3. **用 NGRAM quick-accuracy MCQ 重探路**验证回溯——目标 ≥60% MCQ 精度（与基线一致）。
+4. **移植到 `medusa_worker.py`**，用于 Stage 3a Medusa verify。
+
+这与 §4 的计划一致（"以 NGRAM verify 流水线为参考实现"）——我们现在也用 NGRAM 作为 GLA 回溯修复的参考实现。
+
+### 对 Stage 3a 时间线的影响
+
+快照/恢复调用很小（3–5 行），但部分接受后的"校正 forward"是一个非平凡的 decode 步骤。对于 K=1 零初始化 Medusa head（始终全接受），不存在部分接受——因此初始提交不需要校正 forward。我们只需：
+
+1. verify 前快照。
+2. accept_len == K（零初始化 head 下始终成立）时清除快照。
+
+这是一个更简单的第一阶段实现。等 Stage 3b 使用 K>1 真实训练 head 测试时，再补充部分接受校正 forward。
+
+### 本发现引发的文档更新
+
+- `TEST_RESULTS_TRACKING.md`：新增行 `NGRAM-reprobe-quick`。
+- 本节 §14 记录诊断结论和修复计划。
+- 下一步：提出 `ngram_worker.py`（回溯原型）和 `medusa_worker.py`（Stage 3a GLA 回溯，K=1 全接受）的具体代码变更。
