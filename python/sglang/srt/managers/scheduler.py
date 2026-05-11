@@ -863,7 +863,13 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        if self.draft_worker is None or self.spec_algorithm.is_ngram():
+        if (
+            self.draft_worker is None
+            or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_medusa()
+        ):
+            # SOAR 2026 (CHANGE_0155): Medusa has no separate draft KV pool —
+            # heads attach to the target model's hidden state.
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:

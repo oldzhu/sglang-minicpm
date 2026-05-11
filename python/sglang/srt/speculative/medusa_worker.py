@@ -1,16 +1,39 @@
-"""Medusa speculative-decoding worker (SOAR 2026, MiniCPM-SALA, CHANGE_0153).
+"""Medusa speculative-decoding worker (SOAR 2026, MiniCPM-SALA).
 
-Phase R1a — scaffolding only. The real forward_batch_generation lands in R1b
-alongside SimpleGLAAttnBackend.update_simple_gla_state_after_verify.
+Phase R1b Stage 2 — heads-shadow smoke test.
 
-This file exists so that:
-  * SpeculativeAlgorithm.MEDUSA.create_worker() resolves
-  * server startup with --speculative-algorithm MEDUSA fails LOUDLY with a
-    clear message until R1b is implemented (rather than crashing later in
-    obscure ways)
+Status
+------
+This worker is the **wiring smoke test** for the Medusa code path on
+MiniCPM-SALA. Its contract is:
 
-R1a contract: importing this module must not crash. Instantiating MedusaWorker
-raises NotImplementedError citing the R1b doc.
+  * Server boots with ``--speculative-algorithm MEDUSA``.
+  * ``MedusaHeads`` (K residual Linear modules + reference to the target
+    model's ``lm_head``) is instantiated on GPU; weights are zero-init
+    (R1 byte-identity invariant from CHANGE_0153 §2).
+  * Every decode/extend step is delegated **byte-identically** to the
+    target worker. No draft tokens are produced; no verify pass runs;
+    no recurrent-state snapshot/restore happens; ``capture_hidden_mode``
+    is **not** modified.
+  * ``num_accepted_tokens`` is always 0 (no speculation yet).
+
+What this proves
+----------------
+1. ``SpeculativeAlgorithm.MEDUSA.create_worker()`` dispatches here.
+2. ``server_args`` post-init for MEDUSA succeeds end-to-end.
+3. ``MedusaHeads`` allocates on GPU (~32 MiB BF16 at K=1, hidden=4096).
+4. The host model's ``lm_head`` is reachable via ``target_worker``.
+5. Accuracy/speed under ``SOAR_SPEC_MEDUSA=1`` match baseline.
+
+What this does NOT yet do (deferred to Stage 3)
+-----------------------------------------------
+* Run heads forward on the last hidden state (needs LAST capture mode).
+* Build a verify tree / call ``target_worker.forward_batch_generation
+  (..., is_verify=True)``.
+* Snapshot/restore SimpleGLA recurrent state across the verify pass
+  (Stage 1 helpers in ``hybrid_linear_attn_backend.py`` remain unused).
+
+See ``docs/soar_2026_changes/CHANGE_0155_medusa_phase_r1b_stage2.{en,zh}.md``.
 """
 
 from __future__ import annotations
@@ -18,7 +41,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+import torch
+
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     pass
@@ -26,35 +54,105 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_R1B_BLOCKER_MESSAGE = (
-    "MedusaWorker R1a is a scaffold only — forward_batch_generation lands in "
-    "Phase R1b (port update_mamba_state_after_mtp_verify to SimpleGLAAttnBackend "
-    "and wire forward_with_hidden through MiniCPMSALAForCausalLM). See "
-    "docs/soar_2026_changes/CHANGE_0153_medusa_phase_r1_design.en.md sections 2 and 3."
-)
+class MedusaWorker:
+    """Stage 2 Medusa worker — pure delegation + heads instantiation.
 
+    Mirrors ``NGRAMWorker``'s plain-class style (not an ABC subclass) so the
+    scheduler's existing ``draft_worker.forward_batch_generation(batch)`` dispatch
+    works without changes.
+    """
 
-class MedusaWorker(BaseSpecWorker):
-    """Skeleton Medusa worker; raises until R1b lands."""
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        gpu_id: int,
+        tp_rank: int,
+        dp_rank: Optional[int],
+        moe_ep_rank: int,
+        nccl_port: int,
+        target_worker: TpModelWorker,
+    ) -> None:
+        self.server_args = server_args
+        self.target_worker = target_worker
+        self.model_runner = target_worker.model_runner
+        self.tp_rank = tp_rank
+        self.page_size = server_args.page_size
+        self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__()
-        logger.error(
-            "MedusaWorker instantiated but R1b is not implemented yet. "
-            "Set --speculative-algorithm to a different value or wait for R1b."
+        # R1b Stage 2: K is fixed to whatever server_args reports (default 1).
+        # Stage 3 will validate K vs ``speculative_num_draft_tokens`` once the
+        # verify path runs. For now we only allocate the heads.
+        self.num_heads: int = int(server_args.speculative_num_medusa_heads)
+        assert (
+            self.num_heads >= 1
+        ), f"speculative_num_medusa_heads must be >= 1, got {self.num_heads}"
+
+        # ----- Heads instantiation (smoke test for weight allocation) -----
+        # Import locally so that import errors don't break ``--speculative-algorithm NONE``.
+        from sglang.srt.models.minicpm_medusa_heads import MedusaHeads
+
+        model = self.model_runner.model
+        if not hasattr(model, "lm_head"):
+            raise RuntimeError(
+                "MedusaWorker requires the target model to expose ``lm_head``. "
+                f"Got model={type(model).__name__} with no lm_head attribute. "
+                "Medusa is only supported on MiniCPM-SALA in this branch."
+            )
+
+        hidden_size = self.model_runner.model_config.hidden_size
+        # Match the host model's parameter dtype. ``model_runner.dtype`` is the
+        # canonical source (bfloat16 for SALA in the SOAR submission config).
+        dtype = self.model_runner.dtype
+        self.medusa_heads = MedusaHeads(
+            hidden_size=hidden_size,
+            num_heads=self.num_heads,
+            lm_head_module=model.lm_head,
+            dtype=dtype,
         )
-        raise NotImplementedError(_R1B_BLOCKER_MESSAGE)
+        self.medusa_heads = self.medusa_heads.to(self.device)
+        self.medusa_heads.eval()
 
-    # The abstract properties below are declared so the class is concrete enough
-    # for static analyzers, but they will never be called because __init__ aborts.
+        logger.info(
+            "MedusaWorker Stage 2 ready: K=%d, hidden=%d, dtype=%s, device=%s, "
+            "approx_weight_MiB=%.1f",
+            self.num_heads,
+            hidden_size,
+            dtype,
+            self.device,
+            self.num_heads * hidden_size * hidden_size * torch.tensor([], dtype=dtype).element_size() / (1024 * 1024),
+        )
 
-    @property
-    def target_worker(self):  # type: ignore[override]
-        raise NotImplementedError(_R1B_BLOCKER_MESSAGE)
+    # ----- BaseSpecWorker-compatible duck-typed interface -----
+    #
+    # NGRAMWorker uses plain instance attributes (not @property) so the
+    # scheduler can read ``draft_worker.target_worker`` directly. We mirror
+    # that. ``draft_worker = None`` because Medusa has no separate draft
+    # model — heads attach to the target's hidden state.
 
     @property
     def draft_worker(self):  # type: ignore[override]
-        raise NotImplementedError(_R1B_BLOCKER_MESSAGE)
+        return None
 
-    def clear_cache_pool(self):  # type: ignore[override]
-        raise NotImplementedError(_R1B_BLOCKER_MESSAGE)
+    def clear_cache_pool(self) -> None:  # type: ignore[override]
+        # No draft KV-cache pool in Stage 2 (no verify path yet).
+        pass
+
+    # ----- Forward dispatch -----
+
+    def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        """Stage 2: pure passthrough to the target worker.
+
+        We do NOT modify ``batch.forward_mode``, ``batch.spec_info`` or
+        ``capture_hidden_mode``. The output is therefore byte-identical to
+        running the server with ``--speculative-algorithm NONE``.
+        """
+        model_worker_batch = batch.get_model_worker_batch()
+        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+
+        return GenerationBatchResult(
+            logits_output=batch_result.logits_output,
+            next_token_ids=batch_result.next_token_ids,
+            num_accepted_tokens=0,
+            can_run_cuda_graph=batch_result.can_run_cuda_graph,
+            accept_lens=None,
+        )
