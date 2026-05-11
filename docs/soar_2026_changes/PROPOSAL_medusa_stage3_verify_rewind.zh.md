@@ -208,3 +208,33 @@ AttributeError: 'NgramVerifyInput' object has no attribute 'topk'
 | 3b | 关闭 EAGER → cuda-graph 重新开 → 测速 | **前置**：先给 `hybrid_linear_attn_backend.py` 的 `_capture_metadata` + `_replay_metadata` 打容错补丁，让它能吃 Medusa 形状的 spec_info，然后再关 EAGER 测速 |
 
 Stage 3 启动时，本节将转入 `CHANGE_0156`。
+
+## 13. 容错补丁已应用（2026-05-11）—— §12 前置已解决
+
+已把 §12 识别出的 2 行容错补丁应用到 `python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py`：
+
+- **第 515 行**（`_capture_metadata`）：`spec_info.topk > 1` → `getattr(spec_info, "topk", 1) > 1`
+- **第 575 行**（`_replay_metadata`）：同上
+
+第 570 行暂不动：`NgramVerifyInput` 本来就有 `draft_token_num`，紧接着的 NGRAM 重跑探路用不到补丁。等 Stage 3a 动 Medusa 代码时，一起给 `MedusaInput` 加 `draft_token_num` 属性（或加静态备选）。
+
+### 为什么现在提交安全（不需要 per-feature 开关）
+
+1. **Eagle / Standalone 不受影响**：它们的 spec_info 明确赋了 `topk`，`getattr(..., "topk", 1)` 返回原值 → 行为与之前一致。
+2. **NGRAM / Medusa**：缺属性 → fall back 到 1 → 走非 tree-mask 分支，这正是线性 K-token verify 需要的（只要 custom_mask，不需要 `retrive_next_token`）。
+3. **控制流未变**：只是门限变宽了；两个分支体内未动。
+4. **v23 字节等价保持**：v23 跳 Stage 2 pass-through（spec_algorithm 被翻成 NONE），运行时不进入 TARGET_VERIFY，该路径在 v23 提交包里未被走。
+
+### 重探路计划
+
+1. push 补丁。
+2. fcloud sync（`fcloud_workflow.py sync` 会把 `python/sglang` 拷到 `submission_sim/sglang/python`）。
+3. 同一套环变重启 NGRAM 探路：`--env SOAR_SPEC_MEDUSA=0 --env SOAR_SPEC_NGRAM=1`。
+4. **预期**：cuda-graph capture 过 bs=24 verify bucket，服务达 READY。
+5. 跑 accuracy。NGRAM 走 stock 参数（`speculative_num_draft_tokens=12`、`speculative_ngram_branch_length=18` 等）。
+6. **通过标准**：`ori_accuracy ≥ 80.0%`（与 Stage 2 cuda-graph 80.11% 同本地器械噪声包）→ 证明 verify 管道在我们这套栈上端到端打通 → 可以放心写 Stage 3a Medusa 代码。
+7. **若 acc 明显跳水**（例如 < 78%）→ 除了 tree-mask 门限之外还有二阶 bug；在动 Medusa 代码之前先查。
+
+### 风险提示
+
+补丁只是「打开了容错」，并不能证明非 tree 分支在 hybrid backend 的 verify-shape attention 上功能上是正确的。只有 NGRAM 重探路能验证。若补丁后探路仍坏，再增补丁。

@@ -512,7 +512,11 @@ class MambaAttnBackendBase(AttentionBackend):
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and spec_info.topk > 1:
+        # SOAR 2026 (PROPOSAL_medusa_stage3 §12): non-Eagle spec_info (Ngram, Medusa)
+        # lacks `topk`; treat missing attr as linear-chain verify (topk=1) so the
+        # eagle-tree-mask branch is skipped. NGRAM/Medusa attention only needs
+        # custom_mask; retrieve_* fields are unused on this backend for those algos.
+        if forward_mode.is_target_verify() and getattr(spec_info, "topk", 1) > 1:
             # They are None during cuda graph capture so skip the copy_...
             # self.retrieve_next_token_list[bs - 1].copy_(spec_info.retrive_next_token)
             # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrive_next_sibling)
@@ -573,7 +577,8 @@ class MambaAttnBackendBase(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and spec_info.topk > 1:
+        # SOAR 2026 (PROPOSAL_medusa_stage3 §12): see _capture_metadata note above.
+        if forward_mode.is_target_verify() and getattr(spec_info, "topk", 1) > 1:
             bs_without_pad = spec_info.retrive_next_token.shape[0]
             self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
                 spec_info.retrive_next_token

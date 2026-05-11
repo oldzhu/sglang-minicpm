@@ -209,3 +209,33 @@ Same check at line 575 in `_replay_metadata` uses `spec_info.topk` and `spec_inf
 
 This finding will be reflected in `CHANGE_0156` when Stage 3 work starts.
 
+## 13. Tolerance patch applied (2026-05-11) — §12 prerequisite resolved
+
+Applied the 2-line tolerance patch identified in §12 to `python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py`:
+
+- **Line 515** (`_capture_metadata`): `spec_info.topk > 1` → `getattr(spec_info, "topk", 1) > 1`
+- **Line 575** (`_replay_metadata`): same change
+
+No change to line 570 yet: `spec_info.draft_token_num` is already present on `NgramVerifyInput` so the existing access works for the immediate NGRAM re-probe. When Stage 3a starts wiring Medusa, we will add a `draft_token_num` attribute to `MedusaInput` (or use the static fallback) at the same time.
+
+### Why this is safe to apply now (without per-feature gate)
+
+1. **Eagle/Standalone unaffected**: their spec_info has `topk` explicitly set, so `getattr(..., "topk", 1)` returns the real value → identical behavior to before.
+2. **NGRAM/Medusa**: missing attr → falls back to 1 → takes the non-tree-mask branch, which is exactly what linear K-token verify needs (custom_mask alone suffices; no `retrive_next_token` retrieval pointers).
+3. **No control-flow changes**: only the gate condition becomes attr-tolerant. The two branches' bodies are untouched.
+4. **v23 byte-equality preserved**: v23 default config runs Stage 2 pass-through (flips spec_algorithm=NONE before forward), never enters TARGET_VERIFY at runtime, so this code path is not exercised in v23 submission.
+
+### Plan for re-probe
+
+1. Push the patch.
+2. Sync to fcloud (`fcloud_workflow.py sync` copies `python/sglang` into `submission_sim/sglang/python`).
+3. Restart NGRAM probe with same env: `--env SOAR_SPEC_MEDUSA=0 --env SOAR_SPEC_NGRAM=1`.
+4. **Expected**: cuda-graph capture proceeds past bs=24 verify bucket; server reaches READY.
+5. Run accuracy eval. NGRAM with stock parameters (`speculative_num_draft_tokens=12`, `speculative_ngram_branch_length=18`, etc.) on our config.
+6. **Pass criterion**: `ori_accuracy ≥ 80.0%` (within local noise of Stage 2 cuda-graph 80.11%) → proves the verify pipeline is end-to-end functional on our exact stack → green light to write Stage 3a Medusa code.
+7. **If accuracy degrades meaningfully** (e.g. < 78%) → there is a second-order verify bug beyond the tree-mask gate; diagnose before committing Medusa code.
+
+### Risk note
+
+The patch only widens tolerance — it does NOT prove the non-tree branch is functionally correct on the hybrid backend for verify-shape attention. The NGRAM re-probe is the only way to validate. If the probe still fails after the patch, we'll add a Stage 3 prerequisite document to track the additional fix.
+
