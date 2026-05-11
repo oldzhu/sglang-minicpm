@@ -81,14 +81,18 @@ class MedusaWorker:
 
         # Stage 3a: K=1 draft (zero-init heads, always accept, no speedup yet).
         # Stage 3b will use the Medusa head forward for K>1.
-        self.draft_token_num: int = int(server_args.speculative_num_draft_tokens)
+        # Note: prepare_env.sh sets speculative_num_draft_tokens = num_heads + 1
+        # (base position included), so draft_token_num must be derived from
+        # num_heads (the number of speculative positions), not from
+        # speculative_num_draft_tokens.
         self.num_heads: int = int(server_args.speculative_num_medusa_heads)
+        self.draft_token_num: int = self.num_heads  # K speculative draft tokens
         assert (
             self.num_heads >= 1
         ), f"speculative_num_medusa_heads must be >= 1, got {self.num_heads}"
-        assert self.draft_token_num == 1, (
-            f"Stage 3a supports only draft_token_num=1 (K=1 linear chain), "
-            f"got {self.draft_token_num}.  Set SOAR_SPEC_MEDUSA_DRAFT_TOKENS=1."
+        assert self.num_heads == 1, (
+            f"Stage 3a supports only num_heads=1 (K=1 linear chain), "
+            f"got num_heads={self.num_heads}.  Stage 3b required for K>1."
         )
 
         # ----- Heads instantiation (for future Stage 3b actual head forward) -----
