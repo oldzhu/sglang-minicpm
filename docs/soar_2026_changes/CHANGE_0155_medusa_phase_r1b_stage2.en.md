@@ -406,3 +406,26 @@ Stage 3 will properly increment these counters via the real verify path.
 **Files touched (delta #4).**
 - [python/sglang/srt/managers/scheduler_metrics_mixin.py](../../python/sglang/srt/managers/scheduler_metrics_mixin.py)
   — guard div-by-zero when spec_algorithm is enabled but spec metrics are not yet incremented.
+
+---
+
+## §14. Bring-up addendum #5 — re-enable cuda-graph + torch.compile (post-Stage 2 baseline)
+
+**Context.** First Stage 2 baseline (commit `3b1293ed6`, row `Medusa-Stage2` in `TEST_RESULTS_TRACKING.md`) ran in eager mode: `prepare_env.sh` stripped `--enable-torch-compile`/`--torch-compile-max-bs N` and appended `--disable-cuda-graph`. This was a defensive response to the very first crash ("shape [1] doesn't match broadcast shape [7]") seen during bring-up. Result: accuracy 76.38% (regression vs Test 12 79.29%) and S1 **200.92s** (+65% slower vs Test 12 121.71s).
+
+**Re-analysis of the original crash.** The "shape [1] vs [7]" decode error has the same root cause as addendum #2 (bug #2): the **first** decode of a request was attempted with stale prefill metadata because `ScheduleBatch.prepare_for_decode` early-returns when `spec_algorithm != NONE` (`schedule_batch.py L1948`). After addendum #2, the worker re-runs `prepare_for_decode` itself, and after addendum #3 the batch's `spec_algorithm` is permanently `NONE` by the time `get_model_worker_batch()` runs. The resulting `ForwardBatch` has `spec_algorithm=NONE` and `num_tokens_per_seq=1` — exactly the shape captured by `cuda_graph_runner` for MEDUSA (capture-time `get_spec_info` returns None and `num_tokens_per_bs=1`, byte-identical to a normal-decode graph).
+
+**Conclusion.** Disabling cuda-graph + torch.compile was overkill. The "bug #1" workaround is **redundant** once bugs #2 and #3 are fixed.
+
+**Fix.** In `prepare_env.sh`, gate the eager-mode strip behind a new opt-in env var `SOAR_SPEC_MEDUSA_EAGER` (default `0`). When unset, the Medusa path uses the same cuda-graph + torch.compile config as the v22 baseline (cuda-graph on, `--enable-torch-compile`, `--torch-compile-max-bs 24`). When set to `1`, the strip is re-applied as a rollback option.
+
+**Validation plan.**
+1. Sync + restart server with `SOAR_SPEC_MEDUSA=1 SOAR_SPEC_MEDUSA_HEADS=1` (no `SOAR_SPEC_MEDUSA_EAGER`).
+2. Quick S1 only (≤ 4 min). Pass criterion: server does not crash on first request, S1 within +10% of Test 12 (≤ 134s). Goal: ≤ 125s.
+3. If S1 passes: full accuracy + S1 + S8 + Smax. Pass criterion: accuracy within ±1pt of Test 12 (Stage 2 has zero accept rate, so accuracy = target model output, must match Test 12 exactly modulo eval noise).
+4. If S1 crashes: re-export `SOAR_SPEC_MEDUSA_EAGER=1` and rerun, document failure.
+
+**Rollback.** `SOAR_SPEC_MEDUSA_EAGER=1` in the env.
+
+**Files touched (delta #5).**
+- [benchmark/soar/demo_sala/prepare_env.sh](../../benchmark/soar/demo_sala/prepare_env.sh) — replaced unconditional strip with opt-in `SOAR_SPEC_MEDUSA_EAGER` gate.

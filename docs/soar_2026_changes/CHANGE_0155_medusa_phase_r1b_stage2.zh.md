@@ -379,3 +379,26 @@ Stage 3 将通过真实 verify 路径正确累加这些计数器。
 **本次改动文件（delta #4）。**
 - [python/sglang/srt/managers/scheduler_metrics_mixin.py](../../python/sglang/srt/managers/scheduler_metrics_mixin.py)
   — 当 spec_algorithm 启用但 spec 计数尚未递增时，避免除零。
+
+---
+
+## §14. 调通补丁 #5 —— 重新启用 cuda-graph + torch.compile（Stage 2 基线之后）
+
+**背景。** 首轮 Stage 2 基线（commit `3b1293ed6`，`TEST_RESULTS_TRACKING.md` 中 `Medusa-Stage2` 行）跑在 eager 模式：`prepare_env.sh` 删掉 `--enable-torch-compile`/`--torch-compile-max-bs N` 并追加 `--disable-cuda-graph`。这是对调通时第一次崩溃（"shape [1] doesn't match broadcast shape [7]"）的防御性处理。结果：accuracy 76.38%（相对 Test 12 79.29% 有回退）、S1 **200.92s**（相对 Test 12 121.71s **+65%**）。
+
+**对原崩溃的复盘。** "shape [1] vs [7]" 与补丁 #2（bug #2）同源：首个 decode 用着 prefill 残留的 metadata，因为 `ScheduleBatch.prepare_for_decode` 在 `spec_algorithm != NONE` 时早退（`schedule_batch.py L1948`）。补丁 #2 之后 worker 会自己重跑 `prepare_for_decode`；补丁 #3 之后 `batch.spec_algorithm` 在进入 `get_model_worker_batch()` 时已经永久置为 NONE。最终生成的 `ForwardBatch` 是 `spec_algorithm=NONE`、`num_tokens_per_seq=1`——这正是 cuda_graph_runner 在 MEDUSA 模式下捕获的形状（捕获时 `get_spec_info` 返回 None、`num_tokens_per_bs=1`，与普通 decode 图字节一致）。
+
+**结论。** 当时禁掉 cuda-graph + torch.compile 是过度防御。bug #2、bug #3 修了之后，"bug #1" 的 workaround **已经多余**。
+
+**修复。** 在 `prepare_env.sh` 中把 eager 模式 strip 挪到新增的开关 `SOAR_SPEC_MEDUSA_EAGER` 后面，默认 `0`。未设置时，Medusa 路径与 v22 基线共用同一套 cuda-graph + torch.compile 配置（cuda-graph 开、`--enable-torch-compile`、`--torch-compile-max-bs 24`）。`SOAR_SPEC_MEDUSA_EAGER=1` 时回到之前的 eager 模式，作为兜底回滚。
+
+**验证计划。**
+1. Sync + restart，环境变量：`SOAR_SPEC_MEDUSA=1 SOAR_SPEC_MEDUSA_HEADS=1`（不带 `SOAR_SPEC_MEDUSA_EAGER`）。
+2. 先只跑 S1（≤ 4 分钟）。通过标准：首个请求不崩溃，S1 ≤ Test 12 +10%（≤ 134s）；目标 ≤ 125s。
+3. S1 通过后：完整 accuracy + S1/S8/Smax。通过标准：accuracy 相对 Test 12 在 ±1pt 内（Stage 2 接受率为 0，输出 = target 模型输出，理论上应等于 Test 12，除去 eval 随机性）。
+4. S1 崩溃则导出 `SOAR_SPEC_MEDUSA_EAGER=1` 重跑，文档化失败原因。
+
+**回滚。** 环境里设置 `SOAR_SPEC_MEDUSA_EAGER=1`。
+
+**改动文件（delta #5）。**
+- [benchmark/soar/demo_sala/prepare_env.sh](../../benchmark/soar/demo_sala/prepare_env.sh) —— 把原本无条件的 strip 改成由 `SOAR_SPEC_MEDUSA_EAGER` 控制的可选 strip。
