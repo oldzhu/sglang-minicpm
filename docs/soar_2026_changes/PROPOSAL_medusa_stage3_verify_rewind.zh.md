@@ -152,3 +152,39 @@ def forward_batch_generation(batch):
 若 3a 通过（正确性验证完成）：
 - **Stage 3b**：为 TARGET_VERIFY + DECODE 重启 cuda-graph；测量真正的速度收益上限。
 - **Stage 3c**（延后，可能要模型重训）：用 `lm_head` 初始化 heads（CHANGE_0154 §6），或在 eval 分布上训 heads —— 让接受率突破"100% on zero-init"这种平凡情况（只有 head 等价于 target 时才成立）。
+
+## 11. 阻塞器发现（2026-05-11）
+
+Stage 3a 编码过程中，源码 dive 发现：
+
+```python
+# python/sglang/srt/layers/attention/minicpm_backend.py:521
+def init_forward_metadata(self, forward_batch: ForwardBatch):
+    if forward_batch.forward_mode.is_target_verify():
+        raise NotImplementedError(
+            "MiniCPM backend does not support speculative decoding (target verify)"
+        )
+    if forward_batch.forward_mode.is_draft_extend(include_v2=True):
+        raise NotImplementedError(
+            "MiniCPM backend does not support speculative decoding (draft extend)"
+        )
+```
+
+v22 基线在用的 `minicpm_flashinfer` 注意力后端**没有**实现 `TARGET_VERIFY` 元数据路径。我在 §6 标为「中等概率」的 Stage 2 风险点其实是**100% 命中**：任何 `forward_mode=TARGET_VERIFY` 的请求一到 server 都会触发 `NotImplementedError`。
+
+这直接 kill 掉了 Stage 3 原本的实现路线（默认假设后端已经支持 verify，eagle/ngram 在其他后端上工作的事实让人误以为通用）。
+
+### 选项
+
+| 选项 | 描述 | 工作量 | 风险 |
+|------|------|-------|------|
+| **A** —— 在 `minicpm_backend.py` 里把 `is_target_verify()` 元数据补齐 | 加上每 req 多 query 元数据、自定义 tree mask、verify 的 KV indices；与稀疏注意力路径整合。 | 高（多 session） | 高 —— 稀疏 sliding window 与 tree mask 的交互不平凡。 |
+| **B** —— spec 路径回退到 vanilla flashinfer 后端 | 当 `SOAR_SPEC_MEDUSA=1` 时切换到普通 flashinfer。失去 minicpm 特有的 dense/sparse 路由优化，但能立刻打通 spec。 | 中 | 中 —— vanilla flashinfer 在本配置上可能更慢；spec 净收益可能为负。 |
+| **C** —— 仅脚手架版 Stage 3 | MedusaWorker 每步把 heads 当 side observer 跑，校验 `argmax(heads(h)) == target_argmax`，但永远不调 TARGET_VERIFY。无加速，只验证 heads forward 健康。 | 低 | 低 —— 纯观察。 |
+| **D** —— Medusa 整体延后，转其他优化 | 把 Medusa 暂停直到后端能扩展；先做 kernel / 调度 / 量化。 | 0 | 失去 Medusa 这条速度杠杆。 |
+
+### 经验记录
+
+正确的探路顺序应该是先在 fcloud 跑一次 **NGRAM**（`SOAR_SPEC_NGRAM=1`，已经接好，无新代码）作为一次 de-risk —— 几秒内就会命中同样的 `NotImplementedError`，省下整个本轮提案。今后凡涉及本后端的 spec 路径工作，**必须先在后端层探一次**，再设计 worker 代码。
+
+本提案的 Stage 3a 代码因此**本 session 不实现**。等用户在 A / B / C / D 之间选定后，本提案会被拓展为 CHANGE_0156。
