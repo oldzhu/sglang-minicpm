@@ -406,6 +406,21 @@ export SOAR_SPEC_MEDUSA_HEADS="${SOAR_SPEC_MEDUSA_HEADS:-1}"
 if [[ "$SOAR_SPEC_MEDUSA" == "1" || "$SOAR_SPEC_MEDUSA" == "true" || "$SOAR_SPEC_MEDUSA" == "TRUE" ]]; then
 	NUM_DRAFT_TOKENS=$(( SOAR_SPEC_MEDUSA_HEADS + 1 ))
 	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS} --speculative-algorithm MEDUSA --speculative-num-medusa-heads ${SOAR_SPEC_MEDUSA_HEADS} --speculative-num-draft-tokens ${NUM_DRAFT_TOKENS}"
+	# CHANGE_0155 R1b Stage 2: MedusaWorker is a pure pass-through delegate
+	# to target_worker. The cuda_graph_runner does NOT recognize MEDUSA in
+	# its spec_algorithm.is_eagle/is_standalone/is_ngram branch (cuda_graph_runner.py
+	# L281), so it captures graphs at num_tokens_per_bs=1. But because
+	# spec_algorithm != NONE, scheduler.run_batch routes the ScheduleBatch
+	# directly into model_worker.forward_batch_generation (spec-v1 path),
+	# and the prefill batch ends up replayed against a [1]-shape input
+	# buffer → "shape [1] doesn't match broadcast shape [N]" crash on the
+	# first request. Per CHANGE_0154 §2 we already committed to eager-only
+	# in R1b; CUDA-graph capture of the verify path is deferred to R1c.
+	# Drop --enable-torch-compile from the args (torch-compile implies
+	# cuda-graph capture) and append --disable-cuda-graph defensively.
+	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--enable-torch-compile/}"
+	export SGLANG_SERVER_ARGS="$(echo "$SGLANG_SERVER_ARGS" | sed -E 's/--torch-compile-max-bs [0-9]+//g')"
+	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS} --disable-cuda-graph"
 fi
 
 # === SOAR 2026 (RESEARCH_speculative_decoding_survey_001 §5.2): NGRAM opt-in.

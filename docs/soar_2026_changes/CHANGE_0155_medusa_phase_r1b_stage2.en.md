@@ -171,3 +171,74 @@ six 1-line guards.
 - [CHANGE_0153_medusa_phase_r1_design.en.md](CHANGE_0153_medusa_phase_r1_design.en.md)
 - [CHANGE_0154_medusa_phase_r1b_design.en.md](CHANGE_0154_medusa_phase_r1b_design.en.md)
 - Reference impl: [ngram_worker.py L213](../../python/sglang/srt/speculative/ngram_worker.py#L213) (forward_batch_generation pattern)
+
+## 10. Stage 2 fcloud bring-up addendum (2026-05-11)
+
+**First fcloud restart with `SOAR_SPEC_MEDUSA=1`** confirmed the worker
+instantiates correctly:
+
+```
+[2026-05-11 00:41:32] MedusaWorker Stage 2 ready: K=1, hidden=4096,
+  dtype=torch.bfloat16, device=cuda:0, approx_weight_MiB=32.0
+```
+
+but the **first prefill request crashed**:
+
+```
+File .../medusa_worker.py L150, in forward_batch_generation
+    batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+File .../model_runner.py L2251, in _forward_raw
+    ret = self.graph_runner.replay(...)
+File .../input_buffers.py L156, in populate_from_forward_batch
+    self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+RuntimeError: output with shape [1] doesn't match the broadcast shape [7]
+```
+
+**Root cause.** Two pieces of sglang internal logic interact badly when
+MEDUSA is registered but no draft tokens are produced:
+
+1. [cuda_graph_runner.py L281](../../python/sglang/srt/model_executor/cuda_graph_runner.py#L281)
+   only sets `num_tokens_per_bs = speculative_num_draft_tokens` for
+   EAGLE / STANDALONE / NGRAM. MEDUSA falls through to the default branch
+   (`num_tokens_per_bs = 1`), so all 16 graph captures (936 s wall) used the
+   normal-decode shape.
+2. But `--speculative-algorithm MEDUSA` is set, so
+   [scheduler.py L2225](../../python/sglang/srt/managers/scheduler.py#L2225)
+   takes the spec-v1 branch and passes the raw `ScheduleBatch` (not a
+   `ModelWorkerBatch`) into `model_worker.forward_batch_generation`. Combined
+   with `--enable-torch-compile`, the prefill request flows into
+   `graph_runner.replay`, where `raw_num_token = 1 * 1 = 1` cannot broadcast
+   the 7-token prefill `input_ids`.
+
+**Fix (chosen path).** Per CHANGE_0154 §2 we **already committed to eager-only
+in R1b**; CUDA-graph capture for the verify path is deferred to R1c. So we
+simply make `prepare_env.sh` strip `--enable-torch-compile` /
+`--torch-compile-max-bs N` and append `--disable-cuda-graph` whenever
+`SOAR_SPEC_MEDUSA=1`:
+
+```bash
+if [[ "$SOAR_SPEC_MEDUSA" == "1" ... ]]; then
+    NUM_DRAFT_TOKENS=$(( SOAR_SPEC_MEDUSA_HEADS + 1 ))
+    export SGLANG_SERVER_ARGS="... --speculative-algorithm MEDUSA \
+        --speculative-num-medusa-heads ${SOAR_SPEC_MEDUSA_HEADS} \
+        --speculative-num-draft-tokens ${NUM_DRAFT_TOKENS}"
+    # Eager-only for Stage 2/3; CUDA-graph capture lands in R1c.
+    export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--enable-torch-compile/}"
+    export SGLANG_SERVER_ARGS="$(echo "$SGLANG_SERVER_ARGS" | sed -E 's/--torch-compile-max-bs [0-9]+//g')"
+    export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS} --disable-cuda-graph"
+fi
+```
+
+**Implications for benchmarks.** With CUDA graph + torch.compile disabled,
+Stage 2 will be slower than the v22 baseline (rough estimate: 1.3–2× regression
+on S1/S8/Smax). This is **expected and acceptable for Stage 2 validation**:
+the goal is byte-identical accuracy and a working dispatch path. The speed
+regression will be removed in **R1c** when we add a dedicated TARGET_VERIFY
+graph capture branch for MEDUSA in `cuda_graph_runner.py`.
+
+**Validation expectation (re-run).** Accuracy: byte-identical to v22 baseline.
+Speed: significant regression (eager mode); we record but do not gate on it.
+
+**Files touched (delta).**
+- [benchmark/soar/demo_sala/prepare_env.sh](../../benchmark/soar/demo_sala/prepare_env.sh)
+  — strip torch-compile + append `--disable-cuda-graph` in the MEDUSA branch.

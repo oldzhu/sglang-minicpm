@@ -159,6 +159,69 @@ python3 scripts/fcloud/fcloud_workflow.py server-logs --lines 200   # 验证 "Me
 
 预计 Stage 3 改动量:`medusa_worker.py` 约 400 LOC,加上六处 1 行守卫。
 
+## 10. Stage 2 fcloud 启动补丁（2026-05-11）
+
+**首次以 `SOAR_SPEC_MEDUSA=1` 启动服务器**确认 worker 初始化成功：
+
+```
+[2026-05-11 00:41:32] MedusaWorker Stage 2 ready: K=1, hidden=4096,
+  dtype=torch.bfloat16, device=cuda:0, approx_weight_MiB=32.0
+```
+
+但 **第一个 prefill 请求崩溃**：
+
+```
+File .../medusa_worker.py L150 ... forward_batch_generation
+    batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+File .../model_runner.py L2251 ... _forward_raw
+    ret = self.graph_runner.replay(...)
+File .../input_buffers.py L156 ... populate_from_forward_batch
+    self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+RuntimeError: output with shape [1] doesn't match the broadcast shape [7]
+```
+
+**根因。** sglang 内部两段逻辑在 "已注册 MEDUSA 但没有真实 draft" 时相互矛盾：
+
+1. [cuda_graph_runner.py L281](../../python/sglang/srt/model_executor/cuda_graph_runner.py#L281)
+   只对 EAGLE / STANDALONE / NGRAM 把 `num_tokens_per_bs` 设为
+   `speculative_num_draft_tokens`，MEDUSA 走 default 分支（保持 = 1），
+   所以 16 张图（捕获耗时 936 s）都按普通 decode shape 录制。
+2. 但 `--speculative-algorithm MEDUSA` 已被设置，[scheduler.py L2225](../../python/sglang/srt/managers/scheduler.py#L2225)
+   走 spec-v1 分支，把 `ScheduleBatch` 直接传给
+   `model_worker.forward_batch_generation`。叠加 `--enable-torch-compile` 后，
+   prefill 请求被 dispatch 进 `graph_runner.replay`，而 `raw_num_token = 1 * 1 = 1`
+   无法 broadcast 7 个 token 的 prefill `input_ids`。
+
+**修复（已选定路径）。** CHANGE_0154 §2 已明确 **R1b 全程纯 eager**，verify 路径
+的 CUDA graph capture 推迟到 R1c。因此只需在 `prepare_env.sh` 里：
+当 `SOAR_SPEC_MEDUSA=1` 时剥离 `--enable-torch-compile` /
+`--torch-compile-max-bs N`，并追加 `--disable-cuda-graph`：
+
+```bash
+if [[ "$SOAR_SPEC_MEDUSA" == "1" ... ]]; then
+    NUM_DRAFT_TOKENS=$(( SOAR_SPEC_MEDUSA_HEADS + 1 ))
+    export SGLANG_SERVER_ARGS="... --speculative-algorithm MEDUSA \
+        --speculative-num-medusa-heads ${SOAR_SPEC_MEDUSA_HEADS} \
+        --speculative-num-draft-tokens ${NUM_DRAFT_TOKENS}"
+    # Stage 2/3 全程 eager；图捕获在 R1c 处理。
+    export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--enable-torch-compile/}"
+    export SGLANG_SERVER_ARGS="$(echo "$SGLANG_SERVER_ARGS" | sed -E 's/--torch-compile-max-bs [0-9]+//g')"
+    export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS} --disable-cuda-graph"
+fi
+```
+
+**对基准测试的影响。** 关闭 CUDA graph + torch.compile 后，Stage 2 比 v22 baseline
+会明显变慢（粗估 S1/S8/Smax 各退化 1.3–2 倍）。**Stage 2 接受这一退化**：
+本阶段目标是字节级精度对齐 + dispatch 路径打通；速度退化将在 **R1c**（在
+`cuda_graph_runner.py` 中为 MEDUSA 增加 TARGET_VERIFY graph capture 分支）后消除。
+
+**重测预期。** 精度：与 v22 baseline 字节级一致。速度：明显退化（eager 模式），
+仅记录，不作为通过门槛。
+
+**本次改动文件（delta）。**
+- [benchmark/soar/demo_sala/prepare_env.sh](../../benchmark/soar/demo_sala/prepare_env.sh)
+  — 在 MEDUSA 分支剥离 torch-compile 并追加 `--disable-cuda-graph`。
+
 ## 9. 参考
 
 - [CHANGE_0153_medusa_phase_r1_design.zh.md](CHANGE_0153_medusa_phase_r1_design.zh.md)
