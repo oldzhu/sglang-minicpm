@@ -222,6 +222,72 @@ fi
 - [benchmark/soar/demo_sala/prepare_env.sh](../../benchmark/soar/demo_sala/prepare_env.sh)
   — 在 MEDUSA 分支剥离 torch-compile 并追加 `--disable-cuda-graph`。
 
+## 11. Stage 2 fcloud 启动补丁 #2 — decode-prep bug（2026-05-11）
+
+**eager 模式重测**越过了 cuda-graph 崩溃：**第一个 prefill 请求成功**
+（Marlin GEMM 在 M=7 跑通）。但**第二次 forward 调用**（第一个 decode step）
+立即崩溃：
+
+```
+RuntimeError: Number of tokens in position_ids must match QKV
+```
+
+位于 `fused_qk_norm_rope`，M=7（即 decode batch 仍带着 prefill 阶段的 7 个 input_ids）。
+
+**根因。** [schedule_batch.py L1948](../../python/sglang/srt/managers/schedule_batch.py#L1948)：
+
+```python
+def prepare_for_decode(self):
+    self.forward_mode = ForwardMode.DECODE
+    ...
+    if not self.spec_algorithm.is_none():
+        # 投机解码下，decode batch 由 spec worker 自己准备
+        return   # ← 提前返回
+```
+
+scheduler 在两次迭代之间会调用 `batch.prepare_for_decode()`。当
+`spec_algorithm != NONE` 时，它**只翻转 forward_mode 到 DECODE，但跳过所有
+字段更新**（`input_ids = output_ids`、`seq_lens += 1`、`alloc_for_decode` 等），
+因为 EAGLE/NGRAM worker 自己会在 `_prepare_for_speculative_decoding` →
+`prepare_for_verify` 内做这些。
+
+Stage 2 MedusaWorker 是**纯透传**，没有 `_prepare_for_speculative_decoding`。
+于是 decode batch 到达我们 worker 时，`forward_mode = DECODE` 但 `input_ids`
+仍保留 prefill 的 [7 tokens]。下游 `_forward_raw` 调度到 `forward_decode`，
+但 `positions = clamp_position(seq_lens=[7])` 长度只有 1，与 input_ids 长度 7
+不匹配 → fused_qk_norm_rope 断言失败。
+
+**修复。** 在 `MedusaWorker.forward_batch_generation` 中，当 batch 进入 DECODE
+模式时，临时把 `batch.spec_algorithm` 设为 NONE 并再次调用 `prepare_for_decode()`
+来补完被跳过的准备工作，随后恢复原 spec_algorithm：
+
+```python
+if batch.forward_mode.is_decode():
+    saved_spec_algo = batch.spec_algorithm
+    batch.spec_algorithm = SpeculativeAlgorithm.NONE
+    try:
+        batch.prepare_for_decode()
+    finally:
+        batch.spec_algorithm = saved_spec_algo
+```
+
+证据是临时调试日志（commit `db839a4b1`，修复 commit 中已移除）抓到的两条
+打印：
+
+```
+[MedusaWorker.fbg] batch.forward_mode=EXTEND ... input_ids_len=7   ← prefill 正常
+[MedusaWorker.fbg] batch.forward_mode=DECODE ... input_ids_len=7   ← 字段陈旧，崩溃
+```
+
+**对 Stage 3 安全。** Stage 3 实现完整的 verify+rewind 后，
+`_prepare_for_speculative_decoding` 会在 dispatch 前把 `forward_mode` 翻转
+到 `TARGET_VERIFY`。本补丁中的 `is_decode()` 分支自然会跳过，因为那时
+`forward_mode == TARGET_VERIFY`。所以 Stage 2 的这个补丁不会阻塞 Stage 3。
+
+**本次改动文件（delta #2）。**
+- [python/sglang/srt/speculative/medusa_worker.py](../../python/sglang/srt/speculative/medusa_worker.py)
+  — 当 batch 处于 decode 模式时，补完 scheduler 跳过的 `prepare_for_decode`。
+
 ## 9. 参考
 
 - [CHANGE_0153_medusa_phase_r1_design.zh.md](CHANGE_0153_medusa_phase_r1_design.zh.md)

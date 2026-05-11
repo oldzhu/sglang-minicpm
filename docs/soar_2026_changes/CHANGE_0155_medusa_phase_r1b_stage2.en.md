@@ -242,3 +242,76 @@ Speed: significant regression (eager mode); we record but do not gate on it.
 **Files touched (delta).**
 - [benchmark/soar/demo_sala/prepare_env.sh](../../benchmark/soar/demo_sala/prepare_env.sh)
   — strip torch-compile + append `--disable-cuda-graph` in the MEDUSA branch.
+
+## 11. Stage 2 fcloud bring-up addendum #2 — decode-prep bug (2026-05-11)
+
+**Re-test with eager mode** progressed past the cuda-graph crash: the **first
+prefill request succeeded** (Marlin GEMM ran at M=7). But the **second
+forward call** (the first decode step) crashed:
+
+```
+RuntimeError: Number of tokens in position_ids must match QKV
+```
+
+at `fused_qk_norm_rope` with `M=7` (i.e. the decode batch still carried 7
+input_ids from the prefill).
+
+**Root cause.** [schedule_batch.py L1948](../../python/sglang/srt/managers/schedule_batch.py#L1948):
+
+```python
+def prepare_for_decode(self):
+    self.forward_mode = ForwardMode.DECODE
+    ...
+    if not self.spec_algorithm.is_none():
+        # if spec decoding is used, the decode batch is prepared inside
+        # `forward_batch_speculative_generation` after running draft models.
+        return   # ← early return
+```
+
+The scheduler calls `batch.prepare_for_decode()` between iterations. When
+`spec_algorithm != NONE`, it flips `forward_mode` to `DECODE` but **skips
+the field updates** (`input_ids = output_ids`, `seq_lens += 1`, `alloc_for_decode`,
+etc.) because EAGLE/NGRAM workers do that themselves inside
+`_prepare_for_speculative_decoding` → `prepare_for_verify`.
+
+Stage 2 MedusaWorker is a **pure pass-through** and has no
+`_prepare_for_speculative_decoding`. So the decode batch reaches our worker
+with `forward_mode = DECODE` but `input_ids` still holding the stale prefill
+[7 tokens]. Downstream `_forward_raw` then dispatches to `forward_decode`,
+but `positions = clamp_position(seq_lens=[7])` has length 1, while
+`input_ids` has length 7 → fused_qk_norm_rope assertion fires.
+
+**Fix.** In `MedusaWorker.forward_batch_generation`, when the incoming
+batch is `DECODE`, temporarily set `batch.spec_algorithm = NONE` and call
+`prepare_for_decode()` again to finish the skipped prep, then restore the
+original spec_algorithm:
+
+```python
+if batch.forward_mode.is_decode():
+    saved_spec_algo = batch.spec_algorithm
+    batch.spec_algorithm = SpeculativeAlgorithm.NONE
+    try:
+        batch.prepare_for_decode()
+    finally:
+        batch.spec_algorithm = saved_spec_algo
+```
+
+This is **diagnostic-grade evidence** captured via temporary debug logging
+(committed `db839a4b1`, removed in the fix commit). The two log lines
+showed:
+
+```
+[MedusaWorker.fbg] batch.forward_mode=EXTEND ... input_ids_len=7   ← prefill OK
+[MedusaWorker.fbg] batch.forward_mode=DECODE ... input_ids_len=7   ← stale, crashes
+```
+
+**Why this is safe for Stage 3.** Stage 3 (full verify+rewind) will add
+`_prepare_for_speculative_decoding` that runs BEFORE the decode dispatch
+and flips `forward_mode` to `TARGET_VERIFY`. The `is_decode()` branch added
+here will be skipped naturally because `forward_mode == TARGET_VERIFY` at
+that point. So this Stage 2 patch does not block Stage 3.
+
+**Files touched (delta #2).**
+- [python/sglang/srt/speculative/medusa_worker.py](../../python/sglang/srt/speculative/medusa_worker.py)
+  — finish the scheduler-skipped `prepare_for_decode` when the batch is in
+  decode mode.
