@@ -421,6 +421,10 @@ fi
 # Set SOAR_SPEC_MEDUSA=0 to fall back to the pure v22 path.
 export SOAR_SPEC_MEDUSA="${SOAR_SPEC_MEDUSA:-1}"
 export SOAR_SPEC_MEDUSA_HEADS="${SOAR_SPEC_MEDUSA_HEADS:-1}"
+# Stage 3b: path to trained Medusa head checkpoint (.pt file).
+# When set, MedusaWorker loads W1 weights and uses the head for draft generation.
+# When empty (default = Stage 3a zero-init), draft = req.output_ids[-1].
+export SOAR_MEDUSA_HEAD_PATH="${SOAR_MEDUSA_HEAD_PATH:-}"
 if [[ "$SOAR_SPEC_MEDUSA" == "1" || "$SOAR_SPEC_MEDUSA" == "true" || "$SOAR_SPEC_MEDUSA" == "TRUE" ]]; then
 	NUM_DRAFT_TOKENS=$(( SOAR_SPEC_MEDUSA_HEADS + 1 ))
 	export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS} --speculative-algorithm MEDUSA --speculative-num-medusa-heads ${SOAR_SPEC_MEDUSA_HEADS} --speculative-num-draft-tokens ${NUM_DRAFT_TOKENS}"
