@@ -252,7 +252,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     device=forward_batch.input_ids.device,
                 )
 
-                if forward_batch.spec_info.topk > 1:
+                if getattr(forward_batch.spec_info, "topk", 1) > 1:
                     retrieve_next_token = forward_batch.spec_info.retrive_next_token
                     retrieve_next_sibling = forward_batch.spec_info.retrive_next_sibling
                     # retrieve_next_token is None during dummy run so skip tensor creation
