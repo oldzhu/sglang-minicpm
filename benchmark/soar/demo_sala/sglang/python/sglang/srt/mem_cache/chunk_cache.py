@@ -54,7 +54,14 @@ class ChunkCache(BasePrefixCache):
             req.req_pool_idx, :kv_committed_len
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
-        self.token_to_kv_pool_allocator.free(kv_indices)
+        # CHANGE_0159: filter out slot-0 (reserved sentinel) from main KV indices.
+        # In MEDUSA with draft_token_num=1, when accept_length=1 the bonus token
+        # position in req_to_token is never written (stays 0) but kv_committed_len
+        # is incremented by accept_length+1=2. free([0]) adds the sentinel back
+        # to free_pages causing available_size > max_total_num_tokens crash.
+        kv_indices_valid = kv_indices[kv_indices.ne(0)].to(torch.int64)
+        if kv_indices_valid.numel() > 0:
+            self.token_to_kv_pool_allocator.free(kv_indices_valid)
 
         if isinstance(self.req_to_token_pool, (MiniCPMReqToTokenPool, MiniCPMHybridReqToTokenPool)):
             kernel_size = self.req_to_token_pool.kernel_size
