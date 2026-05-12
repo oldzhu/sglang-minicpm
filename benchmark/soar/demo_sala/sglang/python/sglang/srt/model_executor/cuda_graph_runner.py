@@ -432,12 +432,26 @@ class CudaGraphRunner:
             else True
         )
 
+        # For MEDUSA: cuda graphs are captured with capture_forward_mode=DECODE.
+        # When the verify step runs (forward_mode=TARGET_VERIFY), the DECODE graph
+        # cannot handle NgramVerifyInput (it lacks kv_indptr/kv_indices attributes
+        # that the decode indices updater expects).  Return False here so that
+        # TARGET_VERIFY falls through to eager forward_extend(), which calls
+        # attn_backend.init_forward_metadata() → generate_attn_arg_prefill()
+        # via prefill_wrappers_verify — the correct code path.
+        # DECODE steps are unaffected (still use cuda graph as normal).
+        is_medusa_verify_ok = not (
+            self.model_runner.spec_algorithm.is_medusa()
+            and forward_batch.forward_mode.is_target_verify()
+        )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_medusa_verify_ok
         )
 
     def _init_profile_context_and_memory_record(self):

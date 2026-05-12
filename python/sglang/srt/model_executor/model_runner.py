@@ -2284,7 +2284,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend=reinit_attn_backend,
                 forward_count=split_forward_count,
             )
-        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True) or (
+            forward_batch.forward_mode.is_target_verify()
+            and self.spec_algorithm.is_medusa()
+        ):
+            # TARGET_VERIFY + MEDUSA: cuda graph is not captured for verify
+            # (capture_forward_mode=DECODE for MEDUSA); forward_extend() handles
+            # TARGET_VERIFY correctly via attn_backend.init_forward_metadata()
+            # → prefill_wrappers_verify → generate_attn_arg_prefill().
             ret = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
