@@ -76,6 +76,14 @@ class ChunkCache(BasePrefixCache):
                 k1_indices_valid = k1_indices[k1_indices.ne(0)].to(torch.int64)
                 if k1_indices_valid.numel() > 0:
                     self.token_to_kv_pool_allocator.free(k1_indices_valid)
+                # CHANGE_0161: zero out the K1 row so stale non-zero values from this
+                # request do NOT survive to be phantom-freed by a future request that
+                # reuses the same pool_idx with a smaller k1_prefill.  The root cause
+                # is that MEDUSA decode does not call alloc_for_decode (so no new K1
+                # slots are written), yet kv_committed_len still grows, which makes
+                # k1_total grow past k1_prefill into positions that still hold the
+                # freed slot-IDs from a previous, longer request.
+                self.req_to_token_pool.req_to_sparse_k1_token[req.req_pool_idx, :k1_total] = 0
 
             k2_kernel_size = kernel_size * 4
             k2_kernel_stride = kernel_stride * 4
@@ -86,6 +94,8 @@ class ChunkCache(BasePrefixCache):
                 k2_indices_valid = k2_indices[k2_indices.ne(0)].to(torch.int64)
                 if k2_indices_valid.numel() > 0:
                     self.token_to_kv_pool_allocator.free(k2_indices_valid)
+                # CHANGE_0161: same stale-row zero-out for K2.
+                self.req_to_token_pool.req_to_sparse_k2_token[req.req_pool_idx, :k2_total] = 0
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         from sglang.srt.mem_cache.memory_pool import MiniCPMHybridReqToTokenPool
