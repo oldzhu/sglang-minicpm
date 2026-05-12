@@ -198,6 +198,21 @@ QUANT_MODE="${SOAR_QUANT_MODE}"
 # defaults for A/B testing.
 export SOAR_BACKEND_VARIANT="${SOAR_BACKEND_VARIANT:-flashinfer}"
 
+# CHANGE_0162 (2026-05-12): default SOAR_BACKEND_KEEP_FORCE_DENSE=1 so that
+# --force-dense-minicpm is always active with the flashinfer backend.
+# Structural fix: --force-dense-minicpm → model_config.has_sparse_attention=False
+# → HybridReqToTokenPool (no req_to_sparse_k1_token) → K1/K2 crash class
+# structurally impossible. Verified 2026-05-12 (Stage3a-force-dense test):
+#   - Zero crashes on accuracy (150 req) + speed (S1/S8/Smax) runs
+#   - Zero speed impact vs no-force-dense (202.70/61.60/43.29s vs 202.96/61.65/43.40s)
+#   - Accuracy: 77.87% (norm≈97.34%, C=0.92) — within Stage 3a noise band
+# Previously this was off by default when SOAR_BACKEND_VARIANT=flashinfer (the
+# Round 13f-1 default), causing MiniCPMHybridReqToTokenPool to be allocated
+# even though flashinfer never uses K1/K2 sparse tables — the stale-row crash
+# in MEDUSA decode was the concrete symptom. Set SOAR_BACKEND_KEEP_FORCE_DENSE=0
+# to roll back to old flashinfer-without-force-dense behaviour for A/B testing.
+export SOAR_BACKEND_KEEP_FORCE_DENSE="${SOAR_BACKEND_KEEP_FORCE_DENSE:-1}"
+
 # CHANGE_0140 (Round 14.1): patch chat_template at preprocess time to disable
 # enable_thinking for mcq prompts (detected by literal substring
 # "LETTER is one of ABCD"). Targets mcq runaway-thinking failure mode.
