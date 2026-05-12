@@ -274,39 +274,28 @@ class MedusaWorker:
 
         model_worker_batch = batch.get_model_worker_batch()
 
-        # 5. Snapshot GLA state before verify forward (Stage 3 §14).
-        gla_backend = self._get_gla_backend()
-        if gla_backend is not None:
-            # Use req_to_token_pool.get_mamba_indices to get per-request GLA
-            # pool indices (independent of forward_metadata which isn't set yet).
-            mamba_indices = (
-                gla_backend.req_to_token_pool.get_mamba_indices(
-                    batch.req_pool_indices
-                )
-            )
-            gla_backend.snapshot_state_for_spec(mamba_indices)
-
-        # 6. Run TARGET_VERIFY forward.
+        # 5. Run TARGET_VERIFY forward.
+        #
+        # Stage 3a design note (CHANGE_0155):
+        # SimpleGLAAttnBackend.forward now loads the existing recurrent state
+        # when forward_mode.is_target_verify() is True, so the GLA state is
+        # advanced by exactly 1 token — identical to a normal DECODE step.
+        # No snapshot/restore/correction is needed for K=1 always-accept.
+        # (For K>1 partial-accept (Stage 3b) we will add the snapshot + correction
+        # forward path at that time.)
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
         )
         logits_output = batch_result.logits_output
         can_run_cuda_graph = batch_result.can_run_cuda_graph
 
-        # 7. Accept walk (always accepts root for K=1 zero-init Medusa).
+        # 6. Accept walk (always accepts root for K=1 zero-init Medusa).
         logits_output, next_token_ids, num_accepted_tokens = spec_info.verify(
             batch, logits_output, self.page_size
         )
         accept_lens = spec_info.accept_length  # (bs,) tensor, always 0 for K=1
 
-        # 8. GLA state is correct after single-token verify (K=1, accept_len==0):
-        #    The model processed exactly 1 token (the accepted root draft), so
-        #    GLA state advanced by exactly 1 — same as a normal decode step.
-        #    Just discard the snapshot.
-        if gla_backend is not None:
-            gla_backend.clear_state_snapshot_for_spec()
-
-        # 9. Restore forward_mode / spec_algorithm for scheduler bookkeeping.
+        # 7. Restore forward_mode / spec_algorithm for scheduler bookkeeping.
         batch.forward_mode = ForwardMode.DECODE
         batch.spec_algorithm = SpeculativeAlgorithm.MEDUSA
 

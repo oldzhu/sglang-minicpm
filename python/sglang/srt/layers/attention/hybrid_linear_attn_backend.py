@@ -1735,8 +1735,17 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         mamba_indices = self._get_mamba_indices(forward_batch)
         layer_cache = self._get_layer_cache(layer_id)
         initial_state = None
-        if forward_batch.forward_mode.is_decode() or self._has_prefix_state(
-            forward_batch
+        # TARGET_VERIFY is logically a single-step decode for each request: the
+        # draft token must be processed against the *existing* recurrent state so
+        # that (a) logits are correct and (b) the state advances by exactly one
+        # token (matching what a normal DECODE step would produce).  Without this
+        # guard, `initial_state` stays None and the kernel starts from zero state,
+        # corrupting every subsequent GLA computation (root cause of Stage 3a 0%
+        # accuracy, commit CHANGE_0155).
+        if (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+            or self._has_prefix_state(forward_batch)
         ):
             initial_state = self._load_initial_state(layer_cache, mamba_indices)
 
