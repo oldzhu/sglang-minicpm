@@ -63,14 +63,22 @@ class ChunkCache(BasePrefixCache):
             k1_total = (kv_committed_len - kernel_size) // kernel_stride + 1 if kv_committed_len >= kernel_size else 0
             if k1_total > 0:
                 k1_indices = self.req_to_token_pool.req_to_sparse_k1_token[req.req_pool_idx, :k1_total]
-                self.token_to_kv_pool_allocator.free(k1_indices)
+                # CHANGE_0158: filter out slot-0 (reserved/unallocated sentinel) to prevent
+                # over-free when MEDUSA decode skips alloc_for_decode (sparse slots are
+                # never written for decode steps) but kv_committed_len still advances.
+                k1_indices_valid = k1_indices[k1_indices.ne(0)].to(torch.int64)
+                if k1_indices_valid.numel() > 0:
+                    self.token_to_kv_pool_allocator.free(k1_indices_valid)
 
             k2_kernel_size = kernel_size * 4
             k2_kernel_stride = kernel_stride * 4
             k2_total = (kv_committed_len - k2_kernel_size) // k2_kernel_stride + 1 if kv_committed_len >= k2_kernel_size else 0
             if k2_total > 0:
                 k2_indices = self.req_to_token_pool.req_to_sparse_k2_token[req.req_pool_idx, :k2_total]
-                self.token_to_kv_pool_allocator.free(k2_indices)
+                # CHANGE_0158: same zero-filter for k2 sparse slots.
+                k2_indices_valid = k2_indices[k2_indices.ne(0)].to(torch.int64)
+                if k2_indices_valid.numel() > 0:
+                    self.token_to_kv_pool_allocator.free(k2_indices_valid)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         from sglang.srt.mem_cache.memory_pool import MiniCPMHybridReqToTokenPool
