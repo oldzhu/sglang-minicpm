@@ -300,6 +300,84 @@ def train(
     return W1
 
 
+def _train_from_gptq_dump(args) -> None:
+    """Train Medusa head using pre-collected GPTQ hidden states (CHANGE_0164).
+
+    Skips model loading entirely.  Instead:
+      1. Loads hidden states (N, hidden_size) FP16 from ``args.hidden_dump_path``.
+      2. Loads lm_head.weight (vocab_size, hidden_size) from
+         ``args.hidden_dump_path + '.lm_head_weight.pt'``.
+      3. Computes targets y = argmax(F.linear(h, lm_head_weight)) to replicate
+         what the GPTQ model actually predicts, not the ground-truth next token.
+      4. Trains the W1 layer using the existing ``train()`` function.
+    """
+    device = args.device
+
+    # 1. Load hidden states
+    logger.info("Loading GPTQ hidden states from %s …", args.hidden_dump_path)
+    h_tensor = torch.load(
+        args.hidden_dump_path, map_location="cpu", weights_only=True
+    )
+    h_tensor = h_tensor.float()
+    logger.info("Hidden states: shape=%s", list(h_tensor.shape))
+
+    # 2. Load lm_head.weight
+    lm_weight_path = args.hidden_dump_path + ".lm_head_weight.pt"
+    if not os.path.exists(lm_weight_path):
+        logger.error("lm_head weight file not found: %s", lm_weight_path)
+        sys.exit(1)
+    lm_head_weight = torch.load(
+        lm_weight_path, map_location="cpu", weights_only=True
+    )
+    logger.info("lm_head.weight: shape=%s, dtype=%s", list(lm_head_weight.shape), lm_head_weight.dtype)
+    vocab_size, hidden_size = lm_head_weight.shape
+
+    # 3. Compute labels: y = argmax(F.linear(h, lm_head_weight)) in chunks
+    logger.info("Computing GPTQ training labels …")
+    lm_w_gpu = lm_head_weight.to(device, dtype=torch.bfloat16)
+    h_bf16 = h_tensor.to(device, dtype=torch.bfloat16)
+    chunk_size = 1024
+    label_parts = []
+    with torch.no_grad():
+        for i in range(0, h_bf16.shape[0], chunk_size):
+            chunk = h_bf16[i : i + chunk_size]
+            logits = F.linear(chunk, lm_w_gpu)
+            label_parts.append(logits.argmax(dim=-1).cpu())
+    label_tensor = torch.cat(label_parts, dim=0)
+    del h_bf16, lm_w_gpu, label_parts
+    logger.info("Computed %d labels", len(label_tensor))
+
+    # 4. Build a frozen nn.Linear wrapper for the train() function
+    lm_head = nn.Linear(hidden_size, vocab_size, bias=False, dtype=torch.bfloat16)
+    lm_head.weight = nn.Parameter(
+        lm_head_weight.to(torch.bfloat16), requires_grad=False
+    )
+
+    # 5. Train
+    W1 = train(
+        h=h_tensor,
+        labels=label_tensor,
+        lm_head=lm_head,
+        hidden_size=hidden_size,
+        device=device,
+        epochs=args.epochs,
+        lr=args.lr,
+        batch_size=args.batch_size,
+    )
+
+    # 6. Save checkpoint
+    checkpoint = {"heads.0.W1.weight": W1.weight.cpu()}
+    torch.save(checkpoint, args.output)
+    size_mb = os.path.getsize(args.output) / (1024 * 1024)
+    logger.info(
+        "Saved GPTQ-aligned checkpoint → %s (%.1f MiB, shape=%s)",
+        args.output,
+        size_mb,
+        list(W1.weight.shape),
+    )
+    logger.info("To enable: export SOAR_MEDUSA_HEAD_PATH=%s", args.output)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -331,7 +409,19 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16",
                         choices=["bfloat16", "float16", "float32"])
+    parser.add_argument(
+        "--hidden-dump-path",
+        default=None,
+        help="Path to pre-collected GPTQ hidden states (.pt from SOAR_MEDUSA_DUMP_HIDDEN). "
+             "When set, skips model loading and trains directly on GPTQ server's hidden states. "
+             "Requires <hidden-dump-path>.lm_head_weight.pt in the same location.",
+    )
     args = parser.parse_args()
+
+    if args.hidden_dump_path:
+        # Fast path: train from GPTQ dump, no model loading required.
+        _train_from_gptq_dump(args)
+        return
 
     device = args.device
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}

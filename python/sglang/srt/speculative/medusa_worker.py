@@ -162,6 +162,29 @@ class MedusaWorker:
             / (1024 * 1024),
         )
 
+        # ---- GPTQ hidden-state collection (CHANGE_0164) ----
+        # Set SOAR_MEDUSA_DUMP_HIDDEN=<path> to collect (N, hidden_size) FP16
+        # tensors from TARGET_VERIFY forwards.  Used to retrain the Medusa head
+        # against GPTQ-quantized hidden states so that accept rate is non-zero.
+        # Set SOAR_MEDUSA_DUMP_MAX_ROWS to cap collection (default 20000).
+        self._dump_hidden_path: str = os.environ.get(
+            "SOAR_MEDUSA_DUMP_HIDDEN", ""
+        ).strip()
+        self._dump_max_rows: int = int(
+            os.environ.get("SOAR_MEDUSA_DUMP_MAX_ROWS", "20000")
+        )
+        self._dump_hidden_buffer: list = []
+        self._dump_total_rows: int = 0
+        self._dump_lm_head_saved: bool = False
+        if self._dump_hidden_path:
+            logger.info(
+                "MedusaWorker: GPTQ hidden-state dump ENABLED → %s "
+                "(max_rows=%d).  lm_head.weight will be saved to %s",
+                self._dump_hidden_path,
+                self._dump_max_rows,
+                self._dump_hidden_path + ".lm_head_weight.pt",
+            )
+
     # ----- BaseSpecWorker-compatible duck-typed interface -----
 
     @property
@@ -232,6 +255,31 @@ class MedusaWorker:
         # ---- DECODE path (Stage 3b verify) ----
         return self._forward_verify_k1(batch)
 
+    def _flush_hidden_dump(self) -> None:
+        """Flush accumulated hidden states to disk (CHANGE_0164 dump mode)."""
+        if not self._dump_hidden_buffer:
+            return
+        try:
+            new_rows = torch.cat(self._dump_hidden_buffer, dim=0)
+            if os.path.exists(self._dump_hidden_path):
+                existing = torch.load(
+                    self._dump_hidden_path, map_location="cpu", weights_only=True
+                )
+                combined = torch.cat([existing, new_rows], dim=0)
+            else:
+                combined = new_rows
+            torch.save(combined, self._dump_hidden_path)
+            logger.info(
+                "MedusaWorker: flushed %d new rows \u2192 %s (total %d / %d)",
+                new_rows.shape[0],
+                self._dump_hidden_path,
+                combined.shape[0],
+                self._dump_max_rows,
+            )
+            self._dump_hidden_buffer.clear()
+        except Exception as exc:
+            logger.warning("MedusaWorker: failed to flush hidden dump: %s", exc)
+
     def _forward_verify_k1(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run the K=1 Medusa verify step (Stage 3b).
 
@@ -293,7 +341,13 @@ class MedusaWorker:
             retrive_next_sibling=retrive_next_sibling,
             draft_token_num=1,
         )
-        if self._use_trained_heads:
+        # Capture hidden states when either trained heads are active or dump mode
+        # is collecting GPTQ hidden states for retraining.
+        _should_capture = self._use_trained_heads or (
+            bool(self._dump_hidden_path)
+            and self._dump_total_rows < self._dump_max_rows
+        )
+        if _should_capture:
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
 
         # 4. Prepare batch for TARGET_VERIFY.
@@ -317,11 +371,47 @@ class MedusaWorker:
         #    to map one hidden state per request for the next step's draft prediction.
         raw_hidden_states: Optional[torch.Tensor] = None
         if (
-            self._use_trained_heads
+            _should_capture
             and logits_output is not None
             and logits_output.hidden_states is not None
         ):
             raw_hidden_states = logits_output.hidden_states  # (bs, hidden_size)
+
+        # ---- Dump mode: accumulate GPTQ hidden states for retraining ----
+        if (
+            self._dump_hidden_path
+            and self._dump_total_rows < self._dump_max_rows
+            and raw_hidden_states is not None
+        ):
+            if not self._dump_lm_head_saved:
+                try:
+                    lm_w = self.medusa_heads.lm_head.weight.detach().cpu()
+                    torch.save(lm_w, self._dump_hidden_path + ".lm_head_weight.pt")
+                    logger.info(
+                        "MedusaWorker: saved lm_head.weight → %s (shape %s)",
+                        self._dump_hidden_path + ".lm_head_weight.pt",
+                        list(lm_w.shape),
+                    )
+                    self._dump_lm_head_saved = True
+                except Exception as exc:
+                    logger.warning(
+                        "MedusaWorker: failed to save lm_head.weight: %s", exc
+                    )
+            h_cpu = raw_hidden_states.detach().cpu().to(torch.float16)
+            self._dump_hidden_buffer.append(h_cpu)
+            self._dump_total_rows += h_cpu.shape[0]
+            if (
+                len(self._dump_hidden_buffer) >= 50
+                or self._dump_total_rows >= self._dump_max_rows
+            ):
+                self._flush_hidden_dump()
+            if self._dump_total_rows >= self._dump_max_rows:
+                logger.info(
+                    "MedusaWorker: dump complete (%d rows).  "
+                    "Run train_medusa_head.py --hidden-dump-path %s to retrain.",
+                    self._dump_total_rows,
+                    self._dump_hidden_path,
+                )
 
         # 7. Accept walk.
         logits_output, next_token_ids, num_accepted_tokens = spec_info.verify(
@@ -365,6 +455,7 @@ class MedusaWorker:
         batch.spec_algorithm = SpeculativeAlgorithm.MEDUSA
 
         return GenerationBatchResult(
+
             logits_output=logits_output,
             next_token_ids=next_token_ids,
             num_accepted_tokens=num_accepted_tokens,
