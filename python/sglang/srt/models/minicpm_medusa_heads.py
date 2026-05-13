@@ -93,13 +93,14 @@ class MedusaHeads(nn.Module):
         Returns:
             logits stacked along a new dim K, shape (B, num_heads, vocab_size).
         """
+        # In sglang, ParallelLMHead.forward() raises RuntimeError by design.
+        # We must use F.linear with the weight tensor directly.
+        lm_weight = self.lm_head.weight  # (vocab_size, hidden_size)
         outs: List[torch.Tensor] = []
         for head in self.heads:
-            outs.append(self.lm_head(head(h)))
-        # NOTE: lm_head may return a tuple in sglang (logits, others) depending
-        # on the LogitsProcessor wiring. R1b will adapt as needed; R1a only
-        # defines the structure.
-        return torch.stack(outs, dim=1) if not isinstance(outs[0], tuple) else outs  # type: ignore[return-value]
+            head_h = head(h)  # (B, hidden_size)
+            outs.append(F.linear(head_h, lm_weight))  # (B, vocab_size)
+        return torch.stack(outs, dim=1)  # (B, num_heads, vocab_size)
 
     def load_trained_weights(self, path: str, device: str = "cuda") -> None:
         """Load W1 weights from a checkpoint saved by ``train_medusa_head.py``.
