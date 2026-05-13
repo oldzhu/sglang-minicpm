@@ -80,23 +80,13 @@ class MedusaWorker:
         self.page_size = server_args.page_size
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
 
-        # K=1 Medusa with canonical EAGLE/NGRAM-style verify layout:
-        # ndt = num_heads + 1 = 2 positions per request in the verify input.
-        #   position 0 = bonus = last committed token (T_N from output_ids[-1])
-        #   position 1 = speculative draft (head's prediction of T_{N+1}, or
-        #                fallback = output_ids[-1] when no trained head)
-        # The sgl_kernel VerifyTreeGreedy treats position 0 as "root, always
-        # accepted" and walks children (positions 1..ndt-1) to validate against
-        # target_predict[root]. This is the layout sglang's NGRAM/EAGLE workers
-        # use; using ndt=1 (which we did in CHANGE_0164) makes the verify tree
-        # have zero children, so no draft can ever be accepted AND the kernel's
-        # final assignment ``predicts[root] = target_predict[root]`` writes the
-        # model's prediction conditioned on a duplicated last token, silently
-        # biasing the committed output. See CHANGE_0164 continuation doc.
+        # K=1 draft (either zero-init Stage 3a fallback, or trained Stage 3b heads).
+        # prepare_env.sh sets speculative_num_draft_tokens = num_heads + 1
+        # (base position included), so draft_token_num must be derived from
+        # num_heads (the number of speculative positions), not from
+        # speculative_num_draft_tokens.
         self.num_heads: int = int(server_args.speculative_num_medusa_heads)
-        # ndt = num_heads + 1: 1 bonus + num_heads speculative drafts.
-        # Matches prepare_env.sh's NUM_DRAFT_TOKENS = SOAR_SPEC_MEDUSA_HEADS + 1.
-        self.draft_token_num: int = self.num_heads + 1
+        self.draft_token_num: int = self.num_heads  # K speculative draft tokens
         assert (
             self.num_heads >= 1
         ), f"speculative_num_medusa_heads must be >= 1, got {self.num_heads}"
@@ -172,29 +162,6 @@ class MedusaWorker:
             / (1024 * 1024),
         )
 
-        # ---- GPTQ hidden-state collection (CHANGE_0164) ----
-        # Set SOAR_MEDUSA_DUMP_HIDDEN=<path> to collect (N, hidden_size) FP16
-        # tensors from TARGET_VERIFY forwards.  Used to retrain the Medusa head
-        # against GPTQ-quantized hidden states so that accept rate is non-zero.
-        # Set SOAR_MEDUSA_DUMP_MAX_ROWS to cap collection (default 20000).
-        self._dump_hidden_path: str = os.environ.get(
-            "SOAR_MEDUSA_DUMP_HIDDEN", ""
-        ).strip()
-        self._dump_max_rows: int = int(
-            os.environ.get("SOAR_MEDUSA_DUMP_MAX_ROWS", "20000")
-        )
-        self._dump_hidden_buffer: list = []
-        self._dump_total_rows: int = 0
-        self._dump_lm_head_saved: bool = False
-        if self._dump_hidden_path:
-            logger.info(
-                "MedusaWorker: GPTQ hidden-state dump ENABLED → %s "
-                "(max_rows=%d).  lm_head.weight will be saved to %s",
-                self._dump_hidden_path,
-                self._dump_max_rows,
-                self._dump_hidden_path + ".lm_head_weight.pt",
-            )
-
     # ----- BaseSpecWorker-compatible duck-typed interface -----
 
     @property
@@ -265,115 +232,58 @@ class MedusaWorker:
         # ---- DECODE path (Stage 3b verify) ----
         return self._forward_verify_k1(batch)
 
-    def _flush_hidden_dump(self) -> None:
-        """Flush accumulated hidden states to disk (CHANGE_0164 dump mode)."""
-        if not self._dump_hidden_buffer:
-            return
-        try:
-            new_rows = torch.cat(self._dump_hidden_buffer, dim=0)
-            if os.path.exists(self._dump_hidden_path):
-                existing = torch.load(
-                    self._dump_hidden_path, map_location="cpu", weights_only=True
-                )
-                combined = torch.cat([existing, new_rows], dim=0)
-            else:
-                combined = new_rows
-            torch.save(combined, self._dump_hidden_path)
-            logger.info(
-                "MedusaWorker: flushed %d new rows \u2192 %s (total %d / %d)",
-                new_rows.shape[0],
-                self._dump_hidden_path,
-                combined.shape[0],
-                self._dump_max_rows,
-            )
-            self._dump_hidden_buffer.clear()
-        except Exception as exc:
-            logger.warning("MedusaWorker: failed to flush hidden dump: %s", exc)
-
     def _forward_verify_k1(self, batch: ScheduleBatch) -> GenerationBatchResult:
-        """Run the K=1 Medusa verify step (Stage 3b, ndt=2 canonical layout).
+        """Run the K=1 Medusa verify step (Stage 3b).
 
-        Per-request verify input has 2 positions:
-          position 0 (bonus) = req.output_ids[-1]   (last committed token T_N)
-          position 1 (draft) = req._medusa_draft_token (head prediction of T_{N+1})
-                               or req.output_ids[-1] (Stage 3a fallback)
+        Draft token per request:
+          - Stage 3b (trained heads): req._medusa_draft_token (set by previous step).
+          - Stage 3a fallback (zero-init / missing checkpoint): req.output_ids[-1].
 
-        Verify tree: linear chain bonus(0) -> draft(1).
-        After verify (greedy):
-          - position 0 always accepted, predicts[0] = target_predict[0]
-            (= model's true next-token, byte-equivalent to non-spec decode).
-          - if candidates[1] == target_predict[0]: child accepted,
-            predicts[1] = target_predict[1] (=  T_{N+2} given accepted draft).
-          - Otherwise child rejected; only the bonus output is committed.
-
-        Hidden state for the next draft is taken from position 0 (the bonus),
-        which represents the model's state after consuming the prefix + T_N --
-        the same context the trained Medusa head was fit on (last-position
-        hidden of a TARGET_VERIFY ndt=1 forward).
+        After TARGET_VERIFY, if trained heads are loaded, captures hidden states
+        and stores the next predicted draft on req._medusa_draft_token.
         """
         bs = batch.batch_size()
-        ndt = self.draft_token_num  # 2 for K=1
 
-        # 1. Collect interleaved [bonus, draft] per request, flat shape (bs*ndt,).
-        #    bonus = last committed token; draft = head prediction or fallback.
-        interleaved: list[int] = []
+        # 1. Collect draft tokens.
+        #    Stage 3b: use cached draft from previous step's head forward.
+        #    Stage 3a fallback: use last accepted output (zero-init invariant).
+        draft_token_list = []
         for req in batch.reqs:
-            last_out = int(req.output_ids[-1])
             cached = getattr(req, "_medusa_draft_token", None)
             if cached is not None and self._use_trained_heads:
-                draft_tok = int(cached)
+                draft_token_list.append(cached)
             else:
-                # Stage 3a fallback: no trained head, duplicate the last token
-                # as the draft. Verify will reject (target_predict[0] != T_N in
-                # general), and only the bonus's correct next-token is
-                # committed, matching non-spec decode output.
-                draft_tok = last_out
-            interleaved.append(last_out)
-            interleaved.append(draft_tok)
+                draft_token_list.append(req.output_ids[-1])
         draft_tokens = torch.tensor(
-            interleaved, dtype=torch.int64, device=self.device
-        )  # (bs*ndt,)
+            draft_token_list, dtype=torch.int64, device=self.device
+        )
 
-        # 2. Tree structures for 2-node linear chain.
+        # 2. Build K=1 trivial tree structures.
+        positions = batch.seq_lens.clone()  # (bs,) — draft token absolute positions
+
         retrive_index = (
-            torch.arange(bs * ndt, dtype=torch.int64, device=self.device)
-            .view(bs, ndt)
-        )  # [[0,1],[2,3],...]
-        # bonus has child = draft (col 1); draft is leaf.
+            torch.arange(bs, dtype=torch.int64, device=self.device).unsqueeze(1)
+        )  # (bs, 1)
         retrive_next_token = torch.full(
-            (bs, ndt), -1, dtype=torch.int64, device=self.device
+            (bs, 1), -1, dtype=torch.int64, device=self.device
         )
-        retrive_next_token[:, 0] = 1
         retrive_next_sibling = torch.full(
-            (bs, ndt), -1, dtype=torch.int64, device=self.device
+            (bs, 1), -1, dtype=torch.int64, device=self.device
         )
 
-        # 3. Positions: per req [seq_lens, seq_lens+1], flat (bs*ndt,).
-        seq_lens_dev = batch.seq_lens
-        positions = (
-            seq_lens_dev.unsqueeze(1)
-            + torch.arange(ndt, dtype=seq_lens_dev.dtype, device=self.device)
-        ).view(-1)
-
-        # 4. tree_mask: per req (ndt, seq_len_i - 1 + ndt) full causal, then
-        #    flatten and concat. Follows NGRAM USE_FULL_MASK convention
-        #    (prefix width seq_len_i - 1; trailing ndt x ndt lower triangular).
+        # Full causal mask (same as Stage 3a).
         tree_mask_pieces = []
-        tail = torch.tril(
-            torch.ones((ndt, ndt), dtype=torch.bool, device=self.device)
-        )
         for req in batch.reqs:
             seq_len_i = len(req.origin_input_ids) + len(req.output_ids)
-            prefix = torch.ones(
-                (ndt, seq_len_i - 1), dtype=torch.bool, device=self.device
+            tree_mask_pieces.append(
+                torch.ones(seq_len_i, dtype=torch.bool, device=self.device)
             )
-            req_mask = torch.cat([prefix, tail], dim=1).flatten()
-            tree_mask_pieces.append(req_mask)
         tree_mask = torch.cat(tree_mask_pieces, dim=0)
 
-        # 5. NgramVerifyInput. CaptureHiddenMode.FULL so we get hidden states
-        #    for both verify positions (shape (bs*ndt, hidden)). Position 0
-        #    (bonus) hidden is used both for the head forward and for dumping.
+        # 3. Build NgramVerifyInput for K=1 linear chain.
+        #    Stage 3b: set capture_hidden_mode=LAST so the TARGET_VERIFY forward
+        #    returns hidden states of shape (bs, hidden_size).  TARGET_VERIFY is
+        #    always eager (no CUDA graph), so this is safe.
         spec_info = NgramVerifyInput(
             draft_token=draft_tokens,
             tree_mask=tree_mask,
@@ -381,16 +291,12 @@ class MedusaWorker:
             retrive_index=retrive_index,
             retrive_next_token=retrive_next_token,
             retrive_next_sibling=retrive_next_sibling,
-            draft_token_num=ndt,
+            draft_token_num=1,
         )
-        _should_capture = self._use_trained_heads or (
-            bool(self._dump_hidden_path)
-            and self._dump_total_rows < self._dump_max_rows
-        )
-        if _should_capture:
-            spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
+        if self._use_trained_heads:
+            spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
 
-        # 6. Prepare batch for TARGET_VERIFY.
+        # 4. Prepare batch for TARGET_VERIFY.
         batch.spec_algorithm = SpeculativeAlgorithm.NGRAM
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = spec_info
@@ -398,73 +304,47 @@ class MedusaWorker:
 
         model_worker_batch = batch.get_model_worker_batch()
 
-        # 7. Run TARGET_VERIFY forward (always eager; CUDA graph not used).
+        # 5. Run TARGET_VERIFY forward (always eager; CUDA graph not used).
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
         )
         logits_output = batch_result.logits_output
         can_run_cuda_graph = batch_result.can_run_cuda_graph
 
-        # 8. Capture position-0 (bonus) hidden BEFORE verify() reindexes
-        #    logits_output.hidden_states by accepted_indices.
-        bonus_hidden: Optional[torch.Tensor] = None
+        # 6. Capture hidden states BEFORE verify() modifies them.
+        #    verify() (via _fill_requests) re-indexes logits_output.hidden_states by
+        #    accepted_indices.  We need the pre-index view (shape: bs × hidden_size)
+        #    to map one hidden state per request for the next step's draft prediction.
+        raw_hidden_states: Optional[torch.Tensor] = None
         if (
-            _should_capture
+            self._use_trained_heads
             and logits_output is not None
             and logits_output.hidden_states is not None
         ):
-            # FULL mode: hidden_states shape (bs*ndt, hidden_size).
-            h_full = logits_output.hidden_states.view(bs, ndt, -1)
-            bonus_hidden = h_full[:, 0, :].contiguous()  # (bs, hidden)
+            raw_hidden_states = logits_output.hidden_states  # (bs, hidden_size)
 
-        # ---- Dump mode: accumulate bonus hidden states for retraining ----
-        if (
-            self._dump_hidden_path
-            and self._dump_total_rows < self._dump_max_rows
-            and bonus_hidden is not None
-        ):
-            if not self._dump_lm_head_saved:
-                try:
-                    lm_w = self.medusa_heads.lm_head.weight.detach().cpu()
-                    torch.save(lm_w, self._dump_hidden_path + ".lm_head_weight.pt")
-                    logger.info(
-                        "MedusaWorker: saved lm_head.weight \u2192 %s (shape %s)",
-                        self._dump_hidden_path + ".lm_head_weight.pt",
-                        list(lm_w.shape),
-                    )
-                    self._dump_lm_head_saved = True
-                except Exception as exc:
-                    logger.warning(
-                        "MedusaWorker: failed to save lm_head.weight: %s", exc
-                    )
-            h_cpu = bonus_hidden.detach().cpu().to(torch.float16)
-            self._dump_hidden_buffer.append(h_cpu)
-            self._dump_total_rows += h_cpu.shape[0]
-            if (
-                len(self._dump_hidden_buffer) >= 50
-                or self._dump_total_rows >= self._dump_max_rows
-            ):
-                self._flush_hidden_dump()
-            if self._dump_total_rows >= self._dump_max_rows:
-                logger.info(
-                    "MedusaWorker: dump complete (%d rows).  "
-                    "Run train_medusa_head.py --hidden-dump-path %s to retrain.",
-                    self._dump_total_rows,
-                    self._dump_hidden_path,
-                )
-
-        # 9. Accept walk.
+        # 7. Accept walk.
         logits_output, next_token_ids, num_accepted_tokens = spec_info.verify(
             batch, logits_output, self.page_size
         )
         accept_lens = spec_info.accept_length  # (bs,) tensor
 
-        # 10. Stage 3b: run trained head on bonus hidden, cache next draft.
-        if bonus_hidden is not None and bonus_hidden.shape[0] == bs:
+        # CHANGE_0160: zero bonus-token position in req_to_token after verify.
+        accept_lens_cpu = spec_info.accept_length.cpu().tolist()
+        for _i, _req in enumerate(batch.reqs):
+            if accept_lens_cpu[_i] >= 1:
+                _bonus_pos = int(batch.seq_lens[_i].item()) - 1
+                batch.req_to_token_pool.req_to_token[_req.req_pool_idx, _bonus_pos] = 0
+
+        # 8. Stage 3b: run trained head on captured hidden states, cache next draft.
+        #    Each live (not finished) request gets a next draft token stored on
+        #    req._medusa_draft_token.  The next call to _forward_verify_k1 will
+        #    use these instead of req.output_ids[-1].
+        if raw_hidden_states is not None and raw_hidden_states.shape[0] == bs:
             try:
                 with torch.no_grad():
-                    # (bs, 1, vocab_size) -> argmax -> (bs,)
-                    draft_logits = self.medusa_heads(bonus_hidden)
+                    # (bs, 1, vocab_size) → (bs,)
+                    draft_logits = self.medusa_heads(raw_hidden_states)
                     next_draft_ids = draft_logits[:, 0, :].argmax(dim=-1).tolist()
                 for req_i, req in enumerate(batch.reqs):
                     if not req.finished():
@@ -480,7 +360,7 @@ class MedusaWorker:
                 for req in batch.reqs:
                     req._medusa_draft_token = None
 
-        # 11. Restore forward_mode / spec_algorithm for scheduler bookkeeping.
+        # 9. Restore forward_mode / spec_algorithm for scheduler bookkeeping.
         batch.forward_mode = ForwardMode.DECODE
         batch.spec_algorithm = SpeculativeAlgorithm.MEDUSA
 
