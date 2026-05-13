@@ -165,3 +165,73 @@ behavior.
    was for ndt=1; the ndt=2 path uses the standard NGRAM eviction
    walker and should be correct, but worth a smoke test on a 10-req
    subset first).
+
+---
+
+## Result (2026-05-13) — CATASTROPHIC, REVERT REQUIRED
+
+**Test ID**: `Stage3b-ndt2-CATASTROPHIC` (commit `4b442f421`, fcloud `ai-e7e98a7c52`).
+
+| Metric | Value | vs Baseline (Test 12 = 79.29%) |
+|--------|-------|-------------------------------|
+| ori_accuracy | **15.13 %** | −64.16 pt |
+| normalized   | **18.92 %** | well below 97 % → **C = 0 (eliminated)** |
+| mcq          | **0.00 %**  | runaway: avg_out = 64460 (full max_out_len) |
+| niah         | 3.33 %      | −96.67 pt |
+| cwe          | 15.67 %     | −56.33 pt |
+| fwe          | 20.00 %     | −78.89 pt |
+| qa           | 36.67 %     | −26.66 pt |
+| eval duration| 7911 s (2 h 12 m) | ~2.6× baseline |
+
+Kernel reported `accept_len = 1.46, accept_rate = 0.73` throughout the run —
+i.e. the speculative pipeline was *structurally* alive, but the committed
+tokens are wrong. Every MCQ sample exhausts the 65536 max_out_len budget,
+strongly suggesting the bonus-position output token is corrupted (no stop
+token ever emitted).
+
+### Hypotheses (not yet bisected)
+
+1. **Position-of-bonus mismatch.** We compute
+   `positions = seq_lens + arange(ndt)`, expecting the bonus to occupy
+   slot `seq_lens` and the draft to occupy `seq_lens+1`. NGRAM's own
+   `_prepare_for_speculative_decoding` uses
+   `reconstruct_indices_from_tree_mask(..., batch.seq_lens, positions, ...)`
+   which derives positions from the tree mask. If the NGRAM convention
+   expects the *root* of the verify tree to be at position `seq_lens-1`
+   (overwriting the last-committed-token slot) rather than `seq_lens`,
+   our bonus KV is written at the wrong row and every subsequent step
+   reads stale state.
+2. **Hidden distribution mismatch for the trained head.** The head was
+   retrained on hidden states captured from the ndt=1 path
+   (`hidden[:,0,:]` of a 1-token TARGET_VERIFY). In ndt=2 the position-0
+   hidden has different attention context (it now sees one extra "future"
+   token via tree-mask routing if the mask is wrong, or is identical if
+   correct). If the captured-vs-served distributions diverge, the head
+   produces nonsense drafts; but that alone would just hurt accept rate,
+   not destroy the bonus output. So this can't be the *sole* cause.
+3. **`prepare_for_verify` side-effects on `seq_lens`.** The shared
+   `NgramVerifyInput.prepare_for_verify` may bump `seq_lens` by `ndt`
+   internally; if our explicit `positions` was already computed before
+   that call, the actual forward writes KV at offset `+ndt` past where
+   we intended.
+
+### Decision: REVERT
+
+- Revert `medusa_worker.py` in both `python/sglang/srt/speculative/` and
+  `benchmark/soar/demo_sala/sglang/python/sglang/srt/speculative/` to
+  the Stage 3a `ndt=1` path (commit `3a15a6de3` /
+  `Stage3a-force-dense` baseline: 78.40 % acc, S1=204.86 s).
+- Keep CHANGE_0164 documents in place as a record of the failure.
+- File follow-up investigation: instrument `_forward_verify_k1` to dump
+  one micro-batch's `(positions, seq_lens_in, seq_lens_out, draft_tokens,
+  input_ids_used_by_attention, committed_token)` quadruple and compare
+  byte-for-byte against a single-token NgramWorker decode for the same
+  prompt, to localize the off-by-one before re-attempting ndt=2.
+
+### Rollback commands
+
+```
+git revert 4b442f421       # or
+git checkout 3a15a6de3 -- python/sglang/srt/speculative/medusa_worker.py \
+                          benchmark/soar/demo_sala/sglang/python/sglang/srt/speculative/medusa_worker.py
+```

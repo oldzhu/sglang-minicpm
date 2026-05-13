@@ -153,3 +153,42 @@ git revert <this-commit>
    `req_to_token` pool 的交互（`CHANGE_0160` 那个补丁是给 ndt=1
    设计的；ndt=2 走 NGRAM 标准 eviction 路径，理论上正确，但建议
    先在 10 条样本子集上跑一次冒烟测试）。
+
+---
+
+## 结果（2026-05-13）—— 灾难性失败，必须回退
+
+**测试 ID**：`Stage3b-ndt2-CATASTROPHIC`（commit `4b442f421`，fcloud `ai-e7e98a7c52`）。
+
+| 指标 | 数值 | 与基线（Test 12 = 79.29%）对比 |
+|------|------|------------------------------|
+| ori_accuracy | **15.13 %** | −64.16 pt |
+| normalized   | **18.92 %** | 远低于 97 % → **C = 0（淘汰）** |
+| mcq          | **0.00 %**  | 失控：平均输出 64460 tokens（吃满 max_out_len）|
+| niah         | 3.33 %      | −96.67 pt |
+| cwe          | 15.67 %     | −56.33 pt |
+| fwe          | 20.00 %     | −78.89 pt |
+| qa           | 36.67 %     | −26.66 pt |
+| 评测时长     | 7911 s（2 h 12 m）| 约为基线 2.6× |
+
+kernel 一路报告 `accept_len = 1.46, accept_rate = 0.73`，结构上推测流水正常，但提交的 token 是错的。每条 MCQ 都把 65536 max_out_len 吃满，强烈暗示 bonus 位置输出的 token 已被破坏（永远输出不到 stop token）。
+
+### 假设（尚未二分定位）
+
+1. **bonus 的 position 不对**：我们用 `positions = seq_lens + arange(ndt)`，预期 bonus 在 `seq_lens` 槽位、draft 在 `seq_lens+1` 槽位。NGRAM 自带的 `_prepare_for_speculative_decoding` 调用 `reconstruct_indices_from_tree_mask(..., batch.seq_lens, positions, ...)` 从 tree mask 反推 positions。如果 NGRAM 约定 verify 树的 root 应位于 `seq_lens-1`（覆盖最后已提交 token 的槽位），那我们的 bonus KV 写到了错的行，后续读到的全是脏数据。
+2. **trained head 的 hidden 分布不匹配**：head 是在 ndt=1 路径上采集的 `hidden[:,0,:]` 上重训的。在 ndt=2 下，position-0 hidden 的 attention 上下文不同；若 tree_mask 设置有偏差，捕获到的训练分布与在线推理分布发散，会让 head 草稿胡说。但单凭这点只会让 accept rate 变差，不应破坏 bonus 输出，所以这不是单独原因。
+3. **`prepare_for_verify` 对 `seq_lens` 的副作用**：共享的 `NgramVerifyInput.prepare_for_verify` 内部可能把 `seq_lens` 加上 `ndt`。如果我们的 `positions` 是在调用之前就算好的，那真正的 forward 写 KV 时会比预期多偏移 `ndt`。
+
+### 决策：回退
+
+- 把 `medusa_worker.py`（两份拷贝）回到 Stage 3a `ndt=1` 路径（commit `3a15a6de3` / `Stage3a-force-dense` 基线：78.40 % acc，S1=204.86 s）。
+- 保留 CHANGE_0164 文档作为失败记录。
+- 立项后续调查：在 `_forward_verify_k1` 中 dump 一次 micro-batch 的 `(positions, seq_lens_in, seq_lens_out, draft_tokens, input_ids_used_by_attention, committed_token)` 五元组，与单 token NgramWorker decode 同 prompt 逐字节比对，先定位 off-by-one 再重新尝试 ndt=2。
+
+### 回退命令
+
+```
+git revert 4b442f421       # 或
+git checkout 3a15a6de3 -- python/sglang/srt/speculative/medusa_worker.py \
+                          benchmark/soar/demo_sala/sglang/python/sglang/srt/speculative/medusa_worker.py
+```
