@@ -192,3 +192,68 @@ git revert 4b442f421       # 或
 git checkout 3a15a6de3 -- python/sglang/srt/speculative/medusa_worker.py \
                           benchmark/soar/demo_sala/sglang/python/sglang/srt/speculative/medusa_worker.py
 ```
+
+已作为 commit `a489d78d4` 推到 `minicpm-src/mixed_minicpm_cudagraph`（2026-05-13）。
+
+---
+
+## 回退后根因分析（2026-05-13，离线）
+
+回退之后阅读源码，定位了真正的 bug 类型，并排除了之前三个假设中的两个。
+
+### 已阅读
+
+1. [python/sglang/srt/speculative/ngram_info.py](../../python/sglang/srt/speculative/ngram_info.py) 第 50–115 行（`NgramVerifyInput` 构造 + `prepare_for_verify`），第 374–446 行（`verify`）。
+2. [python/sglang/srt/speculative/ngram_worker.py](../../python/sglang/srt/speculative/ngram_worker.py) 第 142–200 行（`_prepare_for_speculative_decoding`，是 `reconstruct_indices_from_tree_mask` 的正典调用方）。
+3. [sgl-kernel/tests/speculative/test_ngram_utils.py](../../sgl-kernel/tests/speculative/test_ngram_utils.py)（单一正典 kernel 单元测试，钉死磁盘约定：bs=1，ndt=4，seq_lens=[12] → `positions = [12, 13, 13, 14]`）。
+
+### 已确认的事实
+
+- **`NgramVerifyInput` 是通用的 tree-verify 基础设施，不是 NGRAM 算法专属。** 类名很糟糕 —— 应该叫 `TreeVerifyInput`。`SpecInputType.NGRAM_VERIFY` 只是个 tag；`verify_tree_greedy` 里没有任何 NGRAM 特有逻辑。Medusa 复用它是正确且有意为之的（Stage 3a 已经这么做，且是目前最稳的 Medusa 状态：78.40 % acc）。
+- **`prepare_for_verify` 不会改写 `batch.seq_lens`**（只改 `batch.input_ids`、`batch.out_cache_loc`，以及 `req_to_token[idx, seq_lens:seq_lens+ndt]`）。`seq_lens` 每步只在 `.verify()` 里增加一次：`batch.seq_lens.add_(self.accept_length + 1)`。→ **假设 3 排除**。
+- **kernel 约定**（来自单测）：`positions[0] = seq_lens`（不是 `seq_lens-1`）。verify 树的 root 放在下一个空闲槽位，而不是上一个已提交 token 的槽位。→ **假设 1 的原始形式排除**（我们手写的 `positions = seq_lens + arange(ndt)` 在数值上与 kernel 约定一致）。
+- **假设 2（hidden 分布不匹配）** 真实存在，但单独不足以解释 `mcq=0%` 且 avg_out=64460。差的 draft 只会让 `accept_rate` 下降，不应该破坏 **bonus** token（root 位置的 target_predict，本质是模型自身的贪心输出）。→ **假设 2 排除为主因**。
+
+### 真正的根因：一个早就存在的 positional 不变量违例，在 ndt=1 下被掩盖，到 ndt=2 时致命爆发
+
+sglang 的 spec-decode 不变量：
+
+> KV 槽位 `k` 存的是 `origin_input_ids ++ output_ids` 中 **概念位置 `k`** 处的 token（id + positional embedding `k`）的 KV。
+
+NGRAM 约定下保证了这个不变量：
+
+- 第 N 步的 `input_ids[0]` 是 **来自 n-gram 缓存的第一个推测 token**（针对位置 `seq_lens` 的新预测），**不是**前一步提交的 bonus 重喂。
+- 上一步的 bonus 的 KV 已经在第 N−1 步当它作为 `input_ids[0]` 喂入时计算了 —— 位置是正确的 `seq_lens_{N-1} = seq_lens_N - (accept_length_{N-1} + 1)`。链条自然延伸，槽位 `k` 始终对应概念位置 `k` 的 token。
+
+而 Medusa 现在的实现（Stage 3a 和被回退的 ndt=2 尝试）**违反了这个不变量**：
+
+- Stage 3a（`ndt=1`）把 `input_ids[0] = output_ids[-1]`（最后已提交的 token，它的概念位置是 `seq_lens - 1`）喂在位置 `seq_lens`。
+- 模型在槽位 `seq_lens` 算出的 KV，positional embedding 是 `seq_lens`，但 token id 是位于概念位置 `seq_lens - 1` 的那个 token。差一位。
+- 提交的 `target_predict[0]` 是模型在 *这个差一位输入* 条件下的预测，被记到 `output_ids` 中作为概念位置 `seq_lens` 的 token。下一步又重复差一位。错位每步都在，但模型够鲁棒，仅造成约 0.58 pt 的下降（Stage 3a：78.71 % vs v22 baseline 79.29 %）。
+
+ndt=2 路径下，同样的差一位作用在 **两个** 位置上：
+
+- `input_ids = [bonus = output_ids[-1], draft = head_pred]`，`positions = [seq_lens, seq_lens+1]`。
+- bonus 还是差一位（概念位置 `seq_lens-1` 的 token 被喂到位置 `seq_lens`）。
+- `target_predict[0]` 是在 *差一位 bonus 输入* 条件下的预测 —— 分布与真正的「committed history 之后的下一个 token」明显不同。
+- `target_predict[1]` 是在（差一位 bonus）+（head draft）条件下的预测，错得更狠。
+- `verify_tree_greedy` 在 `target_predict[0] == head_draft` 时接受 draft（这就是 `accept_rate=0.73` 日志测的东西 —— 但是相对 *被污染的* `target_predict[0]`，不是真实 argmax）。
+- 下一步要用的 bonus（接受时 `predicts[1] = target_predict[1]`，拒绝时 `predicts[0] = target_predict[0]`）也是从被污染的分布里采的。
+- 每步的偏差累积；在 MCQ 上模型永远到不了 stop token，把 `max_out_len = 65536` 跑满。
+
+所以 `accept_rate = 0.73` 这条日志是 **误导** 的：它只证明 tree-walk kernel 结构上是对的，**不** 证明提交的 token 是对的。
+
+### 为什么之前没抓到
+
+- Stage 2 passthrough（v23）在 forward 之前把 `spec_algorithm = NONE` 翻掉，跑出来与 v22 字节等价，根本没构造 spec_info，所以没有 off-by-one（80.11 % acc，S1=118.28 s —— 反证 baseline 干净）。
+- Stage 3a ndt=1 有 off-by-one，但只损失约 0.6 pt：(a) 每步只一个 token 受影响，(b) 模型对位置扰动在域内 prefix 不敏感，(c) `verify_tree_greedy` 在 ndt=1 下不论 accept 逻辑都直接提交 `target_predict[0]`，所以结果在结构上等价于（轻微扰动的）dense decode。
+- ndt=2 通过 `target_predict[1]` 的乘性放大 + bonus 的递推链，把误差放大到致命级别。
+
+### 后续：修正方案
+
+下一步在 `PROPOSAL_medusa_k1_positional_offbyone_fix.{en,zh}.md` 提出。要点：
+
+- 在 `prepare_for_verify` **之前** 把 `batch.seq_lens` 减 1，让槽位分配从 bonus 的正确概念位置（`seq_lens - 1`）开始；`verify()` 末尾的 `seq_lens.add_(accept_length + 1)` 会把 `seq_lens` 自然带回正确的步后值。
+- 改用 canonical `reconstruct_indices_from_tree_mask` kernel（和 NGRAM 完全一致）来反推 `positions / retrive_*`，不要再手写 —— 减小 off-by-one 出错面。
+- 任何完整 eval 之前先在 10 条请求小集上端到端验证。
+

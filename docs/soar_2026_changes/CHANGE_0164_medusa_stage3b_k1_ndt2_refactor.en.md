@@ -235,3 +235,70 @@ git revert 4b442f421       # or
 git checkout 3a15a6de3 -- python/sglang/srt/speculative/medusa_worker.py \
                           benchmark/soar/demo_sala/sglang/python/sglang/srt/speculative/medusa_worker.py
 ```
+
+Applied as commit `a489d78d4` on `mixed_minicpm_cudagraph` (pushed to
+`minicpm-src` 2026-05-13).
+
+---
+
+## Post-revert root-cause analysis (2026-05-13)
+
+After the revert, two source reads pinpointed the actual bug class and
+eliminated two of the three pre-revert hypotheses.
+
+### Reads performed (offline, no fcloud cost)
+
+1. [python/sglang/srt/speculative/ngram_info.py](../../python/sglang/srt/speculative/ngram_info.py) lines 50–115 (`NgramVerifyInput` ctor + `prepare_for_verify`) and lines 374–446 (`verify`).
+2. [python/sglang/srt/speculative/ngram_worker.py](../../python/sglang/srt/speculative/ngram_worker.py) lines 142–200 (`_prepare_for_speculative_decoding`, the canonical caller of `reconstruct_indices_from_tree_mask`).
+3. [sgl-kernel/tests/speculative/test_ngram_utils.py](../../sgl-kernel/tests/speculative/test_ngram_utils.py) (single canonical kernel test that pins the on-disk convention: bs=1, ndt=4, seq_lens=[12] → `positions = [12, 13, 13, 14]`).
+
+### Confirmed facts
+
+- **`NgramVerifyInput` is generic tree-verify infrastructure, not NGRAM-algorithm-specific.** It is poorly named — effectively `TreeVerifyInput`. `SpecInputType.NGRAM_VERIFY` is just a tag; `verify_tree_greedy` has no NGRAM-specific logic. Medusa reusing it is correct and intentional. (Stage 3a Medusa already does this and is the best-known-good Medusa state at 78.40 % acc.)
+- **`prepare_for_verify` does NOT mutate `batch.seq_lens`** (only `batch.input_ids`, `batch.out_cache_loc`, and `req_to_token[idx, seq_lens:seq_lens+ndt]`). `seq_lens` advances exactly once per step, inside `.verify()`: `batch.seq_lens.add_(self.accept_length + 1)`. → **Hypothesis 3 RULED OUT.**
+- **Kernel convention** (from the test): `positions[0] = seq_lens` (not `seq_lens-1`). The root of the verify tree is placed at the NEXT free slot, not at the slot of the last committed token. → **Hypothesis 1 RULED OUT in its original form** (the manual `positions = seq_lens + arange(ndt)` we computed actually matches the kernel convention numerically).
+- **Hypothesis 2 (hidden distribution mismatch)** is real but cannot alone explain `mcq=0%` with avg_out=64460. A bad draft would just lower `accept_rate`; it would not corrupt the **bonus** token (target_predict at the root), which is the model's own greedy output. → **Hypothesis 2 RULED OUT as the primary cause.**
+
+### Actual root cause: a pre-existing positional invariant violation, masked at ndt=1, fatal at ndt=2
+
+The sglang spec-decode invariant is:
+
+> KV slot `k` contains the KV (token id + positional embedding `k`) of the token that lives at **conceptual position `k`** in `origin_input_ids ++ output_ids`.
+
+In the NGRAM convention, this is preserved because:
+
+- `input_ids[0]` of step N is the **first speculative next-token from the n-gram cache** (a fresh prediction for the next slot at position `seq_lens`), NOT the previously committed bonus.
+- The previous bonus's KV was already computed in step N–1 when IT was fed as `input_ids[0]` of that step — at the correct position `seq_lens_{N-1} = seq_lens_N - (accept_length_{N-1} + 1)`. The chain extends naturally; slot `k` always corresponds to the token at conceptual position `k`.
+
+Medusa as currently implemented (both Stage 3a and the reverted ndt=2 attempt) **breaks this invariant**:
+
+- Stage 3a (`ndt=1`) feeds `input_ids[0] = output_ids[-1]` (the last committed token, which lives at conceptual position `seq_lens - 1`) at position `seq_lens`.
+- The model computes KV at slot `seq_lens` with **positional embedding `seq_lens`** but **token-id of the token at conceptual position `seq_lens - 1`**. Off-by-one.
+- The committed `target_predict[0]` is the model's prediction *conditioned on this off-by-one input*, which is then committed to `output_ids` as the token at conceptual position `seq_lens`. Next step repeats the off-by-one with the new bonus. The error persists every step, but the model is robust enough that the regression is only ~0.58 pt (Stage 3a: 78.71 % vs v22 baseline 79.29 %).
+
+In the ndt=2 path the same off-by-one applies to BOTH positions:
+
+- `input_ids = [bonus = output_ids[-1], draft = head_pred]` at `positions = [seq_lens, seq_lens+1]`.
+- The bonus is again off by one (token from position `seq_lens-1` fed at position `seq_lens`).
+- `target_predict[0]` is the model's prediction *given the corrupted off-by-one bonus input* — distribution noticeably different from the true "next token after committed history".
+- `target_predict[1]` is conditioned on (corrupted bonus) + (head draft), doubly off.
+- `verify_tree_greedy` accepts the draft when `target_predict[0] == head_draft` (this is what the `accept_rate=0.73` log line measured — BUT against a corrupted `target_predict[0]`, not the true argmax).
+- The COMMITTED bonus for the next step (`predicts[1] = target_predict[1]` when accepted, or `predicts[0] = target_predict[0]` when rejected) is drawn from the corrupted distribution.
+- Per-step drift compounds; on MCQ the model never reaches a stop token and runs out the full `max_out_len = 65536` budget.
+
+The `accept_rate = 0.73` log is therefore misleading: it confirms structural correctness of the tree-walk kernel, NOT correctness of the committed tokens.
+
+### Why this wasn't caught earlier
+
+- Stage 2 passthrough (v23) flips `spec_algorithm = NONE` before forward and runs byte-equivalent to v22. No off-by-one because no spec_info is built. (80.11 % acc, S1=118.28 s — confirms baseline.)
+- Stage 3a ndt=1 has the off-by-one but it only costs ~0.6 pt because: (a) only one token per step is affected, (b) the model's positional sensitivity is small for in-domain prefixes, (c) `verify_tree_greedy` with ndt=1 always commits `target_predict[0]` regardless of any accept logic, so the result is structurally a (slightly-perturbed) dense decode.
+- ndt=2 amplifies via the multiplicative effect on `target_predict[1]` + the cascading-bonus chain.
+
+### Sequel: corrected design
+
+Documented in `PROPOSAL_medusa_k1_positional_offbyone_fix.{en,zh}.md` (next step). Sketch:
+
+- Decrement `batch.seq_lens` by 1 **before** `prepare_for_verify`, so slot allocation starts at the bonus's correct conceptual position (`seq_lens - 1`); after `verify()` the standard `seq_lens.add_(accept_length + 1)` puts `seq_lens` back to the correct post-step value (since `accept_length` ranges over 0..ndt-1 with the new convention).
+- Use the canonical `reconstruct_indices_from_tree_mask` kernel (same as NGRAM) instead of hand-rolling `positions / retrive_*` — reduces the surface area for off-by-one bugs.
+- Validate end-to-end on a 10-request subset before any full eval.
+
