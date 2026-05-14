@@ -27,7 +27,7 @@ from typing import Any, Dict, List
 import torch
 
 
-PHASE_ORDER = ["pre_verify", "post_forward", "post_verify"]
+PHASE_ORDER = ["pre_prepare_for_verify", "pre_verify", "post_forward", "post_verify"]
 
 
 def _load(path: str) -> List[Dict[str, Any]]:
