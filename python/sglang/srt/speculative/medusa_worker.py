@@ -41,6 +41,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -81,13 +83,13 @@ class MedusaWorker:
         self.page_size = server_args.page_size
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
 
-        # K=1 draft (either zero-init Stage 3a fallback, or trained Stage 3b heads).
-        # prepare_env.sh sets speculative_num_draft_tokens = num_heads + 1
-        # (base position included), so draft_token_num must be derived from
-        # num_heads (the number of speculative positions), not from
-        # speculative_num_draft_tokens.
+        # CHANGE_0165 iter 2: chain length = base + num_heads draft predictions.
+        # This matches NgramWorker semantics and the value of
+        # --speculative-num-draft-tokens (= num_heads + 1 from prepare_env.sh).
+        # Previously draft_token_num was hard-coded to num_heads (=1), which
+        # produced ndt=1 metadata that mismatched the verify-walk's expectation
+        # of a (base, head_pred) chain and prevented any bonus-token acceptance.
         self.num_heads: int = int(server_args.speculative_num_medusa_heads)
-        self.draft_token_num: int = self.num_heads  # K speculative draft tokens
         assert (
             self.num_heads >= 1
         ), f"speculative_num_medusa_heads must be >= 1, got {self.num_heads}"
@@ -95,6 +97,7 @@ class MedusaWorker:
             f"Stage 3b supports only num_heads=1 (K=1 linear chain), "
             f"got num_heads={self.num_heads}.  K>1 deferred to Stage 4."
         )
+        self.draft_token_num: int = self.num_heads + 1  # = 2 for K=1
 
         # ----- Heads instantiation -----
         from sglang.srt.models.minicpm_medusa_heads import MedusaHeads
@@ -244,55 +247,86 @@ class MedusaWorker:
         and stores the next predicted draft on req._medusa_draft_token.
         """
         bs = batch.batch_size()
+        ndt = self.draft_token_num  # = 2 (num_heads + 1) since iter 2
 
-        # 1. Collect draft tokens.
-        #    Stage 3b: use cached draft from previous step's head forward.
-        #    Stage 3a fallback: use last accepted output (zero-init invariant).
-        draft_token_list = []
+        # 1. Build draft tokens [base_i, head_pred_i] per req — flat (bs*ndt,).
+        #    Stage 3b: head_pred = cached prediction from previous step.
+        #    Stage 3a fallback (or first step before any head ran): pad with 0,
+        #    matching NgramCache's miss padding so the shape is identical to NGRAM.
+        draft_token_list: list = []
         for req in batch.reqs:
-            cached = getattr(req, "_medusa_draft_token", None)
-            if cached is not None and self._use_trained_heads:
-                draft_token_list.append(cached)
+            base = req.output_ids[-1]
+            if self._use_trained_heads:
+                head_pred = getattr(req, "_medusa_draft_token", None)
+                if head_pred is None:
+                    head_pred = 0
             else:
-                draft_token_list.append(req.output_ids[-1])
+                head_pred = 0
+            draft_token_list.extend([base, head_pred])
         draft_tokens = torch.tensor(
             draft_token_list, dtype=torch.int64, device=self.device
+        )  # (bs * ndt,)
+
+        # 2. Tree mask for the K=1 linear chain: lower-triangular (ndt, ndt)
+        #    block per req, flattened to (bs * ndt * ndt,).  Same layout NGRAM
+        #    feeds to reconstruct_indices_from_tree_mask.
+        tri = torch.tril(
+            torch.ones((ndt, ndt), dtype=torch.bool, device=self.device)
+        )
+        tree_mask_blocks = tri.unsqueeze(0).expand(bs, ndt, ndt).contiguous()
+        tree_mask_flat = tree_mask_blocks.reshape(-1)
+
+        # 3. Allocate the kernel outputs.
+        positions = torch.empty(
+            bs * ndt, dtype=torch.int64, device=self.device
+        )
+        retrive_index = torch.empty(
+            bs, ndt, dtype=torch.int64, device=self.device
+        )
+        retrive_next_token = torch.empty(
+            bs, ndt, dtype=torch.int64, device=self.device
+        )
+        retrive_next_sibling = torch.empty(
+            bs, ndt, dtype=torch.int64, device=self.device
         )
 
-        # 2. Build K=1 trivial tree structures.
-        positions = batch.seq_lens.clone()  # (bs,) — draft token absolute positions
-
-        retrive_index = (
-            torch.arange(bs, dtype=torch.int64, device=self.device).unsqueeze(1)
-        )  # (bs, 1)
-        retrive_next_token = torch.full(
-            (bs, 1), -1, dtype=torch.int64, device=self.device
+        # 4. Build positions + retrive_* via the same kernel NGRAM uses.
+        reconstruct_indices_from_tree_mask(
+            tree_mask_flat,
+            batch.seq_lens,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            bs,
+            ndt,
         )
-        retrive_next_sibling = torch.full(
-            (bs, 1), -1, dtype=torch.int64, device=self.device
-        )
 
-        # Full causal mask (same as Stage 3a).
-        tree_mask_pieces = []
+        # 5. Expand to USE_FULL_MASK layout the verifier kernel expects.
+        #    Per req: cat( ones(ndt, seq_len - 1), tri(ndt, ndt) ) -> flatten.
+        full_mask_pieces = []
         for req in batch.reqs:
             seq_len_i = len(req.origin_input_ids) + len(req.output_ids)
-            tree_mask_pieces.append(
-                torch.ones(seq_len_i, dtype=torch.bool, device=self.device)
+            left = torch.ones(
+                (ndt, seq_len_i - 1), dtype=torch.bool, device=self.device
             )
-        tree_mask = torch.cat(tree_mask_pieces, dim=0)
+            full_mask_pieces.append(
+                torch.cat((left, tri), dim=1).reshape(-1)
+            )
+        custom_mask = torch.cat(full_mask_pieces, dim=0)
 
-        # 3. Build NgramVerifyInput for K=1 linear chain.
+        # 6. Build NgramVerifyInput with the correct ndt.
         #    Stage 3b: set capture_hidden_mode=LAST so the TARGET_VERIFY forward
-        #    returns hidden states of shape (bs, hidden_size).  TARGET_VERIFY is
-        #    always eager (no CUDA graph), so this is safe.
+        #    returns hidden states.  TARGET_VERIFY is always eager (no CUDA
+        #    graph), so this is safe.
         spec_info = NgramVerifyInput(
             draft_token=draft_tokens,
-            tree_mask=tree_mask,
+            tree_mask=custom_mask,
             positions=positions,
             retrive_index=retrive_index,
             retrive_next_token=retrive_next_token,
             retrive_next_sibling=retrive_next_sibling,
-            draft_token_num=1,
+            draft_token_num=ndt,
         )
         if self._use_trained_heads:
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
@@ -348,16 +382,21 @@ class MedusaWorker:
         )
 
         # 6. Capture hidden states BEFORE verify() modifies them.
-        #    verify() (via _fill_requests) re-indexes logits_output.hidden_states by
-        #    accepted_indices.  We need the pre-index view (shape: bs × hidden_size)
-        #    to map one hidden state per request for the next step's draft prediction.
+        #    With ndt=2 the model returns (bs * ndt, hidden_size).  For K=1 we
+        #    want one h per req; row 2*i (position 0 of chain i) is the hidden
+        #    state right after the base token — the same one a non-spec decode
+        #    would have produced — so we keep that.
         raw_hidden_states: Optional[torch.Tensor] = None
         if (
             self._use_trained_heads
             and logits_output is not None
             and logits_output.hidden_states is not None
         ):
-            raw_hidden_states = logits_output.hidden_states  # (bs, hidden_size)
+            hs = logits_output.hidden_states
+            if hs.shape[0] == bs * ndt:
+                raw_hidden_states = hs.view(bs, ndt, -1)[:, 0, :].contiguous()
+            else:
+                raw_hidden_states = hs
 
         # 7. Accept walk.
         logits_output, next_token_ids, num_accepted_tokens = spec_info.verify(
