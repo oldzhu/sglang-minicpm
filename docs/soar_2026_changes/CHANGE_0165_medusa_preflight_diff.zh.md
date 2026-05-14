@@ -278,6 +278,54 @@ if batch.forward_mode.is_extend():
 - 通过切回标准 `fcloud_workflow.py restart-server` 流程，重新启用 cuda-graph + torch-compile（不再使用 `preflight_drive.sh`）。
 - 运行完整 accuracy 测试 + S1/S8/Smax 速度测试（按项目规则需用户显式确认）。
 
+### 5.5 第 4 轮结果 —— 预飞行差异在所有阶段归零
+
+**已应用修复**（提交 `0e4634c1d`）：删除 MedusaWorker EXTEND 分支中的 `batch.spec_algorithm = SpeculativeAlgorithm.NONE` 一行。预先核查 `scheduler_output_processor_mixin.py` 确认所有 `spec_algorithm.is_none()` 分支都位于 `process_batch_result_decode` 中；prefill 输出处理（第 85 行）没有这类分支，因此本次修改不会扰乱 extend 输出处理。R-iter4-1 已清除。
+
+**结果 —— 所有 4 个阶段 × 全部 25 个字段差异均为 0**：
+
+| 阶段 | 字段数 | 状态 |
+|---|---|---|
+| pre_prepare_for_verify | 5（`batch_size`、`req_pool_indices`、`seq_lens`、`seq_lens_cpu`、`out_cache_loc`） | **全部相同** |
+| pre_verify | 14（含 `draft_token_num=2`、完整 18-bool 树掩码、所有 retrive_*、`spec_positions=[7,8]`、`out_cache_loc=[8,9]`） | **全部相同** |
+| post_forward | 3（`logits_shape=(2,73448)`、`logits_argmax=[72,72]`、`hidden_states_shape=None`） | **全部相同** |
+| post_verify | 4（`accept_length=[0]`、`accepted_indices=[0]`、`next_token_ids=[72]`、`num_accepted_tokens=0`） | **全部相同** |
+
+**全部阶段差异字段总数：0。**
+
+附加观察：medusa dump 文件大小从 `29590B`（iter 3，scheduler self_check 时遇 KV 泄漏崩溃）恢复到 `52938B`（iter 4），与 ngram 的 `52937B` 完全一致。服务后端的 KV 泄漏现象也消失，证明 bonus 槽位是 +1 级联与 iter 2 / iter 3 观察到的 2 槽位泄漏的共同上游成因。
+
+**Diff 演进总览**：
+
+| 迭代 | 代码改动 | 差异字段数 | 状态 |
+|---|---|---|---|
+| 1 | baseline（坏的） | 13 | 布局错（ndt=1） |
+| 2 | ndt=2 + 内核 retrive_* + 全掩码 | 5 | 布局修好，剩 1 个 seq_lens +1 |
+| 3 | 新增 pre_prepare_for_verify dump | 5（新增阶段又有 3 个） | 根因定位 |
+| 4 | 删除 spec_algorithm=NONE 重置 | **0** | **PASS** |
+
+**产物**
+
+- Dumps：`/tmp/dump_ngram.pkl`（52937B）、`/tmp/dump_medusa.pkl`（52938B）。
+- Diff 日志：`/tmp/iter4_diff.txt` —— `TOTAL differing fields across phases: 0`。
+- 本轮提交：`0e4634c1d`（medusa iter 4: drop spec_algorithm=NONE reset in EXTEND）。
+
+### 5.6 下一步 —— 完整 accuracy + 速度评估（待用户确认）
+
+预飞行循环已达成设计目标：MedusaWorker 的 K=1 路径（Stage 3a 兜底，head_pred=0）在每一处可观测边界都与 NgramWorker 状态字节对齐。CHANGE_0160 / CHANGE_0161 长期遗留的 "+1" bug 已解决。
+
+正式评估前有两个清理决策待定：
+- **保留还是移除 preflight dump 代码？** `_preflight_dump` 调用是环境变量受控的（`SOAR_PREFLIGHT_DUMP_PATH` 未设置时是静默 no-op），保留不增加运行时开销。建议保留，便于未来 spec decoding 工作（如 Stage 4 训练头）。
+- **正式评估从 `preflight_drive.sh` 切回 `fcloud_workflow.py restart-server`？** 需要切回以重新启用 cuda-graph + torch-compile（`preflight_drive.sh` 为快速启动有意禁用）。
+
+拟定最终评估流程（待用户 "go"）：
+1. `fcloud_workflow.py start-instance`（用户确认后）。
+2. `fcloud_workflow.py full` —— sync + restart-server（使用包含 cuda-graph + torch-compile 的 `SGLANG_SERVER_ARGS`） + accuracy 评估。
+3. `fcloud_workflow.py speed --variant all` —— S1 / S8 / Smax。
+4. 对照 Test 12 基线（S1=121.71s、ori_accuracy=79.29%、normalized=99.11%、C=1.0）。预期 medusa 在 S1 上**至少不慢于** ngram；待 Stage 4 训练头落地后应当更快。
+5. Pause fcloud。
+6. 更新 `TEST_RESULTS_TRACKING.md` 并决定是否提交。
+
 ## 6. 风险
 
 - **R1**：Engine 启动非确定性（如 flashinfer kernel JIT 编译顺序）可能改变 A 与 B 运行之间的 KV 布局。缓解：尽量在两个阶段间持久化 Engine；否则固定随机 seed，并在同一 Python 进程内紧接 A 运行 B。

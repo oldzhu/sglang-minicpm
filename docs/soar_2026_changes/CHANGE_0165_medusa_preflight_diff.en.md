@@ -278,6 +278,54 @@ Followup once preflight diff hits zero:
 - Re-enable cuda-graph + torch-compile by swapping `preflight_drive.sh` for the standard `fcloud_workflow.py restart-server` flow.
 - Run full accuracy eval + speed S1/S8/Smax (requires explicit user confirm per project rules).
 
+### 5.5 Iter 4 result — preflight diff is ZERO across all phases
+
+**Applied fix** (commit `0e4634c1d`): dropped the `batch.spec_algorithm = SpeculativeAlgorithm.NONE` line in MedusaWorker's EXTEND branch. Pre-check on `scheduler_output_processor_mixin.py` confirmed all `spec_algorithm.is_none()` branches live in `process_batch_result_decode`; the prefill output processor (line 85) has no such branches, so the change cannot perturb extend output handling. R-iter4-1 cleared.
+
+**Result — 0 differing fields across all 4 phases × all 25 fields**:
+
+| phase | fields | status |
+|---|---|---|
+| pre_prepare_for_verify | 5 (`batch_size`, `req_pool_indices`, `seq_lens`, `seq_lens_cpu`, `out_cache_loc`) | **all EQUAL** |
+| pre_verify | 14 (incl. `draft_token_num=2`, full tree mask 18-bool, all retrive_*, `spec_positions=[7,8]`, `out_cache_loc=[8,9]`) | **all EQUAL** |
+| post_forward | 3 (`logits_shape=(2,73448)`, `logits_argmax=[72,72]`, `hidden_states_shape=None`) | **all EQUAL** |
+| post_verify | 4 (`accept_length=[0]`, `accepted_indices=[0]`, `next_token_ids=[72]`, `num_accepted_tokens=0`) | **all EQUAL** |
+
+**Total differing fields across all phases: 0.**
+
+Bonus observation: Medusa dump file size went from `29590B` (iter 3, KV-leak crash during scheduler self_check) to `52938B` (iter 4) — exactly matching ngram's `52937B`. The post-serve KV leak is also gone, confirming the bonus-slot was the upstream cause of both symptoms (the +1 cascade AND the 2-slot leak observed in iter 2 / iter 3).
+
+**Diff progression summary**:
+
+| iter | code change | differing fields | status |
+|---|---|---|---|
+| 1 | baseline (broken) | 13 | layout broken (ndt=1) |
+| 2 | ndt=2 + kernel retrive_* + full mask | 5 | layout fixed, single seq_lens +1 left |
+| 3 | added pre_prepare_for_verify dump phase | 5 (+3 at new phase) | root cause isolated |
+| 4 | dropped spec_algorithm=NONE reset | **0** | **PASS** |
+
+**Artifacts**
+
+- Dumps: `/tmp/dump_ngram.pkl` (52937B), `/tmp/dump_medusa.pkl` (52938B).
+- Diff log: `/tmp/iter4_diff.txt` — `TOTAL differing fields across phases: 0`.
+- Commit this iter: `0e4634c1d` (medusa iter 4: drop spec_algorithm=NONE reset in EXTEND).
+
+### 5.6 Next step — final accuracy + speed eval (BLOCKED on user confirm)
+
+The preflight loop has achieved its design objective: MedusaWorker's K=1 path (Stage 3a fallback, head_pred=0) now produces identical state to NgramWorker at every observable boundary. The long-standing CHANGE_0160 / CHANGE_0161 "+1" bug is resolved.
+
+Before running the final eval, two cleanup decisions are pending:
+- **Keep or strip the preflight dump code?** The `_preflight_dump` calls are env-gated (silent no-op when `SOAR_PREFLIGHT_DUMP_PATH` unset), so leaving them in place adds zero runtime cost. Recommend keep, as they will be useful for future spec-decoding work (e.g., Stage 4 trained heads).
+- **Switch from `preflight_drive.sh` back to `fcloud_workflow.py restart-server` for the final eval?** Required to re-enable cuda-graph + torch-compile (which `preflight_drive.sh` deliberately disables for fast startup).
+
+Proposed final-eval run (needs user "go"):
+1. `fcloud_workflow.py start-instance` (after user confirm).
+2. `fcloud_workflow.py full` — sync + restart-server (with `SGLANG_SERVER_ARGS` including cuda-graph + torch-compile) + accuracy eval.
+3. `fcloud_workflow.py speed --variant all` — S1 / S8 / Smax.
+4. Compare against Test 12 baseline (S1=121.71s, ori_accuracy=79.29%, normalized=99.11%, C=1.0). Expect medusa to be **at least as fast** as ngram on S1, ideally faster once trained heads ship (Stage 3b → Stage 4).
+5. Pause fcloud.
+6. Update `TEST_RESULTS_TRACKING.md` and decide whether to submit.
+
 ## 6. Risks
 
 - **R1**: Engine startup non-determinism (e.g., flashinfer kernel JIT compile order) could change KV layout between A and B runs. Mitigation: persist Engine across the two phases if possible; otherwise, pin random seeds and run B immediately after A in the same Python process.
