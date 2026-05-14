@@ -326,6 +326,64 @@ if batch.forward_mode.is_extend():
 5. Pause fcloud。
 6. 更新 `TEST_RESULTS_TRACKING.md` 并决定是否提交。
 
+### 5.7 第 4 轮最终评估 —— 灾难性失败（2026-05-14）
+
+**结果已作为 `Stage3a-preflight0-CATASTROPHIC` 行写入 `TEST_RESULTS_TRACKING.md`。**
+
+执行命令（在 `start-instance` + `sync` + `restart-server`（带完整 MEDUSA + cuda-graph + torch-compile + force-dense + dense-as-sparse 服务器参数）之后）：
+
+```bash
+python3 scripts/fcloud/fcloud_workflow.py full
+```
+
+结果（评估输出位于 `/root/data/outputs/20260514_101850/`）：
+
+| 指标 | iter 4 最终 | Test 12 基线 | 差距 |
+|------|-------------|--------------|------|
+| ori_accuracy | **13.16%** | 79.29% | **−66.13 pt** |
+| normalized_accuracy | **16.44%** | 99.11% | **−82.67 pt** |
+| C | **0** | 1.0 | 淘汰 |
+| duration | **10488.91 s**（约 2 小时 55 分） | 4244 s | **+147%** |
+| mcq | **0.00%**（0/30） | 63.33% | 失控 |
+| niah | 6.67% | 100% | 失控 |
+| cwe | 8.00% | 72% | 失控 |
+| fwe | 27.78% | 97.78% | 失控 |
+| qa | 23.33% | 63.33% | 失控 |
+| 平均 output tokens | 48,812 | 约 5,000 | 触发 `max_tokens=65,536` |
+| mcq 平均 output tokens | 55,816 | 约 500 | 无限循环生成 |
+| TPS | 698.06 | — | — |
+
+**Decode 阶段持续观察到的服务器日志信号**：
+- `accept_len: 1.03–1.19, accept_rate: 0.51–0.60` —— kernel “认为”推测在正常工作。
+- 每个 decode batch 都打印 `cuda graph: False` —— 即使启动阶段已经成功捕获 16 个 cuda-graph buckets（bs=[1..24]，约 14 分钟）。
+- `gen throughput: 380–1167 tok/s, running-req: 24, queue-req: 8`。
+
+**输出模式**（手动抽查 3 条 mcq 预测，长度 65,598 / 96,000+ / 155,913 字符）：
+- `</think>\n</think>\n</think>\n</think>\n...`（在 `</think>` 换行上单 token 循环）
+- `_ _ _ _ _ _ _ _ _ _ ...`（下划线重复）
+- `$\n$\n$\n$\n$\n...`（美元符号换行循环）
+
+全部是典型的推测解码污染：模型被锁死在单 token 重复循环里，永远满足不了停止条件，每个样本一路跑到 `max_tokens`。
+
+**关键教训 —— preflight 0-diff 是必要条件而**非**充分条件。** 预检循环证明在第一次 verify 迭代的 4 个边界（pre_prepare_for_verify、pre_verify、post_forward、post_verify）上，25/25 个 dump 字段与 NgramWorker 字节一致。但实际评估仍然产出完全垃圾。这意味着发散点位于：
+
+- **(H1) 跨迭代而非第 1 次迭代内部** —— 预检只捕获第 1 次迭代；如果 MEDUSA 在迭代 ≥ 2（例如下一次 prefill chunk，或首个 DECODE 步）走了不同代码路径（保留 `spec_algorithm=MEDUSA` 现在的 iter-4 修复），dump 是检测不到的。
+- **(H2) 在 verify kernel/logits-to-token 选择内部** —— 预检 dump 了 `next_token_ids` 与 `accept_length` 作为输出，但如果 kernel 内部 logits indexing 在 MEDUSA vs NGRAM verify 分支之间不同（不同 mask 布局、不同 `retrive_*` 解释），dumped 那一迭代正好巧合产出同一 token，后续迭代仍会发散。
+- **(H3) EXTEND verify 上 GLA 递归状态未 snapshot/restore** —— `CHANGE_0157` 仅修补了 cuda-graph DECODE；EXTEND 路径上 GLA state 前进后从未回滚，位置漂移会累积。原始 ngram-vs-medusa diff 看不到这一点，因为两条路径都走相同的 EXTEND verify、iter 1 状态确实一致；污染只在多次迭代累积漂移后才显现。
+- **(H4) `cuda graph: False` 副作用** —— decode 在 MEDUSA 路径上绕开 cuda-graph。这是预期（`CudaGraphRunner.can_run()` 对 MEDUSA+TARGET_VERIFY 返回 False），但同时 torch-compile 加速也丢了，而且 **eager-mode decode kernel 可能走另一条 attention-metadata 路径而自带 bug**（例如 CHANGE_0155 Stage 3a 在 `SimpleGLAAttnBackend.forward` 中增加的 `is_target_verify` 分支）。
+
+**Pause 状态**：pause-instance 重试两次 —— 第一次返回 openresty 502 HTML，第二次返回 HTTP 200 `{"status":"success","message":"任务已暂停"}`。fcloud 现已 PAUSED。
+
+**结论**：Stage 3a K=1 passthrough Medusa + TARGET_VERIFY 在目前任何形态下都**不是提交候选**。最佳已知 Medusa 基线仍是 **Stage 2-cgraph**（commit `46553947b`，S1=118.28s，ori_accuracy=80.11%，C=1.0），即 *经过 MedusaWorker 但不启用 TARGET_VERIFY 的 passthrough*。整体最佳基线仍是 **Test 12 / v18-revert**（不启用 NgramWorker，S1=110.51–121.71s，ori_accuracy=79.29%，C=1.0）。
+
+**下一步选项**（需用户决定）：
+1. **回滚 commit `0e4634c1d`**（iter-4 的修复 —— 保留 `spec_algorithm=MEDUSA` 穿过 EXTEND），重新评估以确认 bug 是修复后引入还是修复前就存在。如果回滚后仍失败，则 bug 早于 iter 4。
+2. **将预检扩展到多迭代 dump**（迭代 1、2、5、10、25），定位状态首次发散的迭代号。
+3. **彻底放弃 Stage 3a Medusa。** 直接以 Stage 2-cgraph（`46553947b`）作为最终 Medusa 提交（v23）—— 已经 C=1.0、80.11%，并相比 Test 12 在 S1 上有约 3% 提速。剩余精力转向非推测解码的优化。
+4. **在 `spec_info.verify()` 中加 tracer**，在迭代 1、2、5 打印 MEDUSA 与 NGRAM 各自选中的 logits-index 与 token；离线 diff 两条轨迹。
+
+推荐顺序（最低成本优先）：(1) → 若回滚仍失败则 (3)。(3) 是 v23 提交最低风险的锁定方案。
+
 ## 6. 风险
 
 - **R1**：Engine 启动非确定性（如 flashinfer kernel JIT 编译顺序）可能改变 A 与 B 运行之间的 KV 布局。缓解：尽量在两个阶段间持久化 Engine；否则固定随机 seed，并在同一 Python 进程内紧接 A 运行 B。

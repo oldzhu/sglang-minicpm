@@ -326,6 +326,64 @@ Proposed final-eval run (needs user "go"):
 5. Pause fcloud.
 6. Update `TEST_RESULTS_TRACKING.md` and decide whether to submit.
 
+### 5.7 Iteration 4 final eval — CATASTROPHIC FAILURE (2026-05-14)
+
+**Result row added to TEST_RESULTS_TRACKING.md as `Stage3a-preflight0-CATASTROPHIC`.**
+
+Command run (after `start-instance` + `sync` + `restart-server` with full MEDUSA + cuda-graph + torch-compile + force-dense + dense-as-sparse server args):
+
+```bash
+python3 scripts/fcloud/fcloud_workflow.py full
+```
+
+Outcome (eval at `/root/data/outputs/20260514_101850/`):
+
+| Metric | Iter 4 final | Test 12 baseline | Delta |
+|--------|--------------|------------------|-------|
+| ori_accuracy | **13.16%** | 79.29% | **−66.13 pt** |
+| normalized_accuracy | **16.44%** | 99.11% | **−82.67 pt** |
+| C | **0** | 1.0 | disqualified |
+| duration | **10488.91 s** (~2h55m) | 4244 s | **+147%** |
+| mcq | **0.00%** (0/30) | 63.33% | runaway |
+| niah | 6.67% | 100% | runaway |
+| cwe | 8.00% | 72% | runaway |
+| fwe | 27.78% | 97.78% | runaway |
+| qa | 23.33% | 63.33% | runaway |
+| avg_output_tokens | 48,812 | ~5,000 | hitting `max_tokens=65,536` |
+| mcq avg_output_tokens | 55,816 | ~500 | infinite-loop generation |
+| TPS | 698.06 | — | — |
+
+**Server-log signals during decode** (sustained):
+- `accept_len: 1.03–1.19, accept_rate: 0.51–0.60` — kernel *thinks* speculation is working.
+- `cuda graph: False` on every decode batch — even though 16 cuda-graph buckets (bs=[1..24]) captured cleanly at startup over ~14 min.
+- `gen throughput: 380–1167 tok/s, running-req: 24, queue-req: 8`.
+
+**Output pattern** (3 mcq predictions inspected by hand, lengths 65,598 / 96,000+ / 155,913 chars):
+- `</think>\n</think>\n</think>\n</think>\n...` (token loop on `</think>` newline)
+- `_ _ _ _ _ _ _ _ _ _ ...` (underscore repetition)
+- `$\n$\n$\n$\n$\n...` (dollar-sign newline loop)
+
+All show classic spec-decoder corruption: model gets locked into a single-token repetition cycle that never satisfies stop conditions, runs to `max_tokens` on every sample.
+
+**Critical learning — preflight 0-diff is necessary but NOT sufficient for correctness.** The preflight loop verified that at 4 boundary points (pre_prepare_for_verify, pre_verify, post_forward, post_verify) of the **first** verify iteration, 25/25 dumped fields match NgramWorker byte-for-byte. But the actual eval still produces complete garbage. This implies the divergence is:
+
+- (H1) **Across iterations, not within iteration 1** — preflight only snapshots the first iteration; if MEDUSA's `spec_algorithm=MEDUSA` (now preserved through EXTEND per the iter-4 fix) takes a different code path on iteration ≥ 2 (e.g., next prefill chunk, or first DECODE step), the dumps would not detect it.
+- (H2) **Inside the verify kernel/logits-to-token selection** — preflight dumps `next_token_ids` and `accept_length` AS OUTPUT, but if the kernel's internal logits indexing differs between MEDUSA and NGRAM verify branches (different mask layout, different `retrive_*` interpretation), and the dump shows the same final token by *coincidence* on the dumped iteration, downstream iterations diverge.
+- (H3) **GLA recurrent state not snapshot/restored on EXTEND verify** — `CHANGE_0157` only patched cuda-graph DECODE; on the EXTEND path, the GLA state is advanced forward but never rewound, so position drift accumulates. The original ngram-vs-medusa diff would not have shown this because both paths share the same EXTEND verify and the state DOES match at iter 1; corruption manifests only after several iterations of accumulated drift.
+- (H4) **cuda-graph=False side effect** — decode bypasses cuda-graph for the MEDUSA path. This is expected (`CudaGraphRunner.can_run()` returns False for MEDUSA+TARGET_VERIFY) but means torch-compile speedup is also lost, and **the eager-mode decode kernel may take a different attention-metadata path that has its own bug** (e.g., the `is_target_verify` branch in `SimpleGLAAttnBackend.forward` added in CHANGE_0155 Stage 3a).
+
+**Pause status**: pause-instance retried twice — first call returned openresty 502 HTML, second call returned HTTP 200 `{"status":"success","message":"任务已暂停"}`. fcloud is now PAUSED.
+
+**Decision**: Stage 3a K=1 passthrough Medusa with TARGET_VERIFY enabled is **NOT a submission candidate** in any form found so far. Best-known-good Medusa baseline remains **Stage 2-cgraph** (commit `46553947b`, S1=118.28s, ori_accuracy=80.11%, C=1.0) which is *passthrough through MedusaWorker without TARGET_VERIFY*. Best overall baseline remains **Test 12 / v18-revert** (NgramWorker disabled, S1=110.51–121.71s, ori_accuracy=79.29%, C=1.0).
+
+**Next-step options** (require user direction):
+1. **Revert commit `0e4634c1d`** (the iter-4 fix that kept `spec_algorithm=MEDUSA` through EXTEND) and re-run eval to confirm the bug is on the post-fix side, not pre-existing. If reverted state also fails, the bug predates iter 4 and isn't caused by the spec_algorithm flip.
+2. **Extend preflight to multi-iteration dumps** (iteration 1, 2, 5, 10, 25) to localize at which iteration the state first diverges.
+3. **Abandon Stage 3a Medusa entirely.** Ship v23 = Stage 2-cgraph (`46553947b`) as the final Medusa submission — already C=1.0 at 80.11% with a small (~3%) S1 speedup vs Test 12. Pivot remaining effort to non-spec-decoding optimizations.
+4. **Add tracer in `spec_info.verify()`** to print the logits-index and token chosen on iterations 1, 2, 5 for both MEDUSA and NGRAM runs; diff the two traces offline.
+
+Recommended path (cheapest first): (1) → (3) if revert also fails. Option (3) is the lowest-risk lock-in for v23 submission.
+
 ## 6. Risks
 
 - **R1**: Engine startup non-determinism (e.g., flashinfer kernel JIT compile order) could change KV layout between A and B runs. Mitigation: persist Engine across the two phases if possible; otherwise, pin random seeds and run B immediately after A in the same Python process.
