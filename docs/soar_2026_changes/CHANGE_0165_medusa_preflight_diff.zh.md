@@ -95,6 +95,54 @@ Stage 3b ndt=2（CHANGE_0164）尝试通过设置 `draft_token_num = num_heads +
 
 ## 5. 迭代日志
 
+### §5.1 第 1 轮 — Stage 3a 基线（commit f375082a2 + 19740212d）
+
+**配置**
+- 驱动脚本：`benchmark/soar/demo_sala/preflight_drive.sh {ngram|medusa}`（提交 d9394bec6 → 19740212d）。
+  - 剥离 `--enable-torch-compile` 与 `--torch-compile-max-bs N`，并强制 `--disable-cuda-graph`，把启动时间从 ~15 分钟（16 个 batch 桶全捕获）缩短到 ~2 分钟 —— pre-flight 只需要一次 verify。
+  - 每个模式启动独立 sglang server：`bs=1`，`ndt = {ngram:2, medusa-stage-3a:虽然传入 H+1=2 但 MedusaWorker 内部硬编码为 1}`。
+- 探针 prompt：`"Question: What is the capital city of France?\nAnswer:"`，`temperature=0.0`，`max_new_tokens=3`。
+- 双侧各在 3 个 phase dump：`pre_verify`、`post_forward`、`post_verify`。
+  - `/tmp/dump_ngram.pkl` = 41908 B（27 条记录：9 次 verify × 3 phase）
+  - `/tmp/dump_medusa.pkl` = 41207 B（27 条记录）
+- diff 工具：`benchmark/soar/demo_sala/preflight_diff.py --ngram … --medusa …`（对比双侧**第一次** verify）。
+
+**结果（13 个字段不同）**
+
+| Phase | 字段 | ngram | medusa (stage 3a) | 严重级别 | 决策 | 原因 |
+|---|---|---|---|---|---|---|
+| pre_verify | `draft_token_num` | 2 | 1 | **关键 / 根因** | iter 2 清理 | MedusaWorker 强制 `ndt=1`，无视 `--speculative-num-draft-tokens` 参数。**所有 shape 差异都从这里级联**。 |
+| pre_verify | `input_ids` | (2,) `[11225, 0]` | (1,) `[11225]` | 关键（级联） | ndt=2 后消失 | 多出的 slot = 填充 draft token `0` |
+| pre_verify | `out_cache_loc` | (2,) `[8, 9]` | (1,) `[9]` | 关键（级联） | ndt=2 后消失 | 两个 KV 槽 vs 一个 |
+| pre_verify | `spec_draft_token` | (2,) `[11225, 0]` | (1,) `[11225]` | 关键（级联） | ndt=2 后消失 | 同 `input_ids`（ngram 传入 `output_ids[-1]` + 一个 ngram 建议 token 用 `0` 填充） |
+| pre_verify | `spec_positions` | (2,) `[7, 8]` | (1,) `[8]` | 关键（级联） | ndt=2 后消失 | 从当前 `seq_len` 跨越 2 个 slot 的位置 |
+| pre_verify | `spec_custom_mask` | (18,) | (8,) | 关键（级联） | ndt=2 后消失 | 全 mask 布局 `(seq_len + ndt) * ndt` ⇒ `(7+2)*2=18` vs `(8+0)*1=8`。编码 `ndt` 个 query × `seq_len + ndt` 个 key 的对角因果 mask。 |
+| pre_verify | `spec_retrive_index` | (1, 2) `[0, 1]` | (1, 1) `[0]` | 关键（级联） | ndt=2 后消失 | 树检索索引；K=1 链 shape = `(bs, ndt)` |
+| pre_verify | `spec_retrive_next_token` | (1, 2) `[1, -1]` | (1, 1) `[-1]` | 关键（级联） | ndt=2 后消失 | 链指针（0→1→叶） |
+| pre_verify | `spec_retrive_next_sibling` | (1, 2) `[-1, -1]` | (1, 1) `[-1]` | 关键（级联） | ndt=2 后消失 | 链无 sibling |
+| pre_verify | `seq_lens` / `seq_lens_cpu` | 7 | 8 | 表面 / 衍生 | 接受 | `ndt=1` 比 `ndt=2` 少消费一个 token，所以 `ndt=1` 多跑一轮 decode 才追上 —— 步数计数偏移，不是算法 bug。 |
+| post_forward | `logits_argmax` | (2,) `[72, 72]` | (1,) `[72]` | 关键（级联） | ndt=2 后消失 | 直接由输入 shape 差异引起；**重叠 slot 上的值相同**（`72`） → 给定输入下 forward 是对的。 |
+| post_forward | `logits_shape` | `(2, 73448)` | `(1, 73448)` | 关键（级联） | ndt=2 后消失 | 同上 |
+| post_verify | `accept_length`, `accepted_indices`, `next_token_ids`, `num_accepted_tokens` | 全相等 | 全相等 | n/a（干净） | 保留 | verify 步本身在被接受输出上一致（`next_token=72`，0 个 bonus 被接受）。确认 **verify 走树逻辑不是 bug**。 |
+
+**结论**
+
+- 单一根因：Stage 3a 的 `MedusaWorker.draft_token_num = 1`。所有 shape 差异都从此级联。verify 走树 / tree-index / 接受打分逻辑没有 bug —— 喂相同 shape 的输入，模型产生匹配的 logits，verify 步给出一致的输出。
+- 这是 Iter 1 的**预期**基线（按 CHANGE_0165 §0 计划 Stage 3a 不动代码）：我们需要在动代码前先用实证确认所有差异都收敛到一个根因。
+
+**Iter 2 计划**
+
+1. 修改 `MedusaWorker`：(a) 让 `draft_token_num=2` 生效（匹配 `--speculative-num-draft-tokens 2`）；(b) 用 NgramWorker 同样的 `reconstruct_indices_from_tree_mask` kernel 构建 `spec_positions`、`spec_custom_mask`、`spec_retrive_*`；(c) K=1 链的 draft token 用 `[output_ids[-1], 0]`（填充） —— 与 Ngram 的 draft 内容 shape 一致，保持 Stage 3a 语义（head 0 实际未被使用；训练好的 head 路径是 Stage 3c）。
+2. 重跑 `preflight_drive.sh medusa`，预期 §5.2 报告 `pre_verify` / `post_forward` **0 个关键差异**，`post_verify` 完全相等。
+3. 仅在那之后跑完整精度 + 速度评测。
+
+**产物**
+
+- Dump：fcloud `/tmp/dump_ngram.pkl`、`/tmp/dump_medusa.pkl`（已同步到本地 `/tmp/`）。
+- diff 日志：`/tmp/iter1_diff.txt`。
+- Server 日志：fcloud `/tmp/server_ngram.log`、`/tmp/server_medusa.log`。
+- 本轮提交：`d9394bec6`（preflight 基础设施）、`11555decd`（驱动脚本）、`283c8a106`（去掉 set -e）、`f375082a2`（导出 MODEL_PATH）、`19740212d`（关闭 graph+compile）。
+
 （空 — 每次预飞行运行后填充。）
 
 ## 6. 风险
