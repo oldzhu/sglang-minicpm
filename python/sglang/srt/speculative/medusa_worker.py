@@ -46,6 +46,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative._preflight import dump_state as _preflight_dump
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -304,12 +305,47 @@ class MedusaWorker:
 
         model_worker_batch = batch.get_model_worker_batch()
 
+        # SOAR CHANGE_0165 preflight: capture state just before forward.
+        _preflight_dump(
+            tag="medusa",
+            phase="pre_verify",
+            batch_size=bs,
+            draft_token_num=spec_info.draft_token_num,
+            seq_lens=batch.seq_lens,
+            seq_lens_cpu=batch.seq_lens_cpu,
+            input_ids=batch.input_ids,
+            out_cache_loc=batch.out_cache_loc,
+            req_pool_indices=batch.req_pool_indices,
+            spec_draft_token=spec_info.draft_token,
+            spec_custom_mask=spec_info.custom_mask,
+            spec_positions=spec_info.positions,
+            spec_retrive_index=spec_info.retrive_index,
+            spec_retrive_next_token=spec_info.retrive_next_token,
+            spec_retrive_next_sibling=spec_info.retrive_next_sibling,
+            spec_capture_hidden_mode=str(getattr(spec_info, "capture_hidden_mode", None)),
+        )
+
         # 5. Run TARGET_VERIFY forward (always eager; CUDA graph not used).
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
         )
         logits_output = batch_result.logits_output
         can_run_cuda_graph = batch_result.can_run_cuda_graph
+
+        _logits_argmax = None
+        _ntl = getattr(logits_output, "next_token_logits", None)
+        try:
+            if _ntl is not None:
+                _logits_argmax = _ntl.argmax(dim=-1)
+        except Exception:  # pylint: disable=broad-except
+            _logits_argmax = None
+        _preflight_dump(
+            tag="medusa",
+            phase="post_forward",
+            logits_argmax=_logits_argmax,
+            logits_shape=tuple(getattr(_ntl, "shape", ())) if _ntl is not None else None,
+            hidden_states_shape=tuple(getattr(getattr(logits_output, "hidden_states", None), "shape", ())) if getattr(logits_output, "hidden_states", None) is not None else None,
+        )
 
         # 6. Capture hidden states BEFORE verify() modifies them.
         #    verify() (via _fill_requests) re-indexes logits_output.hidden_states by
@@ -328,6 +364,15 @@ class MedusaWorker:
             batch, logits_output, self.page_size
         )
         accept_lens = spec_info.accept_length  # (bs,) tensor
+
+        _preflight_dump(
+            tag="medusa",
+            phase="post_verify",
+            accept_length=accept_lens,
+            next_token_ids=next_token_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            accepted_indices=getattr(spec_info, "accepted_indices", None),
+        )
 
         # CHANGE_0160: zero bonus-token position in req_to_token after verify.
         accept_lens_cpu = spec_info.accept_length.cpu().tolist()

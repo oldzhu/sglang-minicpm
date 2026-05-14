@@ -11,6 +11,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative._preflight import dump_state as _preflight_dump
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -217,6 +218,26 @@ class NGRAMWorker:
         accept_lens = None
 
         if model_worker_batch.forward_mode.is_target_verify():
+            # SOAR CHANGE_0165 preflight: capture state just before forward.
+            _vi_pre: NgramVerifyInput = model_worker_batch.spec_info
+            _preflight_dump(
+                tag="ngram",
+                phase="pre_verify",
+                batch_size=batch.batch_size(),
+                draft_token_num=getattr(_vi_pre, "draft_token_num", None),
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                input_ids=batch.input_ids,
+                out_cache_loc=batch.out_cache_loc,
+                req_pool_indices=batch.req_pool_indices,
+                spec_draft_token=getattr(_vi_pre, "draft_token", None),
+                spec_custom_mask=getattr(_vi_pre, "custom_mask", None),
+                spec_positions=getattr(_vi_pre, "positions", None),
+                spec_retrive_index=getattr(_vi_pre, "retrive_index", None),
+                spec_retrive_next_token=getattr(_vi_pre, "retrive_next_token", None),
+                spec_retrive_next_sibling=getattr(_vi_pre, "retrive_next_sibling", None),
+                spec_capture_hidden_mode=str(getattr(_vi_pre, "capture_hidden_mode", None)),
+            )
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
             )
@@ -225,11 +246,33 @@ class NGRAMWorker:
                 batch_result.can_run_cuda_graph,
             )
             verify_input: NgramVerifyInput = model_worker_batch.spec_info
+            _logits_argmax = None
+            try:
+                _ntl = getattr(logits_output, "next_token_logits", None)
+                if _ntl is not None:
+                    _logits_argmax = _ntl.argmax(dim=-1)
+            except Exception:  # pylint: disable=broad-except
+                _logits_argmax = None
+            _preflight_dump(
+                tag="ngram",
+                phase="post_forward",
+                logits_argmax=_logits_argmax,
+                logits_shape=tuple(getattr(_ntl, "shape", ())) if _ntl is not None else None,
+                hidden_states_shape=tuple(getattr(getattr(logits_output, "hidden_states", None), "shape", ())) if getattr(logits_output, "hidden_states", None) is not None else None,
+            )
             logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
                 batch, logits_output, self.page_size
             )
             # Store accept_lens for per-request metrics
             accept_lens = verify_input.accept_length
+            _preflight_dump(
+                tag="ngram",
+                phase="post_verify",
+                accept_length=accept_lens,
+                next_token_ids=next_token_ids,
+                num_accepted_tokens=num_accepted_tokens,
+                accepted_indices=getattr(verify_input, "accepted_indices", None),
+            )
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
             self._update_ngram_cache(batch)
