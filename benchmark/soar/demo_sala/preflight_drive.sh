@@ -53,6 +53,15 @@ export SOAR_QUANT_MODE="${SOAR_QUANT_MODE:-gptq}"
 # Source prepare_env.sh.
 source ./prepare_env.sh
 
+# Preflight only needs ONE verify step.  Strip torch-compile + cuda-graph to
+# cut server start time from ~15min (full capture across 16 buckets) to ~2min.
+SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--enable-torch-compile/}"
+SGLANG_SERVER_ARGS="$(echo "$SGLANG_SERVER_ARGS" | sed -E 's/--torch-compile-max-bs [0-9]+//g')"
+if [[ "$SGLANG_SERVER_ARGS" != *"--disable-cuda-graph"* ]]; then
+    SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS} --disable-cuda-graph"
+fi
+export SGLANG_SERVER_ARGS
+
 # prepare_env.sh does NOT export MODEL_PATH; fcloud_workflow's restart-server
 # sets it explicitly after sourcing.  Mirror that here.
 MODEL_PATH="${MODEL_PATH:-/root/models/openbmb/MiniCPM-SALA-90-qa-cwe-mcq-sparse_qkv_w8}"
