@@ -53,7 +53,13 @@ export SOAR_QUANT_MODE="${SOAR_QUANT_MODE:-gptq}"
 # Source prepare_env.sh.
 source ./prepare_env.sh
 
+# prepare_env.sh does NOT export MODEL_PATH; fcloud_workflow's restart-server
+# sets it explicitly after sourcing.  Mirror that here.
+MODEL_PATH="${MODEL_PATH:-/root/models/openbmb/MiniCPM-SALA-90-qa-cwe-mcq-sparse_qkv_w8}"
+export MODEL_PATH
+
 echo "[preflight] mode=$MODE"
+echo "[preflight] MODEL_PATH=$MODEL_PATH"
 echo "[preflight] SGLANG_SERVER_ARGS=$SGLANG_SERVER_ARGS"
 echo "[preflight] SOAR_PREFLIGHT_DUMP_PATH=$SOAR_PREFLIGHT_DUMP_PATH"
 
