@@ -143,6 +143,66 @@ Each iteration ends with:
 - Server logs: `/tmp/server_ngram.log`, `/tmp/server_medusa.log` on fcloud.
 - Commits this iter: `d9394bec6` (preflight infra), `11555decd` (driver), `283c8a106` (set -e fix), `f375082a2` (MODEL_PATH export), `19740212d` (disable graph+compile).
 
+### §5.2 Iteration 2 — ndt=2 + kernel-built retrive_* + full mask (commit `89a30d5d0`)
+
+**Setup**
+
+- Code change (single commit, `python/sglang/srt/speculative/medusa_worker.py`):
+  1. `self.draft_token_num = self.num_heads + 1` (=2 for K=1) instead of `=num_heads`.
+  2. `_forward_verify_k1` rewritten to mirror NgramWorker layout:
+     - Build per-req draft chain `[base, head_pred or 0]` (Stage 3a: head untrained → `head_pred=0`).
+     - Build tri `(ndt, ndt)` lower-triangular tree mask, flatten as `(ndt, seq_len-1+ndt)` per req (USE_FULL_MASK style), concat across batch.
+     - Allocate `positions`, `retrive_index`, `retrive_next_token`, `retrive_next_sibling` and let `sgl_kernel.speculative.reconstruct_indices_from_tree_mask` populate them — same canonical kernel NgramWorker uses.
+  3. Hidden-state slicing for trained heads: `hs.view(bs, ndt, -1)[:, 0, :]` since `hs.shape[0] == bs * ndt = 2` now.
+- Pre-flight run: same driver, same prompt. Ngram dump 41908 B / 27 records; **Medusa dump 23529 B / 15 records** (one fewer verify step because scheduler crashed on idle KV check after the probe — this is post-probe and does NOT affect the captured records: phases pre/post/post are intact).
+
+**Findings (5 fields differ — 13 → 5)**
+
+| Phase | Field | ngram | medusa (iter 2) | Severity | Diagnosis |
+|---|---|---|---|---|---|
+| pre_verify | `draft_token_num` | 2 | **2** | ✅ EQUAL | Fix #1 confirmed. |
+| pre_verify | `input_ids` | (2,) `[11225, 0]` | (2,) `[11225, 0]` | ✅ EQUAL | ndt=2 layout adopted; pad=0 matches. |
+| pre_verify | `spec_draft_token` | (2,) `[11225, 0]` | (2,) `[11225, 0]` | ✅ EQUAL | Stage 3a head returns 0 → identical to ngram fallback. |
+| pre_verify | `spec_custom_mask` | (18,) | (18,) | ✅ EQUAL | USE_FULL_MASK + tri lowered to identical layout. |
+| pre_verify | `spec_retrive_index` / `next_token` / `next_sibling` | (1,2) | (1,2) | ✅ EQUAL | `reconstruct_indices_from_tree_mask` kernel produces identical tree. |
+| pre_verify | `seq_lens` / `seq_lens_cpu` | 7 | **8** | semantic off-by-one | **Remaining root cause.** MedusaWorker's verify is invoked when the request's `seq_lens` is already 1 ahead of ngram's. |
+| pre_verify | `spec_positions` | `[7, 8]` | `[8, 9]` | cascade of seq_lens | kernel writes `[seq_len-1, seq_len, ..., seq_len-2+ndt]` — values shifted by +1 because seq_lens=8. |
+| pre_verify | `out_cache_loc` | `[8, 9]` | `[9, 10]` | cascade of seq_lens | KV allocator hands out the next 2 free slots — also +1 because medusa has one more committed slot. |
+| post_forward | `logits_argmax[0]` | 72 | 72 | ✅ equal at slot 0 | Forward over the (now identical-shape) input produces matching token at the base position. |
+| post_forward | `logits_argmax[1]` | 72 | **59320** | cascade of seq_lens | Model is invoked at position 9 vs 8 with different KV history depth → different speculative slot logits. |
+| post_forward | `logits_shape` | (2, 73448) | (2, 73448) | ✅ EQUAL | Layout fixed. |
+| post_verify | accept_length / accepted_indices / next_token_ids / num_accepted_tokens | all equal | all equal | ✅ EQUAL | Despite the slot-1 logits diverging, accept_length=0 (no draft accepted because draft was `0`) → next_token=72 on both. Verify walk is clean. |
+
+**Conclusion**
+
+- Iter 2 delivers exactly what the proposal promised for the layout fix: **8 previously-broken fields now align** (`draft_token_num`, `input_ids`, `spec_draft_token`, `spec_custom_mask`, `spec_retrive_index`, `spec_retrive_next_token`, `spec_retrive_next_sibling`, `logits_shape`). `post_verify` remains 4×EQUAL.
+- The **single remaining root cause** is `seq_lens` ahead by 1 in MedusaWorker. This is the long-standing positional off-by-one that CHANGE_0160 / CHANGE_0161 / `PROPOSAL_medusa_k1_positional_offbyone_fix` have been circling around. Now the pre-flight harness pins it to **a single field** (`seq_lens`) in a single phase (`pre_verify`) — eliminating ambiguity from layout cascade.
+
+**Where does the extra +1 come from?**
+
+Hypotheses (to be tested in iter 3):
+1. **H1 (most likely)** — Stage 3a-style "bonus position" KV write: when MedusaWorker enters its verify path, the previous decode step appended the bonus token's KV at `seq_len`, advancing `seq_lens` by 1 before `prepare_for_verify` runs. NgramWorker doesn't write bonus KV during decode, so it stays at the pre-verify seq_len.
+2. **H2** — `prepare_for_verify` in MedusaWorker increments `seq_lens` by `+1` instead of leaving it untouched (the increment-by-ndt is supposed to happen during the verify forward, not before).
+3. **H3** — The probe is the *second* batch step (after the initial decode that emitted token `11225`), and Medusa's "extend" mode for that initial decode incorrectly committed two slots.
+
+The pre-flight harness can disambiguate by dumping a 4th phase: `pre_prepare_for_verify` (state immediately before `spec_info.prepare_for_verify`). That isolates whether the +1 comes from decode-side bookkeeping (H1/H3 → bug visible at this earlier phase) or `prepare_for_verify` itself (H2 → diff appears only after).
+
+**Iter 3 plan (proposal — needs user "go")**
+
+1. Add `phase="pre_prepare_for_verify"` dump in both workers, capturing `seq_lens`, `seq_lens_cpu`, `out_cache_loc` (whatever is already allocated), `req_pool_indices`.
+2. Re-run preflight, diff.
+3. If H1/H3: locate where MedusaWorker's main-decode commits the bonus slot → either skip the commit OR shift verify's `seq_lens` back by 1 before `prepare_for_verify`. Per CHANGE_0160/0161, the safer path is the latter (subtract 1 from `batch.seq_lens` for the verify-input view) — but the **correct** fix is to not double-count the bonus slot in the first place.
+4. If H2: simplify `prepare_for_verify` to remove the spurious increment.
+5. Iterate to 0 critical diffs in pre_verify; only then run accuracy.
+
+**Pass criterion for iter 3**: `seq_lens`, `seq_lens_cpu`, `spec_positions`, `out_cache_loc`, `logits_argmax` all EQUAL between ngram and medusa. `post_verify` already-equal must remain equal.
+
+**Artifacts**
+
+- Dumps: `/tmp/dump_ngram.pkl`, `/tmp/dump_medusa.pkl` on fcloud (this iter).
+- Diff log: `/tmp/iter2_diff.txt` (also mirrored to local `/tmp/`).
+- Commit this iter: `89a30d5d0` (medusa: preflight iter 2 — adopt ndt=2 + kernel-built retrive_* + full mask).
+
 ## 6. Risks
 
 - **R1**: Engine startup non-determinism (e.g., flashinfer kernel JIT compile order) could change KV layout between A and B runs. Mitigation: persist Engine across the two phases if possible; otherwise, pin random seeds and run B immediately after A in the same Python process.

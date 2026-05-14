@@ -143,6 +143,66 @@ Stage 3b ndt=2（CHANGE_0164）尝试通过设置 `draft_token_num = num_heads +
 - Server 日志：fcloud `/tmp/server_ngram.log`、`/tmp/server_medusa.log`。
 - 本轮提交：`d9394bec6`（preflight 基础设施）、`11555decd`（驱动脚本）、`283c8a106`（去掉 set -e）、`f375082a2`（导出 MODEL_PATH）、`19740212d`（关闭 graph+compile）。
 
+### §5.2 第 2 轮 —— ndt=2 + 内核生成 retrive_* + 全掩码（提交 `89a30d5d0`）
+
+**Setup**
+
+- 代码改动（单个提交，`python/sglang/srt/speculative/medusa_worker.py`）：
+  1. `self.draft_token_num = self.num_heads + 1`（K=1 时 =2），不再是 `=num_heads`。
+  2. `_forward_verify_k1` 改写，镜像 NgramWorker 布局：
+     - 每个 req 构造 draft 链 `[base, head_pred or 0]`（Stage 3a：head 未训练 → `head_pred=0`）。
+     - 构造 `(ndt, ndt)` 下三角 tree mask，按 USE_FULL_MASK 拼成 `(ndt, seq_len-1+ndt)`，跨 batch 串接。
+     - 分配 `positions`、`retrive_index`、`retrive_next_token`、`retrive_next_sibling`，由 `sgl_kernel.speculative.reconstruct_indices_from_tree_mask` 填充 —— 与 NgramWorker 同一内核。
+  3. 训练 head 的 hidden state 切片：`hs.view(bs, ndt, -1)[:, 0, :]`，因为现在 `hs.shape[0] == bs * ndt = 2`。
+- Pre-flight 执行：同一驱动、同一 prompt。Ngram dump 41908 B / 27 records；**Medusa dump 23529 B / 15 records**（少一步 verify，因为探针完成后 scheduler 在 idle KV 检查时崩溃 —— 探针后才发生，不影响已记录数据：pre/post/post 三阶段完整）。
+
+**结果（差异由 13 项降到 5 项）**
+
+| Phase | 字段 | ngram | medusa（iter 2） | 严重度 | 诊断 |
+|---|---|---|---|---|---|
+| pre_verify | `draft_token_num` | 2 | **2** | ✅ EQUAL | 修复 #1 生效。 |
+| pre_verify | `input_ids` | (2,) `[11225, 0]` | (2,) `[11225, 0]` | ✅ EQUAL | ndt=2 布局已采用；pad=0 一致。 |
+| pre_verify | `spec_draft_token` | (2,) `[11225, 0]` | (2,) `[11225, 0]` | ✅ EQUAL | Stage 3a head 返回 0 → 与 ngram fallback 完全一致。 |
+| pre_verify | `spec_custom_mask` | (18,) | (18,) | ✅ EQUAL | USE_FULL_MASK + 下三角拼装得到相同布局。 |
+| pre_verify | `spec_retrive_index` / `next_token` / `next_sibling` | (1,2) | (1,2) | ✅ EQUAL | `reconstruct_indices_from_tree_mask` 内核生成相同树。 |
+| pre_verify | `seq_lens` / `seq_lens_cpu` | 7 | **8** | 语义性 off-by-one | **剩余根因**。MedusaWorker 进入 verify 时 `seq_lens` 已比 ngram 多 1。 |
+| pre_verify | `spec_positions` | `[7, 8]` | `[8, 9]` | seq_lens 级联 | 内核写 `[seq_len-1, seq_len, ...]`，因 seq_lens=8 整体 +1。 |
+| pre_verify | `out_cache_loc` | `[8, 9]` | `[9, 10]` | seq_lens 级联 | KV 分配器给出后续 2 个空槽，因 medusa 多占 1 槽。 |
+| post_forward | `logits_argmax[0]` | 72 | 72 | ✅ slot 0 相等 | 形状一致后模型在 base 位置产生相同 token。 |
+| post_forward | `logits_argmax[1]` | 72 | **59320** | seq_lens 级联 | 模型在 position 9 vs 8 不同 KV 历史下被调用 → speculative slot 的 logits 不同。 |
+| post_forward | `logits_shape` | (2, 73448) | (2, 73448) | ✅ EQUAL | 布局已修。 |
+| post_verify | accept_length / accepted_indices / next_token_ids / num_accepted_tokens | 全部相等 | 全部相等 | ✅ EQUAL | 虽然 slot 1 logits 不同，accept_length=0（draft 为 `0` 不会被接受）→ 两边 next_token=72。verify-walk 干净。 |
+
+**结论**
+
+- Iter 2 完全实现提案中的布局修复：**之前破裂的 8 个字段全部对齐**（`draft_token_num`、`input_ids`、`spec_draft_token`、`spec_custom_mask`、`spec_retrive_index`、`spec_retrive_next_token`、`spec_retrive_next_sibling`、`logits_shape`）。`post_verify` 保持 4×EQUAL。
+- **唯一剩余根因**是 MedusaWorker 中 `seq_lens` 比 ngram 多 1。这就是 CHANGE_0160 / CHANGE_0161 / `PROPOSAL_medusa_k1_positional_offbyone_fix` 一直在外围打转的"位置 off-by-one"。pre-flight 框架将其锁定为**单个字段**（`seq_lens`）在**单个阶段**（`pre_verify`）的偏差 —— 消除了布局级联带来的歧义。
+
+**+1 从哪里来？**
+
+待 iter 3 验证的假设：
+1. **H1（最可能）** —— Stage 3a "bonus 位"的 KV 写入：上一次 decode 步骤把 bonus token 的 KV 写到 `seq_len` 处，在 `prepare_for_verify` 之前就把 `seq_lens` 推进了 1。NgramWorker 不写 bonus KV，所以保持原值。
+2. **H2** —— MedusaWorker 的 `prepare_for_verify` 错误地把 `seq_lens` +1（本应由 verify forward 在执行时按 ndt 推进，而非提前）。
+3. **H3** —— 探针是*第二个* batch 步骤（首个 decode 已输出 11225），Medusa 在那个初始 decode 的 "extend" 模式下错误地提交了两个 KV 槽。
+
+Pre-flight 可以增加第 4 阶段 `pre_prepare_for_verify`（进入 `spec_info.prepare_for_verify` 之前）来区分：如果差异在此阶段就出现 → 是 decode 端记账问题（H1/H3）；如果只在 `prepare_for_verify` 之后才出现 → 是 H2。
+
+**Iter 3 计划（提案 —— 需用户"go"）**
+
+1. 在两个 worker 中加入 `phase="pre_prepare_for_verify"` dump，记录 `seq_lens`、`seq_lens_cpu`、`out_cache_loc`、`req_pool_indices`。
+2. 再跑一次 preflight，做 diff。
+3. 若 H1/H3：定位 MedusaWorker 主 decode 中提交 bonus 槽的位置 → 要么不提交，要么 verify 前把 `batch.seq_lens` 减 1。按 CHANGE_0160/0161 的经验，**正确**做法是源头不双计 bonus 槽。
+4. 若 H2：简化 `prepare_for_verify` 去掉多余的 +1。
+5. 迭代到 pre_verify 0 关键差异，然后再跑 accuracy。
+
+**Iter 3 通过条件**：`seq_lens`、`seq_lens_cpu`、`spec_positions`、`out_cache_loc`、`logits_argmax` 全部 ngram == medusa。`post_verify` 继续 4×EQUAL。
+
+**产物**
+
+- Dumps：fcloud 上的 `/tmp/dump_ngram.pkl`、`/tmp/dump_medusa.pkl`（本轮）。
+- Diff 日志：`/tmp/iter2_diff.txt`（本地也有副本）。
+- 本轮提交：`89a30d5d0`（medusa: preflight iter 2 — adopt ndt=2 + kernel-built retrive_* + full mask）。
+
 （空 — 每次预飞行运行后填充。）
 
 ## 6. 风险
