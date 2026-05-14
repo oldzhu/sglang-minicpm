@@ -220,7 +220,12 @@ class MedusaWorker:
         """
         # ---- EXTEND path (passthrough, same as Stage 2) ----
         if batch.forward_mode.is_extend():
-            batch.spec_algorithm = SpeculativeAlgorithm.NONE
+            # SOAR CHANGE_0165 iter 4: do NOT reset spec_algorithm to NONE here.
+            # Resetting causes scheduler's prepare_for_decode to fall through and
+            # pre-commit a bonus KV slot (seq_lens += 1) before the next verify
+            # step, which is the long-standing CHANGE_0160/0161 "+1" bug.
+            # NgramWorker (canonical reference) leaves spec_algorithm = NGRAM
+            # throughout extend; we mirror that here.
             model_worker_batch = batch.get_model_worker_batch()
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch
