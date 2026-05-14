@@ -411,15 +411,18 @@ elif [[ "$QUANT_MODE" == "noquant" ]]; then
 fi
 
 # === SOAR 2026 Phase R1b Stage 2 (CHANGE_0155): Medusa speculative decoding.
-# Default 1 for v23-medusa-passthrough submission: exercises MedusaWorker
-# pass-through on official hardware to de-risk Stage 3 infrastructure
-# (spec launch args accepted, cuda-graph capture across 16 buckets with
-# spec enabled, worker pass-through compatible with eval harness).
-# MedusaWorker.forward_batch_generation permanently flips
-# batch.spec_algorithm = NONE before get_model_worker_batch(), so runtime
-# behavior is bit-equivalent to v22 baseline; expected score ≈ v22.
-# Set SOAR_SPEC_MEDUSA=0 to fall back to the pure v22 path.
-export SOAR_SPEC_MEDUSA="${SOAR_SPEC_MEDUSA:-1}"
+# v24 (2026-05-15): default flipped back to 0 after v23 official scoring
+# showed −5–8% slowdown across all three concurrency tiers (S1=627.27s vs
+# pre-v18 594.63s; S8=1133.88s vs 1066.16s; Smax=2945.19s vs 2736.61s) plus
+# −2.18pt accuracy (79.2% vs 81.38%). MedusaWorker pass-through is locally
+# neutral on the short-context speed dataset but each per-decode-step
+# overhead accumulates badly on the official long-context speed set
+# (~68% of inputs in 32K–512K range). Drop the spec_algorithm flag chain
+# entirely so v24 runtime matches the v22-byte-baseline that scored 28.30
+# pre-v18. Set SOAR_SPEC_MEDUSA=1 to re-enable for future spec-decoding
+# experiments. See docs/soar_2026_changes/CHANGE_0165 §5.7 and chat log
+# CHAT_iter4-final-eval-failure_20260514_2124 for the failure analysis.
+export SOAR_SPEC_MEDUSA="${SOAR_SPEC_MEDUSA:-0}"
 export SOAR_SPEC_MEDUSA_HEADS="${SOAR_SPEC_MEDUSA_HEADS:-1}"
 # Stage 3b: path to trained Medusa head checkpoint (.pt file).
 # When set, MedusaWorker loads W1 weights and uses the head for draft generation.
