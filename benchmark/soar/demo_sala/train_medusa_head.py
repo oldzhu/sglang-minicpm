@@ -332,8 +332,11 @@ def _train_from_gptq_dump(args) -> None:
     logger.info("lm_head.weight: shape=%s, dtype=%s", list(lm_head_weight.shape), lm_head_weight.dtype)
     vocab_size, hidden_size = lm_head_weight.shape
 
-    # 3. Compute labels: y = argmax(F.linear(h, lm_head_weight)) in chunks
-    logger.info("Computing GPTQ training labels …")
+    # 3. Compute labels: y[i] = argmax(F.linear(h[i+1], lm_head_weight)).
+    # Medusa head predicts the NEXT token from current hidden state, so pair
+    # (h[i], y[i+1]). We drop the last hidden state since it has no follower.
+    # Cross-request boundary noise is negligible (~0.3% with ~350 tok/req).
+    logger.info("Computing GPTQ training labels (shifted by 1 for next-token prediction) …")
     lm_w_gpu = lm_head_weight.to(device, dtype=torch.bfloat16)
     h_bf16 = h_tensor.to(device, dtype=torch.bfloat16)
     chunk_size = 1024
@@ -343,9 +346,12 @@ def _train_from_gptq_dump(args) -> None:
             chunk = h_bf16[i : i + chunk_size]
             logits = F.linear(chunk, lm_w_gpu)
             label_parts.append(logits.argmax(dim=-1).cpu())
-    label_tensor = torch.cat(label_parts, dim=0)
-    del h_bf16, lm_w_gpu, label_parts
-    logger.info("Computed %d labels", len(label_tensor))
+    all_tokens = torch.cat(label_parts, dim=0)  # token at each position
+    # Shift: input h[i] -> target token at position i+1
+    h_tensor = h_tensor[:-1].contiguous()
+    label_tensor = all_tokens[1:].contiguous()
+    del h_bf16, lm_w_gpu, label_parts, all_tokens
+    logger.info("Computed %d (h, next-token) pairs", len(label_tensor))
 
     # 4. Build a frozen nn.Linear wrapper for the train() function
     lm_head = nn.Linear(hidden_size, vocab_size, bias=False, dtype=torch.bfloat16)

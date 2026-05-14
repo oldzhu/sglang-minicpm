@@ -9,7 +9,10 @@
 # Expects to be invoked from /root/submission_sim with prepare_env.sh,
 # preflight_run.py, etc available in /root/sglang-minicpm.
 
-set -euo pipefail
+# NOTE: We intentionally do NOT `set -e` here.  prepare_env.sh runs
+# `uv pip install --force-reinstall pypcre -v` which fails on fcloud (clang
+# missing) but is non-fatal because pypcre is already installed.  The
+# regular fcloud_workflow restart-server also tolerates this.
 
 MODE="${1:?usage: $0 ngram|medusa}"
 DUMP_PATH="/tmp/dump_${MODE}.pkl"
