@@ -195,6 +195,18 @@ class NGRAMWorker:
             retrive_next_sibling,
             self.draft_token_num,
         )
+        # SOAR CHANGE_0165 preflight iter3: capture seq_lens/out_cache_loc BEFORE
+        # prepare_for_verify mutates them.  Used to disambiguate H1/H3 (upstream
+        # bookkeeping bug) vs H2 (prepare_for_verify increments).
+        _preflight_dump(
+            tag="ngram",
+            phase="pre_prepare_for_verify",
+            batch_size=batch.batch_size(),
+            seq_lens=batch.seq_lens,
+            seq_lens_cpu=batch.seq_lens_cpu,
+            out_cache_loc=batch.out_cache_loc,
+            req_pool_indices=batch.req_pool_indices,
+        )
         batch.spec_info.prepare_for_verify(batch, self.page_size)
 
     def _update_ngram_cache(self, batch: ScheduleBatch):

@@ -335,6 +335,18 @@ class MedusaWorker:
         batch.spec_algorithm = SpeculativeAlgorithm.NGRAM
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = spec_info
+        # SOAR CHANGE_0165 preflight iter3: capture seq_lens/out_cache_loc BEFORE
+        # prepare_for_verify mutates them.  Used to disambiguate H1/H3 (upstream
+        # bookkeeping bug) vs H2 (prepare_for_verify increments).
+        _preflight_dump(
+            tag="medusa",
+            phase="pre_prepare_for_verify",
+            batch_size=bs,
+            seq_lens=batch.seq_lens,
+            seq_lens_cpu=batch.seq_lens_cpu,
+            out_cache_loc=batch.out_cache_loc,
+            req_pool_indices=batch.req_pool_indices,
+        )
         spec_info.prepare_for_verify(batch, self.page_size)
 
         model_worker_batch = batch.get_model_worker_batch()
