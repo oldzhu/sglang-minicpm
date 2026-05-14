@@ -145,7 +145,7 @@ def main() -> int:
     ap.add_argument("--medusa", required=True, help="pickle from MEDUSA run")
     ap.add_argument(
         "--phase", default="all",
-        choices=["all", "pre_verify", "post_forward", "post_verify"],
+        choices=["all", "pre_prepare_for_verify", "pre_verify", "post_forward", "post_verify"],
     )
     args = ap.parse_args()
 
