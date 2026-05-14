@@ -203,6 +203,81 @@ The pre-flight harness can disambiguate by dumping a 4th phase: `pre_prepare_for
 - Diff log: `/tmp/iter2_diff.txt` (also mirrored to local `/tmp/`).
 - Commit this iter: `89a30d5d0` (medusa: preflight iter 2 — adopt ndt=2 + kernel-built retrive_* + full mask).
 
+### 5.3 Iter 3 result — bonus-slot bookkeeping isolated
+
+**Goal**: Disambiguate H1/H3 (upstream KV write before verify-prep) vs H2 (prepare_for_verify increments) by adding a fourth dump phase `pre_prepare_for_verify` to both workers, capturing the batch state just before `spec_info.prepare_for_verify(batch, page_size)` is called.
+
+**Code changes** (commits `3d2435d26` + `346c3f666`):
+- `ngram_worker.py`: dump (`seq_lens`, `seq_lens_cpu`, `out_cache_loc`, `req_pool_indices`) just before `batch.spec_info.prepare_for_verify(...)`.
+- `medusa_worker.py`: same dump just before `spec_info.prepare_for_verify(...)`.
+- `preflight_diff.py`: register the new phase in `PHASE_ORDER` and argparse `choices`.
+
+**Result (5 differing fields at pre_verify; 3 at pre_prepare_for_verify)**:
+
+| phase | field | ngram | medusa | status |
+|---|---|---|---|---|
+| pre_prepare_for_verify | `seq_lens` | `[7]` | `[8]` | **DIFFER** |
+| pre_prepare_for_verify | `seq_lens_cpu` | `[7]` | `[8]` | **DIFFER** |
+| pre_prepare_for_verify | `out_cache_loc` | `[1,2,3,4,5,6,7]` (shape 7) | `[8]` (shape 1) | **DIFFER (shape+values)** |
+| pre_prepare_for_verify | `batch_size`, `req_pool_indices` | — | — | EQUAL |
+
+**Interpretation — H1/H3 confirmed, H2 ruled out**:
+
+The `seq_lens` +1 is already present **before** `prepare_for_verify` runs. Therefore `prepare_for_verify` is innocent; the bonus-slot commit happens **upstream**, in the path between EXTEND completion and the next iteration's DECODE/verify entry.
+
+**Root cause located** in [`schedule_batch.py`](../../python/sglang/srt/managers/schedule_batch.py) `prepare_for_decode()` line 1948:
+
+```python
+def prepare_for_decode(self):
+    ...
+    if not self.spec_algorithm.is_none():
+        return  # spec workers manage their own decode-prep
+    # else: alloc 1 slot, seq_lens.add_(1), kv_committed_len += 1
+```
+
+And the asymmetry between workers' EXTEND paths:
+- **NgramWorker** EXTEND: `_prepare_for_speculative_decoding` returns early; `spec_algorithm` stays `NGRAM` → next iteration's `prepare_for_decode` returns early → `seq_lens` stays at 7.
+- **MedusaWorker** EXTEND: explicitly sets `batch.spec_algorithm = SpeculativeAlgorithm.NONE` → next iteration's `prepare_for_decode` falls through → allocates 1 slot, advances `seq_lens` to 8, increments `kv_committed_len`. By the time MedusaWorker re-enters DECODE and rebuilds spec_info, the bonus slot is already committed.
+
+This is exactly the symptom CHANGE_0160 / CHANGE_0161 chased (the "+1" mystery), now precisely pinpointed.
+
+**Artifacts**
+
+- Dumps: `/tmp/dump_ngram.pkl` (52937B / 36 records), `/tmp/dump_medusa.pkl` (29590B / 20 records) on fcloud.
+- Diff logs: `/tmp/iter3_diff.txt` (all phases), `/tmp/iter3_pre_prep.txt` (pre_prepare_for_verify only).
+- Commits this iter: `3d2435d26` (iter3 dump instrumentation), `a87da57dd` + `346c3f666` (preflight_diff phase registration fix).
+
+### 5.4 Iter 4 plan — drop the spec_algorithm reset in MedusaWorker EXTEND
+
+**Proposed fix** (single line in `medusa_worker.py::forward_batch_generation`):
+
+```python
+# EXTEND path
+if batch.forward_mode.is_extend():
+-    batch.spec_algorithm = SpeculativeAlgorithm.NONE   # drop this
+    model_worker_batch = batch.get_model_worker_batch()
+    batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+    return GenerationBatchResult(...)
+```
+
+**Why this is safe**:
+1. NgramWorker (the canonical reference) does not reset `spec_algorithm` during extend.
+2. The `model_worker_batch` for EXTEND is built with `forward_mode=EXTEND`, so the target model runs normal extend regardless of `spec_algorithm`.
+3. Keeping `spec_algorithm=NGRAM` makes the scheduler's `prepare_for_decode` take the early-return path (matching ngram), which leaves KV/seq_lens management entirely to `prepare_for_verify` — the intended design.
+
+**Validation plan**:
+1. Apply fix, push.
+2. Re-run `preflight_drive.sh ngram` + `preflight_drive.sh medusa` on fcloud.
+3. Re-run `preflight_diff.py` — expect all phases (including pre_prepare_for_verify, pre_verify, post_forward, post_verify) to show **0 differing fields**.
+4. **Pass criterion**: total differing fields across all 4 phases = 0.
+
+**Risks**:
+- R-iter4-1: If some scheduler path branches on `spec_algorithm.is_none()` specifically for the extend output (e.g., output_processor's `next_token_ids.tolist()` at line 372), behavior may shift. Mitigation: read the EXTEND-result branches in `scheduler_output_processor_mixin.py` before applying; if the path under `is_none()` does something MedusaWorker actually needs, find an alternative (e.g., wrap target_worker call to manually fetch the per-req append).
+
+Followup once preflight diff hits zero:
+- Re-enable cuda-graph + torch-compile by swapping `preflight_drive.sh` for the standard `fcloud_workflow.py restart-server` flow.
+- Run full accuracy eval + speed S1/S8/Smax (requires explicit user confirm per project rules).
+
 ## 6. Risks
 
 - **R1**: Engine startup non-determinism (e.g., flashinfer kernel JIT compile order) could change KV layout between A and B runs. Mitigation: persist Engine across the two phases if possible; otherwise, pin random seeds and run B immediately after A in the same Python process.

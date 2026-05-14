@@ -203,7 +203,80 @@ Pre-flight 可以增加第 4 阶段 `pre_prepare_for_verify`（进入 `spec_info
 - Diff 日志：`/tmp/iter2_diff.txt`（本地也有副本）。
 - 本轮提交：`89a30d5d0`（medusa: preflight iter 2 — adopt ndt=2 + kernel-built retrive_* + full mask）。
 
-（空 — 每次预飞行运行后填充。）
+### 5.3 第 3 轮结果 —— 定位到 bonus 槽位的记账问题
+
+**目标**：通过在两个 worker 中 `spec_info.prepare_for_verify(batch, page_size)` 调用前增加第四个 dump 阶段 `pre_prepare_for_verify`，捕获该调用前的 batch 状态，区分假设 H1/H3（verify-prep 之前上游就提交了 KV 槽位）与 H2（`prepare_for_verify` 内部进行了 +1）。
+
+**代码改动**（提交 `3d2435d26` + `346c3f666`）：
+- `ngram_worker.py`：在 `batch.spec_info.prepare_for_verify(...)` 之前 dump（`seq_lens`、`seq_lens_cpu`、`out_cache_loc`、`req_pool_indices`）。
+- `medusa_worker.py`：在 `spec_info.prepare_for_verify(...)` 之前做相同的 dump。
+- `preflight_diff.py`：将新阶段加入 `PHASE_ORDER` 和 argparse `choices`。
+
+**结果（pre_verify 仍有 5 字段差异；pre_prepare_for_verify 有 3 字段差异）**：
+
+| 阶段 | 字段 | ngram | medusa | 状态 |
+|---|---|---|---|---|
+| pre_prepare_for_verify | `seq_lens` | `[7]` | `[8]` | **不同** |
+| pre_prepare_for_verify | `seq_lens_cpu` | `[7]` | `[8]` | **不同** |
+| pre_prepare_for_verify | `out_cache_loc` | `[1,2,3,4,5,6,7]`（shape 7） | `[8]`（shape 1） | **不同（形状+取值）** |
+| pre_prepare_for_verify | `batch_size`、`req_pool_indices` | — | — | 相同 |
+
+**解释 —— H1/H3 确认，H2 排除**：
+
+`seq_lens` 的 +1 **早于** `prepare_for_verify` 调用就已经存在。因此 `prepare_for_verify` 本身无罪；多分配的那个 KV 槽位是在 **EXTEND 完成 → 下一轮 DECODE/verify 入口** 这段上游流程里提交的。
+
+**根因定位** 在 [`schedule_batch.py`](../../python/sglang/srt/managers/schedule_batch.py) 的 `prepare_for_decode()` 第 1948 行：
+
+```python
+def prepare_for_decode(self):
+    ...
+    if not self.spec_algorithm.is_none():
+        return  # spec worker 自行管理 decode-prep
+    # 否则：alloc 1 个槽位，seq_lens.add_(1)，kv_committed_len += 1
+```
+
+以及两个 worker 在 EXTEND 路径上的差异：
+- **NgramWorker** EXTEND：`_prepare_for_speculative_decoding` 提前返回；`spec_algorithm` 保持 `NGRAM` → 下一轮 `prepare_for_decode` 走早返回 → `seq_lens` 保持为 7。
+- **MedusaWorker** EXTEND：显式设置 `batch.spec_algorithm = SpeculativeAlgorithm.NONE` → 下一轮 `prepare_for_decode` 进入正常分支 → 分配 1 个槽位、`seq_lens` 推到 8、`kv_committed_len += 1`。当 MedusaWorker 再次进入 DECODE 重新构建 spec_info 时，bonus 槽位已经被提交。
+
+这正是 CHANGE_0160 / CHANGE_0161 追了很久的“+1 之谜”，现在终于精确定位。
+
+**产物**
+
+- Dumps：fcloud 上 `/tmp/dump_ngram.pkl`（52937B / 36 条记录）、`/tmp/dump_medusa.pkl`（29590B / 20 条记录）。
+- Diff 日志：`/tmp/iter3_diff.txt`（全阶段）、`/tmp/iter3_pre_prep.txt`（仅 pre_prepare_for_verify）。
+- 本轮提交：`3d2435d26`（iter3 dump 增量）、`a87da57dd` + `346c3f666`（preflight_diff 阶段注册修复）。
+
+### 5.4 第 4 轮计划 —— 删除 MedusaWorker EXTEND 中的 spec_algorithm 重置
+
+**拟修复**（`medusa_worker.py::forward_batch_generation` 中一行）：
+
+```python
+# EXTEND 路径
+if batch.forward_mode.is_extend():
+-    batch.spec_algorithm = SpeculativeAlgorithm.NONE   # 删除此行
+    model_worker_batch = batch.get_model_worker_batch()
+    batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+    return GenerationBatchResult(...)
+```
+
+**安全性说明**：
+1. NgramWorker（标准参照）在 extend 时不重置 `spec_algorithm`。
+2. EXTEND 的 `model_worker_batch` 已经以 `forward_mode=EXTEND` 构建，目标模型无论 `spec_algorithm` 取何值都会正常跑 extend。
+3. 保持 `spec_algorithm=NGRAM` 使得 scheduler 的 `prepare_for_decode` 走早返回路径（与 ngram 完全一致），把 KV/seq_lens 的管理完全交给 `prepare_for_verify`——这正是设计意图。
+
+**验证计划**：
+1. 应用修改并 push。
+2. 在 fcloud 上重新运行 `preflight_drive.sh ngram` + `preflight_drive.sh medusa`。
+3. 再次执行 `preflight_diff.py` —— 预期所有 4 个阶段（pre_prepare_for_verify、pre_verify、post_forward、post_verify）的差异字段数均为 **0**。
+4. **通过判据**：4 个阶段的差异总数 = 0。
+
+**风险**：
+- R-iter4-1：如果 scheduler 中有针对 EXTEND 输出的、专门检查 `spec_algorithm.is_none()` 的分支（例如 `scheduler_output_processor_mixin.py` 第 372 行的 `next_token_ids.tolist()`），行为可能改变。缓解措施：应用前先阅读 `scheduler_output_processor_mixin.py` 中的 EXTEND 结果分支；如果 `is_none()` 分支里有 MedusaWorker 必需的逻辑，需要找替代方案（例如包装 target_worker 调用、手动执行每请求 append）。
+
+下一步（待 preflight 差异归零之后）：
+- 通过切回标准 `fcloud_workflow.py restart-server` 流程，重新启用 cuda-graph + torch-compile（不再使用 `preflight_drive.sh`）。
+- 运行完整 accuracy 测试 + S1/S8/Smax 速度测试（按项目规则需用户显式确认）。
 
 ## 6. 风险
 
