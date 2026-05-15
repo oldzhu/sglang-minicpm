@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
@@ -197,6 +198,36 @@ class OpenAIServingChat(OpenAIServingBase):
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
+
+        # SOAR 2026 v24-iter1: clamp max_new_tokens for mcq prompts to prevent
+        # catastrophic runaway-think loops (e.g. v24 round-1 idx=13 emitted
+        # 65,545 repeated 史 tokens). Gate via SOAR_MCQ_MAX_TOKENS_CAP env;
+        # unset/0 disables (byte-equivalent to v22/v24 baseline). mcq prompts
+        # are detected by the same literal substring used by
+        # SOAR_DISABLE_MCQ_THINKING's chat_template patch.
+        _soar_mcq_cap_raw = os.environ.get("SOAR_MCQ_MAX_TOKENS_CAP", "").strip()
+        if _soar_mcq_cap_raw:
+            try:
+                _soar_mcq_cap = int(_soar_mcq_cap_raw)
+            except (TypeError, ValueError):
+                _soar_mcq_cap = 0
+            if _soar_mcq_cap > 0:
+                _is_mcq = False
+                for _msg in (request.messages or []):
+                    _content = getattr(_msg, "content", None)
+                    if _content is None and isinstance(_msg, dict):
+                        _content = _msg.get("content")
+                    if isinstance(_content, str) and "LETTER is one of ABCD" in _content:
+                        _is_mcq = True
+                        break
+                if _is_mcq:
+                    _prev = sampling_params.get("max_new_tokens")
+                    _new = _soar_mcq_cap if not _prev else min(_prev, _soar_mcq_cap)
+                    if _new != _prev:
+                        sampling_params["max_new_tokens"] = _new
+                        logger.info(
+                            f"[SOAR_MCQ_MAX_TOKENS_CAP] clamped max_new_tokens {_prev} -> {_new}"
+                        )
 
         # Handle single vs multiple requests
         if is_multimodal:

@@ -219,6 +219,16 @@ export SOAR_BACKEND_KEEP_FORCE_DENSE="${SOAR_BACKEND_KEEP_FORCE_DENSE:-1}"
 # Set SOAR_DISABLE_MCQ_THINKING=0 to A/B against the unpatched template.
 export SOAR_DISABLE_MCQ_THINKING="${SOAR_DISABLE_MCQ_THINKING:-1}"
 
+# v24-iter1 (2026-05-15): server-side hard cap on max_new_tokens for mcq
+# prompts. Detected by the same "LETTER is one of ABCD" substring as
+# SOAR_DISABLE_MCQ_THINKING. Targets catastrophic runaway-think loops
+# (v24 round-1 idx=13 emitted 65,545 repeated 史 tokens, wasting ~140s
+# of wall-clock and producing 0 mcq points). Default 4096 = ~8x headroom
+# over typical clean mcq answers (<500 tok). Set 0 (or empty) to disable
+# (byte-equivalent to v22/v24 baseline). Implemented in
+# python/sglang/srt/entrypoints/openai/serving_chat.py::_convert_to_internal_request.
+export SOAR_MCQ_MAX_TOKENS_CAP="${SOAR_MCQ_MAX_TOKENS_CAP:-4096}"
+
 export SOAR_GPTQ_CALIBRATION_FILE="${SOAR_GPTQ_CALIBRATION_FILE:-$(pwd)/perf_public_set.jsonl}"
 export SOAR_GPTQ_CALIBRATION_SAMPLES="${SOAR_GPTQ_CALIBRATION_SAMPLES:-90}"
 export SOAR_GPTQ_CALIBRATION_SAMPLING="${SOAR_GPTQ_CALIBRATION_SAMPLING:-stratified}"
@@ -500,5 +510,6 @@ echo "[prepare_env] SOAR_BACKEND_VARIANT=${SOAR_BACKEND_VARIANT:-<unset>}"
 echo "[prepare_env] SOAR_SPEC_MEDUSA=${SOAR_SPEC_MEDUSA}"
 echo "[prepare_env] SOAR_SPEC_MEDUSA_HEADS=${SOAR_SPEC_MEDUSA_HEADS}"
 echo "[prepare_env] SOAR_SPEC_NGRAM=${SOAR_SPEC_NGRAM}"
+echo "[prepare_env] SOAR_MCQ_MAX_TOKENS_CAP=${SOAR_MCQ_MAX_TOKENS_CAP:-<unset>}"
 echo "[prepare_env] SGLANG_SERVER_ARGS=${SGLANG_SERVER_ARGS}"
 echo "[prepare_env] done"
