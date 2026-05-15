@@ -223,11 +223,18 @@ export SOAR_DISABLE_MCQ_THINKING="${SOAR_DISABLE_MCQ_THINKING:-1}"
 # prompts. Detected by the same "LETTER is one of ABCD" substring as
 # SOAR_DISABLE_MCQ_THINKING. Targets catastrophic runaway-think loops
 # (v24 round-1 idx=13 emitted 65,545 repeated 史 tokens, wasting ~140s
-# of wall-clock and producing 0 mcq points). Default 4096 = ~8x headroom
-# over typical clean mcq answers (<500 tok). Set 0 (or empty) to disable
-# (byte-equivalent to v22/v24 baseline). Implemented in
+# of wall-clock and producing 0 mcq points).
+#
+# 2026-05-15 v24-iter1 result @ cap=4096: overall 75.38% but mcq REGRESSED
+# to 33.33% (10/30) — cap too tight, truncated legitimate 4k–16k deep-think
+# samples. Speed -12.4% (2724s vs 3108s) confirmed runaway elimination, but
+# net accuracy drop pushed normalized below 97% safety floor → C=0 risk.
+# Default reverted to 0 (disabled, byte-equivalent to v22/v24 baseline).
+# To re-test with a larger cap (e.g. 16384, large enough to spare legit
+# deep-thinkers while still catching 65k runaway loops), set
+# SOAR_MCQ_MAX_TOKENS_CAP=16384 in the environment. Implemented in
 # python/sglang/srt/entrypoints/openai/serving_chat.py::_convert_to_internal_request.
-export SOAR_MCQ_MAX_TOKENS_CAP="${SOAR_MCQ_MAX_TOKENS_CAP:-4096}"
+export SOAR_MCQ_MAX_TOKENS_CAP="${SOAR_MCQ_MAX_TOKENS_CAP:-0}"
 
 export SOAR_GPTQ_CALIBRATION_FILE="${SOAR_GPTQ_CALIBRATION_FILE:-$(pwd)/perf_public_set.jsonl}"
 export SOAR_GPTQ_CALIBRATION_SAMPLES="${SOAR_GPTQ_CALIBRATION_SAMPLES:-90}"
