@@ -957,15 +957,14 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
 
         # SOAR W4A8 REAL: true W4A8 (INT4 storage + FP8 activation + FP8 QMMA).
         # Activation quantized per-token on-the-fly; INT4 weights kept in HBM.
-        # Temp FP8 weight dequant (this pass) will be replaced by a fused kernel
-        # that unpacks INT4→FP8 inside the GEMM mainloop (Day 2-3).
+        # CUDA dequant kernel (Day 2) converts INT4→FP8 quickly; still has
+        # temp-FP8 HBM round-trip. Day 3 will fuse into GEMM mainloop.
         if getattr(layer, "_soar_w4a8_real_active", False):
             try:
                 from sglang.srt.layers.quantization.fp8_utils import (
                     cutlass_w8a8_block_fp8_linear_with_fallback,
                 )
                 from sglang.srt.layers.quantization.w4a8_fp8_utils import (
-                    dequantize_weight_int4_to_fp8,
                     quantize_activation_fp8_per_token,
                 )
 
@@ -973,13 +972,16 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 x_fp8, input_scale = quantize_activation_fp8_per_token(x)
 
                 # Dequantize weights: INT4 → FP8 e4m3 with 128×128 blockwise scales.
-                # TEMPORARY: materializes full FP8 weight tensor (HBM round-trip).
-                # Day 2-3 kernel will fuse this into the GEMM.
-                w_fp8, w_scale = dequantize_weight_int4_to_fp8(
+                # Uses CUDA kernel (sgl-kernel) for speed; still produces temp FP8 tensor.
+                # Day 3: fuse into GEMM mainloop to eliminate temp-FP8 HBM round-trip.
+                in_features, out_features = c.partition_weight_shape
+                w_fp8, w_scale = torch.ops.sgl_kernel.gptq_int4_to_fp8_blockwise(
                     layer.qweight.data,
                     layer.qzeros.data,
                     layer.scales.data,
-                    group_size=c.group_size,
+                    in_features,
+                    out_features,
+                    c.group_size,
                 )
 
                 # Call existing SM120 FP8 blockwise GEMM (296 TF QMMA).
