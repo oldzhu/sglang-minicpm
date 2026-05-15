@@ -700,6 +700,12 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         # See docs/soar_2026_changes/PROPOSAL_iteration_W4A8_001.{en,zh}.md.
         self._soar_maybe_setup_w4a8_fp8(layer)
 
+        # SOAR W4A8 REAL: mark layer for true W4A8 (INT4 storage + FP8 activation).
+        # No weight conversion — INT4 weights stay as-is; activation quant and
+        # weight dequant happen on-the-fly at inference time.
+        # See docs/soar_2026_changes/PROPOSAL_W4A8_REAL_002_concerns_and_verification.{en,zh}.md.
+        self._soar_maybe_setup_w4a8_fp8_real(layer)
+
         check_marlin_supports_shape(
             c.partition_weight_shape[1],  # out_features
             c.partition_weight_shape[0],  # in_features
@@ -868,6 +874,56 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 exc,
             )
 
+    # ------------------------------------------------------------------
+    # SOAR W4A8 REAL helpers (true W4A8: INT4 storage + FP8 activation)
+    # ------------------------------------------------------------------
+    def _soar_maybe_setup_w4a8_fp8_real(self, layer: torch.nn.Module) -> None:
+        """Mark a layer as eligible for the true W4A8 fast path.
+
+        Unlike the old W4A8 path (which pre-computed FP8 weights at load time,
+        doubling HBM weight footprint), this path keeps INT4 weights in HBM
+        and quantizes activations + dequantizes weights on-the-fly at inference.
+
+        Activates only when ALL of the following hold:
+        - ``SOAR_W4A8_REAL_FP8_GEMM=1`` is set in the environment.
+        - ``layer._soar_w4a8_eligible`` is ``True`` (set by ``minicpm.py`` on
+          standard-attention QKV/O and MLP linears only).
+        - The Marlin kernel config matches our supported recipe: 4-bit,
+          ``group_size=128``, ``desc_act=False``.
+        - Both partitioned dims are multiples of 128 (cutlass blockwise FP8
+          GEMM requirement).
+
+        On any failure the helper logs and returns silently; the standard
+        Marlin path remains in place.
+        """
+        if os.environ.get("SOAR_W4A8_REAL_FP8_GEMM") != "1":
+            return
+        if not getattr(layer, "_soar_w4a8_eligible", False):
+            return
+
+        c = self.kernel_config
+        if c.weight_type.size_bits != 4:
+            return
+        if c.group_size != 128:
+            return
+        if c.has_g_idx:
+            return
+
+        in_features, out_features = c.partition_weight_shape
+        if in_features % 128 != 0 or out_features % 128 != 0:
+            return
+
+        # Mark the layer for the real W4A8 dispatch in apply().
+        # No weight conversion needed — INT4 weights stay as-is.
+        layer._soar_w4a8_real_active = True
+        logger.info(
+            "[SOAR W4A8-REAL] enabled true W4A8 for layer prefix=%s "
+            "shape=(N=%d, K=%d)",
+            getattr(layer, "prefix", "?"),
+            out_features,
+            in_features,
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -895,6 +951,50 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 layer._soar_w4a8_active = False
                 logger.warning(
                     "[SOAR W4A8] FP8 GEMM raised, reverting layer prefix=%s: %s",
+                    getattr(layer, "prefix", "?"),
+                    exc,
+                )
+
+        # SOAR W4A8 REAL: true W4A8 (INT4 storage + FP8 activation + FP8 QMMA).
+        # Activation quantized per-token on-the-fly; INT4 weights kept in HBM.
+        # Temp FP8 weight dequant (this pass) will be replaced by a fused kernel
+        # that unpacks INT4→FP8 inside the GEMM mainloop (Day 2-3).
+        if getattr(layer, "_soar_w4a8_real_active", False):
+            try:
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    cutlass_w8a8_block_fp8_linear_with_fallback,
+                )
+                from sglang.srt.layers.quantization.w4a8_fp8_utils import (
+                    dequantize_weight_int4_to_fp8,
+                    quantize_activation_fp8_per_token,
+                )
+
+                # Quantize activations: BF16 (M, K) → FP8 e4m3 (M, K) + per-token scales (M, 1).
+                x_fp8, input_scale = quantize_activation_fp8_per_token(x)
+
+                # Dequantize weights: INT4 → FP8 e4m3 with 128×128 blockwise scales.
+                # TEMPORARY: materializes full FP8 weight tensor (HBM round-trip).
+                # Day 2-3 kernel will fuse this into the GEMM.
+                w_fp8, w_scale = dequantize_weight_int4_to_fp8(
+                    layer.qweight.data,
+                    layer.qzeros.data,
+                    layer.scales.data,
+                    group_size=c.group_size,
+                )
+
+                # Call existing SM120 FP8 blockwise GEMM (296 TF QMMA).
+                return cutlass_w8a8_block_fp8_linear_with_fallback(
+                    input=x_fp8,
+                    weight=w_fp8,
+                    block_size=[128, 128],
+                    weight_scale=w_scale,
+                    input_scale=input_scale,
+                    bias=bias,
+                )
+            except Exception as exc:  # pragma: no cover - defensive guard
+                layer._soar_w4a8_real_active = False
+                logger.warning(
+                    "[SOAR W4A8-REAL] FP8 GEMM raised, reverting layer prefix=%s: %s",
                     getattr(layer, "prefix", "?"),
                     exc,
                 )

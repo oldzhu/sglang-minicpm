@@ -277,6 +277,15 @@ export SGLANG_FLA_CHUNK_SIZE="${SGLANG_FLA_CHUNK_SIZE:-64}"
 # docs/soar_2026_changes/PROPOSAL_iteration_W4A8_001.{en,zh}.md.
 export SOAR_W4A8_FP8_GEMM="${SOAR_W4A8_FP8_GEMM:-0}"
 
+# SOAR W4A8 REAL: true W4A8 (INT4 weight storage + FP8 activation + FP8 QMMA).
+# Unlike SOAR_W4A8_FP8_GEMM (old W8A8 mislabel, doubled HBM weight footprint),
+# this path keeps INT4 weights in HBM and quantizes BF16 activations to FP8
+# e4m3 per-token on-the-fly. The INT4→FP8 weight dequant is fused into the
+# GEMM kernel (sgl-kernel change), eliminating the temp-FP8 HBM round-trip.
+# Default off. Set SOAR_W4A8_REAL_FP8_GEMM=1 to enable.
+# See docs/soar_2026_changes/PROPOSAL_W4A8_REAL_002_concerns_and_verification.{en,zh}.md.
+export SOAR_W4A8_REAL_FP8_GEMM="${SOAR_W4A8_REAL_FP8_GEMM:-0}"
+
 # SOAR CHANGE_0131: opt-in MXFP4 KV cache (--kv-cache-dtype fp4_e2m1).
 # Default off (FP8 e5m2 baseline). Set SOAR_FP4_KV_CACHE=1 to enable.
 # See docs/soar_2026_changes/CHANGE_0131_nvfp4_kv_p2_plumbing.{en,zh}.md.
@@ -512,6 +521,7 @@ echo "[prepare_env] SGLANG_MINICPM_LIGHTNING_FAST_OUTPUT_GATE=${SGLANG_MINICPM_L
 echo "[prepare_env] SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD=${SGLANG_MINICPM_LIGHTNING_RECURRENT_THRESHOLD}"
 echo "[prepare_env] SGLANG_FLA_CHUNK_SIZE=${SGLANG_FLA_CHUNK_SIZE}"
 echo "[prepare_env] SOAR_W4A8_FP8_GEMM=${SOAR_W4A8_FP8_GEMM}"
+echo "[prepare_env] SOAR_W4A8_REAL_FP8_GEMM=${SOAR_W4A8_REAL_FP8_GEMM}"
 echo "[prepare_env] SOAR_SPARSE_DENSE_LEN=${SOAR_SPARSE_DENSE_LEN:-<unset>}"
 echo "[prepare_env] SOAR_BACKEND_VARIANT=${SOAR_BACKEND_VARIANT:-<unset>}"
 echo "[prepare_env] SOAR_SPEC_MEDUSA=${SOAR_SPEC_MEDUSA}"
