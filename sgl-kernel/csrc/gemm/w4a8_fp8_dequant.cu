@@ -17,6 +17,7 @@
  *   g = group_size (typically 128)
  */
 
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp8.h>
 #include <torch/all.h>
 
@@ -112,7 +113,8 @@ __global__ void gptq_int4_to_fp8_blockwise_kernel(
     scaled = fmaxf(-kFp8E4m3Max, fminf(kFp8E4m3Max, scaled));
 
     // Convert float → fp8 e4m3 via CUDA intrinsic.
-    __nv_fp8_e4m3 fp8_val = __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
+    __nv_fp8_e4m3 fp8_val = static_cast<__nv_fp8_e4m3>(
+        __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3));
 
     weight_fp8[n_global * n_stride + k_global] = fp8_val;
   }
