@@ -972,17 +972,29 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 x_fp8, input_scale = quantize_activation_fp8_per_token(x)
 
                 # Dequantize weights: INT4 → FP8 e4m3 with 128×128 blockwise scales.
-                # Uses CUDA kernel (sgl-kernel) for speed; still produces temp FP8 tensor.
-                # Day 3: fuse into GEMM mainloop to eliminate temp-FP8 HBM round-trip.
+                # Uses CUDA kernel (sgl-kernel) for speed, falls back to Python dequant.
                 in_features, out_features = c.partition_weight_shape
-                w_fp8, w_scale = torch.ops.sgl_kernel.gptq_int4_to_fp8_blockwise(
-                    layer.qweight.data,
-                    layer.qzeros.data,
-                    layer.scales.data,
-                    in_features,
-                    out_features,
-                    c.group_size,
-                )
+                try:
+                    w_fp8, w_scale = torch.ops.sgl_kernel.gptq_int4_to_fp8_blockwise(
+                        layer.qweight.data,
+                        layer.qzeros.data,
+                        layer.scales.data,
+                        in_features,
+                        out_features,
+                        c.group_size,
+                    )
+                except (RuntimeError, AttributeError):
+                    # CUDA kernel not available (sgl-kernel not rebuilt yet).
+                    # Fall back to Python dequant — slower but correct.
+                    from sglang.srt.layers.quantization.w4a8_fp8_utils import (
+                        dequantize_weight_int4_to_fp8,
+                    )
+                    w_fp8, w_scale = dequantize_weight_int4_to_fp8(
+                        layer.qweight.data,
+                        layer.qzeros.data,
+                        layer.scales.data,
+                        group_size=c.group_size,
+                    )
 
                 # Call existing SM120 FP8 blockwise GEMM (296 TF QMMA).
                 return cutlass_w8a8_block_fp8_linear_with_fallback(
