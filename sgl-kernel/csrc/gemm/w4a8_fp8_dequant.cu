@@ -42,51 +42,73 @@ __global__ void gptq_int4_to_fp8_blockwise_kernel(
   const int n_start = n_tile * 128;
   const int k_start = k_tile * 128;
 
-  constexpr int kBlockSize = 256;
-  constexpr int kElemsPerTile = 128 * 128;
-  constexpr int kItersPerThread = kElemsPerTile / kBlockSize;
+  // Process the 128x128 tile in sub-tiles to stay within SMEM budget.
+  // Each sub-tile is 128x32 elements (128 rows, 32 K-columns).
+  constexpr int kSubTileK = 32;
+  constexpr int kBlockSize = 128;
+  constexpr int kElemsPerSubTile = 128 * kSubTileK;  // 4096
+  constexpr int kItersPerThread = kElemsPerSubTile / kBlockSize;  // 32
+  constexpr int kNumSubTiles = 128 / kSubTileK;  // 4
 
-  __shared__ float smem_vals[kElemsPerTile];
+  __shared__ float smem_vals[kElemsPerSubTile];
   __shared__ float smem_reduce[kBlockSize];
 
   const int tid = threadIdx.x;
   float tile_amax = 0.0f;
+  int n_stride = K;
+  int scale_stride = K / 128;
 
-  // Step 1: Unpack INT4 → float.
-  for (int iter = 0; iter < kItersPerThread; ++iter) {
-    int elem_idx = tid * kItersPerThread + iter;
-    int k_local = elem_idx % 128;
-    int n_local = elem_idx / 128;
-    int k_global = k_start + k_local;
-    int n_global = n_start + n_local;
+  for (int st = 0; st < kNumSubTiles; ++st) {
+    int k_sub_start = k_start + st * kSubTileK;
 
-    int k_packed_idx = k_global / 8;
-    int k_shift = (k_global % 8) * 4;
+    // Step 1: Unpack INT4 → float for this sub-tile.
+    for (int iter = 0; iter < kItersPerThread; ++iter) {
+      int elem_idx = tid * kItersPerThread + iter;
+      int k_local = elem_idx % kSubTileK;
+      int n_local = elem_idx / kSubTileK;
+      int k_global = k_sub_start + k_local;
+      int n_global = n_start + n_local;
 
-    int32_t packed_w = qweight[k_packed_idx * N + n_global];
-    int32_t w4 = (packed_w >> k_shift) & 0xF;
+      int k_packed_idx = k_global / 8;
+      int k_shift = (k_global % 8) * 4;
 
-    int group = k_global / group_size;
-    int z_packed_idx = group / 8;
-    int z_shift = (group % 8) * 4;
+      int32_t packed_w = qweight[k_packed_idx * N + n_global];
+      int32_t w4 = (packed_w >> k_shift) & 0xF;
 
-    int32_t packed_z = qzeros[z_packed_idx * N + n_global];
-    int32_t z4 = (packed_z >> z_shift) & 0xF;
+      int group = k_global / group_size;
+      int z_packed_idx = group / 8;
+      int z_shift = (group % 8) * 4;
 
-    float scale_val = scales[group * N + n_global];
-    float val = (static_cast<float>(w4) - static_cast<float>(z4)) * scale_val;
+      int32_t packed_z = qzeros[z_packed_idx * N + n_global];
+      int32_t z4 = (packed_z >> z_shift) & 0xF;
 
-    smem_vals[elem_idx] = val;
-    float a = fabsf(val);
-    if (a > tile_amax) tile_amax = a;
+      float scale_val = scales[group * N + n_global];
+      float val = (static_cast<float>(w4) - static_cast<float>(z4)) * scale_val;
+
+      smem_vals[elem_idx] = val;
+      float a = fabsf(val);
+      if (a > tile_amax) tile_amax = a;
+    }
+
+    __syncthreads();
+
+    // Step 2: Accumulate amax across sub-tiles.
+    // (Already tracked in tile_amax register.)
+
+    // Step 3: Quantize + write for this sub-tile.
+    // Need the final tile_amax first. We compute it after all sub-tiles.
+    // Save values to global memory now, quantize after amax is known.
+    // Actually, we need to write FP8 values now. Let's defer the write
+    // and just store float values in a temp location.
+
+    // Store the float values temporarily for later quantization.
+    // We'll quantize all sub-tiles in a second pass after tile_amax is known.
   }
 
-  __syncthreads();
-
-  // Step 2: Block-reduce tile_amax.
+  // After all sub-tiles: block-reduce tile_amax.
   smem_reduce[tid] = tile_amax;
   __syncthreads();
-  for (int stride = 128; stride > 0; stride >>= 1) {
+  for (int stride = 64; stride > 0; stride >>= 1) {
     if (tid < stride) {
       float other = smem_reduce[tid + stride];
       if (other > smem_reduce[tid]) smem_reduce[tid] = other;
@@ -95,32 +117,47 @@ __global__ void gptq_int4_to_fp8_blockwise_kernel(
   }
   float block_amax = smem_reduce[0];
   if (block_amax < 1e-12f) block_amax = 1e-12f;
-  float scale_val = block_amax / kFp8E4m3Max;  // multiply: val/scale_val to quantize
+  float scale_val = block_amax / kFp8E4m3Max;
   float scale_inv = 1.0f / scale_val;
 
-  // Step 3: Quantize + write.
-  int n_stride = K;
+  // Second pass: quantize and write.
+  for (int st = 0; st < kNumSubTiles; ++st) {
+    int k_sub_start = k_start + st * kSubTileK;
 
-  for (int iter = 0; iter < kItersPerThread; ++iter) {
-    int elem_idx = tid * kItersPerThread + iter;
-    int k_local = elem_idx % 128;
-    int n_local = elem_idx / 128;
-    int k_global = k_start + k_local;
-    int n_global = n_start + n_local;
+    for (int iter = 0; iter < kItersPerThread; ++iter) {
+      int elem_idx = tid * kItersPerThread + iter;
+      int k_local = elem_idx % kSubTileK;
+      int n_local = elem_idx / kSubTileK;
+      int k_global = k_sub_start + k_local;
+      int n_global = n_start + n_local;
 
-    float val = smem_vals[elem_idx];
-    float scaled = val * scale_inv;
-    scaled = fmaxf(-kFp8E4m3Max, fminf(kFp8E4m3Max, scaled));
+      int k_packed_idx = k_global / 8;
+      int k_shift = (k_global % 8) * 4;
 
-    // Convert float → fp8 e4m3 via CUDA intrinsic.
-    __nv_fp8_e4m3 fp8_val = static_cast<__nv_fp8_e4m3>(
-        __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3));
+      int32_t packed_w = qweight[k_packed_idx * N + n_global];
+      int32_t w4 = (packed_w >> k_shift) & 0xF;
 
-    weight_fp8[n_global * n_stride + k_global] = fp8_val;
+      int group = k_global / group_size;
+      int z_packed_idx = group / 8;
+      int z_shift = (group % 8) * 4;
+
+      int32_t packed_z = qzeros[z_packed_idx * N + n_global];
+      int32_t z4 = (packed_z >> z_shift) & 0xF;
+
+      float scale_w = scales[group * N + n_global];
+      float val = (static_cast<float>(w4) - static_cast<float>(z4)) * scale_w;
+
+      float scaled = val * scale_inv;
+      scaled = fmaxf(-kFp8E4m3Max, fminf(kFp8E4m3Max, scaled));
+
+      __nv_fp8_e4m3 fp8_val = static_cast<__nv_fp8_e4m3>(
+          __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3));
+
+      weight_fp8[n_global * n_stride + k_global] = fp8_val;
+    }
   }
 
   if (tid == 0) {
-    int scale_stride = K / 128;
     weight_scales[n_tile * scale_stride + k_tile] = scale_val;
   }
 }
@@ -147,7 +184,7 @@ std::tuple<torch::Tensor, torch::Tensor> gptq_int4_to_fp8_blockwise(
       torch::TensorOptions().dtype(torch::kFloat32).device(qweight.device()));
 
   dim3 grid(N / 128, K / 128);
-  dim3 block(256);
+  dim3 block(128);
   auto stream = at::cuda::getCurrentCUDAStream(qweight.get_device());
 
   gptq_int4_to_fp8_blockwise_kernel<<<grid, block, 0, stream>>>(
