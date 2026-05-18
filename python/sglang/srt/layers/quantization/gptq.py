@@ -994,14 +994,11 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 # Call SM120 FP8 blockwise GEMM (296 TF QMMA).
                 # Pass original BF16 input — function quantizes activations internally.
                 # (input_scale must be None as asserted by the function.)
-                # CRITICAL: .clone() ensures the returned tensor owns its storage.
-                # Without this, cutlass_w8a8_block_fp8_linear_with_fallback()
-                # returns a view of the FP8 GEMM's internal temp buffer (line 379
-                # in fp8_utils.py: .to() is a no-op when dtypes match, so .view()
-                # creates a non-owning view). Downstream in-place ops like
-                # hidden_states *= self.residual_scale then write to the freed
-                # temp buffer → cudaErrorIllegalAddress.
-                return cutlass_w8a8_block_fp8_linear_with_fallback(
+                import sys
+                layer_name = getattr(layer, "prefix", "?")
+                sys.stdout.write(f"[W4A8] GEMM start: layer={layer_name} in={list(x.shape)} out_N={out_features} out_K={in_features}\n")
+                sys.stdout.flush()
+                result = cutlass_w8a8_block_fp8_linear_with_fallback(
                     input=x,                     # BF16, quantized internally
                     weight=w_fp8,                # FP8 e4m3 (N, K)
                     block_size=[128, 128],
@@ -1009,6 +1006,9 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     input_scale=None,            # function asserts this must be None
                     bias=bias,
                 ).clone()
+                sys.stdout.write(f"[W4A8] GEMM done: layer={layer_name}\n")
+                sys.stdout.flush()
+                return result
             except Exception as exc:  # pragma: no cover - defensive guard
                 layer._soar_w4a8_real_active = False
                 logger.warning(
