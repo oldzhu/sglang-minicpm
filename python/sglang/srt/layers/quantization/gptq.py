@@ -960,6 +960,8 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         # CUDA dequant kernel (Day 2) converts INT4→FP8 quickly; still has
         # temp-FP8 HBM round-trip. Day 3 will fuse into GEMM mainloop.
         if getattr(layer, "_soar_w4a8_real_active", False):
+            layer_name = getattr(layer, "prefix", "?")
+            _log = open("/tmp/w4a8_debug.log", "a")
             try:
                 from sglang.srt.layers.quantization.fp8_utils import (
                     cutlass_w8a8_block_fp8_linear_with_fallback,
@@ -968,9 +970,8 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 # Dequantize weights: INT4 → FP8 e4m3 with 128×128 blockwise scales.
                 # Uses CUDA kernel (sgl-kernel) for speed, falls back to Python dequant.
                 in_features, out_features = c.partition_weight_shape
-                import sys
-                sys.stdout.write(f"[W4A8] dequant start: layer={layer_name} N={out_features} K={in_features}\n")
-                sys.stdout.flush()
+                _log.write(f"[W4A8] dequant start: layer={layer_name} N={out_features} K={in_features}\n")
+                _log.flush()
                 try:
                     import sgl_kernel  # noqa: F401 — loads .so, registers torch.ops
                     w_fp8, w_scale = torch.ops.sgl_kernel.gptq_int4_to_fp8_blockwise(
@@ -993,14 +994,12 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                         layer.scales.data,
                         group_size=c.group_size,
                     )
+                _log.write(f"[W4A8] dequant done: layer={layer_name}\n")
+                _log.flush()
 
                 # Call SM120 FP8 blockwise GEMM (296 TF QMMA).
-                # Pass original BF16 input — function quantizes activations internally.
-                # (input_scale must be None as asserted by the function.)
-                import sys
-                layer_name = getattr(layer, "prefix", "?")
-                sys.stdout.write(f"[W4A8] GEMM start: layer={layer_name} in={list(x.shape)} out_N={out_features} out_K={in_features}\n")
-                sys.stdout.flush()
+                _log.write(f"[W4A8] GEMM start: layer={layer_name} in={list(x.shape)} out_N={out_features} out_K={in_features}\n")
+                _log.flush()
                 # Ensure input owns its storage — upstream may pass views that
                 # share memory with FP8 GEMM internal buffers.
                 x_contig = x.contiguous()
@@ -1012,10 +1011,14 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     input_scale=None,            # function asserts this must be None
                     bias=bias,
                 ).contiguous()
-                sys.stdout.write(f"[W4A8] GEMM done: layer={layer_name}\n")
-                sys.stdout.flush()
+                _log.write(f"[W4A8] GEMM done: layer={layer_name}\n")
+                _log.flush()
+                _log.close()
                 return result
             except Exception as exc:  # pragma: no cover - defensive guard
+                _log.write(f"[W4A8] FAILED: layer={layer_name} error={exc}\n")
+                _log.flush()
+                _log.close()
                 layer._soar_w4a8_real_active = False
                 logger.warning(
                     "[SOAR W4A8-REAL] FP8 GEMM raised, reverting layer prefix=%s: %s",
