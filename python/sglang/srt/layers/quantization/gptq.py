@@ -964,12 +964,6 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 from sglang.srt.layers.quantization.fp8_utils import (
                     cutlass_w8a8_block_fp8_linear_with_fallback,
                 )
-                from sglang.srt.layers.quantization.w4a8_fp8_utils import (
-                    quantize_activation_fp8_per_token,
-                )
-
-                # Quantize activations: BF16 (M, K) → FP8 e4m3 (M, K) + per-token scales (M, 1).
-                x_fp8, input_scale = quantize_activation_fp8_per_token(x)
 
                 # Dequantize weights: INT4 → FP8 e4m3 with 128×128 blockwise scales.
                 # Uses CUDA kernel (sgl-kernel) for speed, falls back to Python dequant.
@@ -997,13 +991,15 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                         group_size=c.group_size,
                     )
 
-                # Call existing SM120 FP8 blockwise GEMM (296 TF QMMA).
+                # Call SM120 FP8 blockwise GEMM (296 TF QMMA).
+                # Pass original BF16 input — function quantizes activations internally.
+                # (input_scale must be None as asserted by the function.)
                 return cutlass_w8a8_block_fp8_linear_with_fallback(
-                    input=x_fp8,
-                    weight=w_fp8,
+                    input=x,                     # BF16, quantized internally
+                    weight=w_fp8,                # FP8 e4m3 (N, K)
                     block_size=[128, 128],
-                    weight_scale=w_scale,
-                    input_scale=input_scale,
+                    weight_scale=w_scale,        # float32 (N/128, K/128)
+                    input_scale=None,            # function asserts this must be None
                     bias=bias,
                 )
             except Exception as exc:  # pragma: no cover - defensive guard
