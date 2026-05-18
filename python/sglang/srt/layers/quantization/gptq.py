@@ -1001,14 +1001,17 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 layer_name = getattr(layer, "prefix", "?")
                 sys.stdout.write(f"[W4A8] GEMM start: layer={layer_name} in={list(x.shape)} out_N={out_features} out_K={in_features}\n")
                 sys.stdout.flush()
+                # Ensure input owns its storage — upstream may pass views that
+                # share memory with FP8 GEMM internal buffers.
+                x_contig = x.contiguous()
                 result = cutlass_w8a8_block_fp8_linear_with_fallback(
-                    input=x,                     # BF16, quantized internally
+                    input=x_contig,              # BF16, owns storage
                     weight=w_fp8,                # FP8 e4m3 (N, K)
                     block_size=[128, 128],
                     weight_scale=w_scale,        # float32 (N/128, K/128)
                     input_scale=None,            # function asserts this must be None
                     bias=bias,
-                ).clone()
+                ).contiguous()
                 sys.stdout.write(f"[W4A8] GEMM done: layer={layer_name}\n")
                 sys.stdout.flush()
                 return result
