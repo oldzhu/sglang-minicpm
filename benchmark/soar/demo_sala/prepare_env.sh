@@ -282,9 +282,10 @@ export SOAR_W4A8_FP8_GEMM="${SOAR_W4A8_FP8_GEMM:-0}"
 # this path keeps INT4 weights in HBM and quantizes BF16 activations to FP8
 # e4m3 per-token on-the-fly. The INT4→FP8 weight dequant is fused into the
 # GEMM kernel (sgl-kernel change), eliminating the temp-FP8 HBM round-trip.
-# Default ON (v25). Set SOAR_W4A8_REAL_FP8_GEMM=0 to disable.
+# Default OFF (crashes during forward pass — debugging 2026-05-18).
+# Set SOAR_W4A8_REAL_FP8_GEMM=1 to enable (for testing only).
 # See docs/soar_2026_changes/CHANGE_W4A8_REAL_FP8_GEMM.{en,zh}.md.
-export SOAR_W4A8_REAL_FP8_GEMM="${SOAR_W4A8_REAL_FP8_GEMM:-1}"
+export SOAR_W4A8_REAL_FP8_GEMM="${SOAR_W4A8_REAL_FP8_GEMM:-0}"
 
 # SOAR CHANGE_0131: opt-in MXFP4 KV cache (--kv-cache-dtype fp4_e2m1).
 # Default off (FP8 e5m2 baseline). Set SOAR_FP4_KV_CACHE=1 to enable.
