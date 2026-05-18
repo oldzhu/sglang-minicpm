@@ -975,6 +975,7 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 # Uses CUDA kernel (sgl-kernel) for speed, falls back to Python dequant.
                 in_features, out_features = c.partition_weight_shape
                 try:
+                    import sgl_kernel  # noqa: F401 — loads .so, registers torch.ops
                     w_fp8, w_scale = torch.ops.sgl_kernel.gptq_int4_to_fp8_blockwise(
                         layer.qweight.data,
                         layer.qzeros.data,
