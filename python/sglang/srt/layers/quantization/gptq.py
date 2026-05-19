@@ -913,11 +913,30 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         if in_features % 128 != 0 or out_features % 128 != 0:
             return
 
-        # Mark the layer for the real W4A8 dispatch in apply().
-        # No weight conversion needed — INT4 weights stay as-is.
+        # Dequantize weights NOW (before Marlin repack changes the format).
+        # The weights are still in standard GPTQ format at this point.
+        # Marlin repack happens later in __init__, which changes qweight/qzeros
+        # shapes to a GPU-optimized layout that we can't easily unpack.
+        try:
+            from sglang.srt.layers.quantization.w4a8_fp8_utils import (
+                dequantize_weight_int4_to_fp8,
+            )
+            w_fp8, w_scale = dequantize_weight_int4_to_fp8(
+                layer.qweight.data,
+                layer.qzeros.data,
+                layer.scales.data,
+                group_size=c.group_size,
+            )
+        except Exception:
+            # Dequant failed — skip this layer.
+            return
+
+        # Cache the FP8 weights and mark the layer for the W4A8 dispatch.
+        layer._w4a8_cached_fp8_weight = w_fp8
+        layer._w4a8_cached_fp8_scale = w_scale
         layer._soar_w4a8_real_active = True
         logger.info(
-            "[SOAR W4A8-REAL] enabled true W4A8 for layer prefix=%s "
+            "[SOAR W4A8-REAL] cached FP8 weights for layer prefix=%s "
             "shape=(N=%d, K=%d)",
             getattr(layer, "prefix", "?"),
             out_features,
@@ -957,79 +976,31 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
 
         # SOAR W4A8 REAL: true W4A8 (INT4 storage + FP8 activation + FP8 QMMA).
         # Activation quantized per-token on-the-fly; INT4 weights kept in HBM.
-        # CUDA dequant kernel (Day 2) converts INT4→FP8 quickly; still has
-        # temp-FP8 HBM round-trip. Day 3 will fuse into GEMM mainloop.
+        # W4A8 REAL: dispatch to FP8 blockwise GEMM using pre-cached weights.
+        # Weights are dequantized once in _soar_maybe_setup_w4a8_fp8_real()
+        # (called before Marlin repack during __init__), so apply() just
+        # uses the cached FP8 tensors.
         if getattr(layer, "_soar_w4a8_real_active", False):
-            layer_name = getattr(layer, "prefix", "?")
-            _log = open("/tmp/w4a8_debug.log", "a")
             try:
                 from sglang.srt.layers.quantization.fp8_utils import (
                     cutlass_w8a8_block_fp8_linear_with_fallback,
                 )
-
-                # Use cached FP8 weights if available (dequant done once).
-                in_features, out_features = c.partition_weight_shape
-                if hasattr(layer, "_w4a8_cached_fp8_weight"):
-                    w_fp8 = layer._w4a8_cached_fp8_weight
-                    w_scale = layer._w4a8_cached_fp8_scale
-                else:
-                    # Dequantize weights: INT4 → FP8 e4m3 with 128×128 blockwise scales.
-                    _log.write(f"[W4A8] dequant start: layer={layer_name} N={out_features} K={in_features} group={c.group_size}\n")
-                    _log.write(f"[W4A8] shapes: qweight={list(layer.qweight.shape)} qzeros={list(layer.qzeros.shape)} scales={list(layer.scales.shape)}\n")
-                    _log.flush()
-                    try:
-                        import sgl_kernel  # noqa: F401
-                        w_fp8, w_scale = torch.ops.sgl_kernel.gptq_int4_to_fp8_blockwise(
-                            layer.qweight.data,
-                            layer.qzeros.data,
-                            layer.scales.data,
-                            in_features,
-                            out_features,
-                            c.group_size,
-                        )
-                    except (RuntimeError, AttributeError):
-                        from sglang.srt.layers.quantization.w4a8_fp8_utils import (
-                            dequantize_weight_int4_to_fp8,
-                        )
-                        w_fp8, w_scale = dequantize_weight_int4_to_fp8(
-                            layer.qweight.data,
-                            layer.qzeros.data,
-                            layer.scales.data,
-                            group_size=c.group_size,
-                        )
-                    # Cache for subsequent forward passes.
-                    layer._w4a8_cached_fp8_weight = w_fp8
-                    layer._w4a8_cached_fp8_scale = w_scale
-                    _log.write(f"[W4A8] dequant done (cached): layer={layer_name}\n")
-                    _log.flush()
-
-                # Call SM120 FP8 blockwise GEMM (296 TF QMMA).
-                _log.write(f"[W4A8] GEMM start: layer={layer_name} in={list(x.shape)} out_N={out_features} out_K={in_features}\n")
-                _log.flush()
-                # Ensure input owns its storage — upstream may pass views that
-                # share memory with FP8 GEMM internal buffers.
+                w_fp8 = layer._w4a8_cached_fp8_weight
+                w_scale = layer._w4a8_cached_fp8_scale
                 x_contig = x.contiguous()
                 result = cutlass_w8a8_block_fp8_linear_with_fallback(
-                    input=x_contig,              # BF16, owns storage
-                    weight=w_fp8,                # FP8 e4m3 (N, K)
+                    input=x_contig,
+                    weight=w_fp8,
                     block_size=[128, 128],
-                    weight_scale=w_scale,        # float32 (N/128, K/128)
-                    input_scale=None,            # function asserts this must be None
+                    weight_scale=w_scale,
+                    input_scale=None,
                     bias=bias,
                 ).contiguous()
-                _log.write(f"[W4A8] GEMM done: layer={layer_name}\n")
-                _log.flush()
-                _log.close()
                 return result
-            except Exception as exc:  # pragma: no cover - defensive guard
-                _log.write(f"[W4A8] FAILED: layer={layer_name} error={exc}\n")
-                _log.flush()
-                _log.close()
+            except Exception as exc:
                 layer._soar_w4a8_real_active = False
                 logger.warning(
-                    "[SOAR W4A8-REAL] FP8 GEMM raised, reverting layer prefix=%s: %s",
-                    getattr(layer, "prefix", "?"),
-                    exc,
+                    "[SOAR W4A8-REAL] FP8 GEMM failed, reverting layer: %s", exc
                 )
 
         def _get_weight_params(
