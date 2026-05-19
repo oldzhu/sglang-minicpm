@@ -58,7 +58,8 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
           float v = ((float)w4 - (float)z4) * s;
           if (v > (float)kMaxFp8) v = (float)kMaxFp8;
           if (v < -(float)kMaxFp8) v = -(float)kMaxFp8;
-          W[nl][sk + kl] = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+          W[nl][sk + kl] = static_cast<__nv_fp8_e4m3>(
+              __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3));
         }
       }
     }
@@ -71,7 +72,8 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
         int kl = i % kSubK, ml = i / kSubK;
         int kg = kb + sk + kl, mg = m0 + ml;
         A[kl][ml] = (kg < K && mg < M) ? a_fp8[mg * lda + kg]
-                     : __nv_cvt_float_to_fp8(0.0f, __NV_SATFINITE, __NV_E4M3);
+                     : static_cast<__nv_fp8_e4m3>(
+                         __nv_cvt_float_to_fp8(0.0f, __NV_SATFINITE, __NV_E4M3));
       }
       __syncthreads();
 
