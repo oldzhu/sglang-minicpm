@@ -918,15 +918,20 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         # Marlin repack happens later in __init__, which changes qweight/qzeros
         # shapes to a GPU-optimized layout that we can't easily unpack.
         try:
-            from sglang.srt.layers.quantization.w4a8_fp8_utils import (
-                dequantize_weight_int4_to_fp8,
+            from sglang.srt.layers.quantization.utils_w4a8_fp8 import (
+                fp8_blockwise_quantize,
+                gptq_int4_dequantize,
             )
-            w_fp8, w_scale = dequantize_weight_int4_to_fp8(
+            # Dequantize INT4 → BF16 using the proven path from W4A8 #1.
+            w_kn = gptq_int4_dequantize(
                 layer.qweight.data,
                 layer.qzeros.data,
                 layer.scales.data,
                 group_size=c.group_size,
             )
+            # Transpose to (N, K) and quantize to FP8 using sgl-kernel.
+            w_nk = w_kn.t().contiguous()
+            w_fp8, w_scale = fp8_blockwise_quantize(w_nk, block_size=128)
         except Exception:
             # Dequant failed — skip this layer.
             return
