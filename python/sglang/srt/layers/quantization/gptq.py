@@ -967,37 +967,41 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     cutlass_w8a8_block_fp8_linear_with_fallback,
                 )
 
-                # Dequantize weights: INT4 → FP8 e4m3 with 128×128 blockwise scales.
-                # Uses CUDA kernel (sgl-kernel) for speed, falls back to Python dequant.
+                # Use cached FP8 weights if available (dequant done once).
                 in_features, out_features = c.partition_weight_shape
-                _log.write(f"[W4A8] dequant start: layer={layer_name} N={out_features} K={in_features} group={c.group_size}\n")
-                _log.write(f"[W4A8] shapes: qweight={list(layer.qweight.shape)} qzeros={list(layer.qzeros.shape)} scales={list(layer.scales.shape)}\n")
-                _log.write(f"[W4A8] expected qzeros: [{in_features//c.group_size//8}, {out_features}] expected scales: [{in_features//c.group_size}, {out_features}]\n")
-                _log.flush()
-                try:
-                    import sgl_kernel  # noqa: F401 — loads .so, registers torch.ops
-                    w_fp8, w_scale = torch.ops.sgl_kernel.gptq_int4_to_fp8_blockwise(
-                        layer.qweight.data,
-                        layer.qzeros.data,
-                        layer.scales.data,
-                        in_features,
-                        out_features,
-                        c.group_size,
-                    )
-                except (RuntimeError, AttributeError):
-                    # CUDA kernel not available (sgl-kernel not rebuilt yet).
-                    # Fall back to Python dequant — slower but correct.
-                    from sglang.srt.layers.quantization.w4a8_fp8_utils import (
-                        dequantize_weight_int4_to_fp8,
-                    )
-                    w_fp8, w_scale = dequantize_weight_int4_to_fp8(
-                        layer.qweight.data,
-                        layer.qzeros.data,
-                        layer.scales.data,
-                        group_size=c.group_size,
-                    )
-                _log.write(f"[W4A8] dequant done: layer={layer_name}\n")
-                _log.flush()
+                if hasattr(layer, "_w4a8_cached_fp8_weight"):
+                    w_fp8 = layer._w4a8_cached_fp8_weight
+                    w_scale = layer._w4a8_cached_fp8_scale
+                else:
+                    # Dequantize weights: INT4 → FP8 e4m3 with 128×128 blockwise scales.
+                    _log.write(f"[W4A8] dequant start: layer={layer_name} N={out_features} K={in_features} group={c.group_size}\n")
+                    _log.write(f"[W4A8] shapes: qweight={list(layer.qweight.shape)} qzeros={list(layer.qzeros.shape)} scales={list(layer.scales.shape)}\n")
+                    _log.flush()
+                    try:
+                        import sgl_kernel  # noqa: F401
+                        w_fp8, w_scale = torch.ops.sgl_kernel.gptq_int4_to_fp8_blockwise(
+                            layer.qweight.data,
+                            layer.qzeros.data,
+                            layer.scales.data,
+                            in_features,
+                            out_features,
+                            c.group_size,
+                        )
+                    except (RuntimeError, AttributeError):
+                        from sglang.srt.layers.quantization.w4a8_fp8_utils import (
+                            dequantize_weight_int4_to_fp8,
+                        )
+                        w_fp8, w_scale = dequantize_weight_int4_to_fp8(
+                            layer.qweight.data,
+                            layer.qzeros.data,
+                            layer.scales.data,
+                            group_size=c.group_size,
+                        )
+                    # Cache for subsequent forward passes.
+                    layer._w4a8_cached_fp8_weight = w_fp8
+                    layer._w4a8_cached_fp8_scale = w_scale
+                    _log.write(f"[W4A8] dequant done (cached): layer={layer_name}\n")
+                    _log.flush()
 
                 # Call SM120 FP8 blockwise GEMM (296 TF QMMA).
                 _log.write(f"[W4A8] GEMM start: layer={layer_name} in={list(x.shape)} out_N={out_features} out_K={in_features}\n")
