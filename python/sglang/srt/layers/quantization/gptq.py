@@ -975,17 +975,31 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         # Falls back to separate dequant+GEMM if fused kernel not built yet.
         if getattr(layer, "_soar_w4a8_real_active", False):
             try:
-                # Try fused kernel first (requires sgl-kernel rebuild).
-                import sgl_kernel  # noqa: F401
+                # Load standalone fused kernel .so (built separately from sgl-kernel).
+                # FUTURE: integrate into sgl-kernel wheel build.
+                import os
+                _fused_so = os.environ.get(
+                    "SOAR_W4A8_FUSED_SO",
+                    "/root/submission_sim/libw4a8_fused_gemm.so")
+                if os.path.exists(_fused_so):
+                    torch.ops.load_library(_fused_so)
+                # Fused kernel requires M % 128 == 0; fall back for small batches.
+                if x.size(0) % 128 != 0:
+                    raise RuntimeError("M not multiple of 128, using fallback")
+                # Fused kernel expects FP8 activation; convert from BF16.
+                x_fp8 = x.to(torch.float8_e4m3fn).contiguous()
                 result = torch.ops.sgl_kernel.w4a8_fp8_fused_gemm(
                     layer._w4a8_qweight,
                     layer._w4a8_qzeros,
                     layer._w4a8_scales,
-                    x,  # BF16, kernel quantizes internally (FUTURE: pass FP8)
+                    x_fp8,  # FP8 activation
                     out_features,  # N
                     in_features,   # K
                     c.group_size,
                 )
+                # Fused kernel returns BF16; ensure correct dtype.
+                if result.dtype != x.dtype:
+                    result = result.to(x.dtype)
                 return result
             except (AttributeError, RuntimeError):
                 # Fused kernel not available — fall back to separate
