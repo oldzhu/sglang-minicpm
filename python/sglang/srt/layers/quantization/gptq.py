@@ -986,6 +986,9 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 # Fused kernel requires M % 128 == 0; fall back for small batches.
                 if x.size(0) % 128 != 0:
                     raise RuntimeError("M not multiple of 128, using fallback")
+                # DEBUG: log fused kernel call before it executes
+                import sys
+                print(f"[W4A8-FUSED] M={x.size(0)} K={in_features} N={out_features} group={c.group_size} qweight_shape={layer._w4a8_qweight.shape} qzeros_shape={layer._w4a8_qzeros.shape} scales_shape={layer._w4a8_scales.shape}", file=sys.stderr, flush=True)
                 # Fused kernel expects FP8 activation; convert from BF16.
                 x_fp8 = x.to(torch.float8_e4m3fn).contiguous()
                 result = torch.ops.sgl_kernel.w4a8_fp8_fused_gemm(
