@@ -144,6 +144,9 @@ def _unpack_gptq_int4(
     # shape [K//16, N*2] (16 columns per int32) and qzeros may be empty [0]
     # (zero points baked into qweight). Detect and normalize.
     if qzeros.numel() == 0:
+        import sys
+        sys.stderr.write(f"[W4A8 unpack] MARLIN PATH qweight={list(qweight.shape)}\n")
+        sys.stderr.flush()
         # Marlin format: zeros are already incorporated in qweight.
         # qweight shape: [K//16, N*2] — unpack to [K//8, N] then to [K, N].
         K_div_16, N2 = qweight.shape
@@ -168,6 +171,9 @@ def _unpack_gptq_int4(
         return w_kn.to(scales.dtype)
 
     # Standard GPTQ format (non-Marlin): qweight [K//8, N], qzeros [groups//8, N].
+    import sys
+    sys.stderr.write(f"[W4A8 unpack] STANDARD PATH qweight={list(qweight.shape)} qzeros={list(qzeros.shape)}\n")
+    sys.stderr.flush()
     K_div_8, N = qweight.shape
     K = K_div_8 * 8
     groups = K // group_size
