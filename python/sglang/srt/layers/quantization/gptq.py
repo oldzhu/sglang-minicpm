@@ -913,35 +913,25 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         if in_features % 128 != 0 or out_features % 128 != 0:
             return
 
-        # Dequantize weights NOW (before Marlin repack changes the format).
-        # The weights are still in standard GPTQ format at this point.
-        # Marlin repack happens later in __init__, which changes qweight/qzeros
-        # shapes to a GPU-optimized layout that we can't easily unpack.
+        # Save a copy of standard-GPTQ weights BEFORE Marlin repack.
+        # Marlin repack (later in __init__) modifies qweight/qzeros in-place
+        # to a GPU-optimized layout. The fused W4A8 kernel needs the original
+        # standard GPTQ format to unpack INT4 correctly.
+        # We save clones so the fused kernel can read INT4 weights directly
+        # from HBM (4-bit) instead of FP8 (8-bit) — 2× bandwidth reduction.
         try:
-            from sglang.srt.layers.quantization.utils_w4a8_fp8 import (
-                fp8_blockwise_quantize,
-                gptq_int4_dequantize,
-            )
-            # Dequantize INT4 → BF16 using the proven path from W4A8 #1.
-            w_kn = gptq_int4_dequantize(
-                layer.qweight.data,
-                layer.qzeros.data,
-                layer.scales.data,
-                group_size=c.group_size,
-            )
-            # Transpose to (N, K) and quantize to FP8 using sgl-kernel.
-            w_nk = w_kn.t().contiguous()
-            w_fp8, w_scale = fp8_blockwise_quantize(w_nk, block_size=128)
+            layer._w4a8_qweight = layer.qweight.data.clone()
+            layer._w4a8_qzeros = layer.qzeros.data.clone()
+            layer._w4a8_scales = layer.scales.data.clone()
         except Exception:
-            # Dequant failed — skip this layer.
             return
 
-        # Cache the FP8 weights and mark the layer for the W4A8 dispatch.
-        layer._w4a8_cached_fp8_weight = w_fp8
-        layer._w4a8_cached_fp8_scale = w_scale
+        # Mark the layer for the fused W4A8 dispatch in apply().
+        # The fused kernel (w4a8_fp8_fused_gemm) will dequant INT4→FP8
+        # in shared memory during the GEMM, eliminating the FP8 HBM traffic.
         layer._soar_w4a8_real_active = True
         logger.info(
-            "[SOAR W4A8-REAL] cached FP8 weights for layer prefix=%s "
+            "[SOAR W4A8-REAL] saved INT4 weights for fused GEMM, layer=%s "
             "shape=(N=%d, K=%d)",
             getattr(layer, "prefix", "?"),
             out_features,
@@ -979,17 +969,50 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     exc,
                 )
 
-        # SOAR W4A8 REAL: true W4A8 (INT4 storage + FP8 activation + FP8 QMMA).
-        # Activation quantized per-token on-the-fly; INT4 weights kept in HBM.
-        # W4A8 REAL: dispatch to FP8 blockwise GEMM using pre-cached weights.
-        # Weights are dequantized once in _soar_maybe_setup_w4a8_fp8_real()
-        # (called before Marlin repack during __init__), so apply() just
-        # uses the cached FP8 tensors.
+        # SOAR W4A8 REAL: use fused INT4→FP8 GEMM kernel when available.
+        # The fused kernel dequants INT4→FP8 in shared memory during the GEMM,
+        # eliminating the FP8 HBM round-trip and reducing weight bandwidth 2×.
+        # Falls back to separate dequant+GEMM if fused kernel not built yet.
         if getattr(layer, "_soar_w4a8_real_active", False):
+            try:
+                # Try fused kernel first (requires sgl-kernel rebuild).
+                import sgl_kernel  # noqa: F401
+                result = torch.ops.sgl_kernel.w4a8_fp8_fused_gemm(
+                    layer._w4a8_qweight,
+                    layer._w4a8_qzeros,
+                    layer._w4a8_scales,
+                    x,  # BF16, kernel quantizes internally (FUTURE: pass FP8)
+                    out_features,  # N
+                    in_features,   # K
+                    c.group_size,
+                )
+                return result
+            except (AttributeError, RuntimeError):
+                # Fused kernel not available — fall back to separate
+                # dequant + FP8 GEMM.
+                pass
+
+            # FALLBACK: separate dequant + FP8 GEMM using cached FP8 weights.
             try:
                 from sglang.srt.layers.quantization.fp8_utils import (
                     cutlass_w8a8_block_fp8_linear_with_fallback,
                 )
+                if not hasattr(layer, "_w4a8_cached_fp8_weight"):
+                    # Dequant on first use (for fallback path without setup-time cache).
+                    from sglang.srt.layers.quantization.utils_w4a8_fp8 import (
+                        fp8_blockwise_quantize,
+                        gptq_int4_dequantize,
+                    )
+                    w_kn = gptq_int4_dequantize(
+                        layer._w4a8_qweight,
+                        layer._w4a8_qzeros,
+                        layer._w4a8_scales,
+                        group_size=c.group_size,
+                    )
+                    w_nk = w_kn.t().contiguous()
+                    w_fp8, w_scale = fp8_blockwise_quantize(w_nk, block_size=128)
+                    layer._w4a8_cached_fp8_weight = w_fp8
+                    layer._w4a8_cached_fp8_scale = w_scale
                 w_fp8 = layer._w4a8_cached_fp8_weight
                 w_scale = layer._w4a8_cached_fp8_scale
                 x_contig = x.contiguous()
