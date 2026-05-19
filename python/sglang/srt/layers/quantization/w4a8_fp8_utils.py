@@ -140,6 +140,34 @@ def _unpack_gptq_int4(
     Returns:
         ``(K, N)`` dense BF16 weight tensor.
     """
+    # Detect Marlin-packed format: after GPTQ→Marlin repack, qweight may have
+    # shape [K//16, N*2] (16 columns per int32) and qzeros may be empty [0]
+    # (zero points baked into qweight). Detect and normalize.
+    if qzeros.numel() == 0:
+        # Marlin format: zeros are already incorporated in qweight.
+        # qweight shape: [K//16, N*2] — unpack to [K//8, N] then to [K, N].
+        K_div_16, N2 = qweight.shape
+        N = N2 // 2
+        K = K_div_16 * 16
+        groups = K // group_size
+
+        # Unpack Marlin qweight: [K//16, N*2] → [K//8, N] → [K, N]
+        # Each int32 packs 8 weights across 2 columns × 4-bit.
+        qweight_kn8 = qweight.view(K // 8, N)  # reinterpret
+        shifts = torch.arange(0, 8, device=qweight.device) * 4
+        qweight_expanded = qweight_kn8.unsqueeze(1)  # (K//8, 1, N)
+        qweight_unpacked = (
+            (qweight_expanded >> shifts.view(1, 8, 1)) & 0xF
+        ).reshape(K, N).to(scales.dtype)
+
+        # Broadcast scales: (groups, N) → (K, N).
+        scales_broadcast = scales.repeat_interleave(group_size, dim=0)
+
+        # No zero-point correction needed (already in qweight).
+        w_kn = qweight_unpacked.float() * scales_broadcast.float()
+        return w_kn.to(scales.dtype)
+
+    # Standard GPTQ format (non-Marlin): qweight [K//8, N], qzeros [groups//8, N].
     K_div_8, N = qweight.shape
     K = K_div_8 * 8
     groups = K // group_size
