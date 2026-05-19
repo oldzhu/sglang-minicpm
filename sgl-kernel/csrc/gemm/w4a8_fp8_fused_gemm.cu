@@ -15,8 +15,6 @@
 #include <cuda_bf16.h>
 #include <torch/all.h>
 
-#include "utils.h"
-
 namespace sglang {
 
 static constexpr int kTileM = 128, kTileN = 128, kTileK = 128, kSubK = 32;
