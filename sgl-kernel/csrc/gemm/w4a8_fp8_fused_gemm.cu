@@ -51,8 +51,8 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
           int gid = kg / group;
           int z4 = 0;
           if (qzeros != nullptr) {
-            int zp = gid / 8, zb = (gid % 8) * 4;
-            z4 = (qzeros[zp * N + ng] >> zb) & 0xF;
+            int zn = ng / 8, zb = (ng % 8) * 4;
+            z4 = (qzeros[gid * (N / 8) + zn] >> zb) & 0xF;
           }
           float s = scales[gid * N + ng];
           float v = ((float)w4 - (float)z4) * s;
