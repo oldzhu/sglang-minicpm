@@ -13,6 +13,7 @@
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
 #include <torch/all.h>
 #include <torch/library.h>
 
@@ -57,7 +58,7 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
           float v = ((float)w4 - (float)z4) * s;
           if (v > (float)kMaxFp8) v = (float)kMaxFp8;
           if (v < -(float)kMaxFp8) v = -(float)kMaxFp8;
-          W[nl][sk + kl] = __nv_cvt_float_to_fp8(v);
+          W[nl][sk + kl] = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
         }
       }
     }
@@ -70,15 +71,15 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
         int kl = i % kSubK, ml = i / kSubK;
         int kg = kb + sk + kl, mg = m0 + ml;
         A[kl][ml] = (kg < K && mg < M) ? a_fp8[mg * lda + kg]
-                     : __nv_cvt_float_to_fp8(0.0f);
+                     : __nv_cvt_float_to_fp8(0.0f, __NV_SATFINITE, __NV_E4M3);
       }
       __syncthreads();
 
       for (int n = 0; n < kTileN; ++n) {
         float dot = 0.0f;
         for (int k = 0; k < kSubK; ++k)
-          dot += __nv_cvt_fp8_to_float(W[n][sk + k]) *
-                 __nv_cvt_fp8_to_float(A[k][tid]);
+          dot += float(W[n][sk + k]) *
+                 float(A[k][tid]);
         acc[n] += dot;
       }
     }
