@@ -34,8 +34,8 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
   const int m0 = mb * kTileM, n0 = nb * kTileN;
   const int tid = threadIdx.x;
 
-  __shared__ __nv_fp8_e4m3 W[kTileN][kTileK];
-  __shared__ __nv_fp8_e4m3 A[kSubK][kTileM];
+  __shared__ __nv_fp8_e4m3 W[kTileN * kTileK];
+  __shared__ __nv_fp8_e4m3 A[kSubK * kTileM];
   float acc[kTileN] = {0.0f};
 
   for (int kb = 0; kb < K; kb += kTileK) {
@@ -58,7 +58,7 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
           float v = ((float)w4 - (float)z4) * s;
           if (v > (float)kMaxFp8) v = (float)kMaxFp8;
           if (v < -(float)kMaxFp8) v = -(float)kMaxFp8;
-          W[nl][sk + kl] = static_cast<__nv_fp8_e4m3>(
+          W[nl * kTileK + (sk + kl)] = static_cast<__nv_fp8_e4m3>(
               __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3));
         }
       }
@@ -71,7 +71,7 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
       for (int i = tid; i < kTileM * kSubK; i += 128) {
         int kl = i % kSubK, ml = i / kSubK;
         int kg = kb + sk + kl, mg = m0 + ml;
-        A[kl][ml] = (kg < K && mg < M) ? a_fp8[mg * lda + kg]
+        A[kl * kTileM + ml] = (kg < K && mg < M) ? a_fp8[mg * lda + kg]
                      : static_cast<__nv_fp8_e4m3>(
                          __nv_cvt_float_to_fp8(0.0f, __NV_SATFINITE, __NV_E4M3));
       }
@@ -80,8 +80,8 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
       for (int n = 0; n < kTileN; ++n) {
         float dot = 0.0f;
         for (int k = 0; k < kSubK; ++k)
-          dot += float(W[n][sk + k]) *
-                 float(A[k][tid]);
+          dot += static_cast<float>(W[n * kTileK + (sk + k)]) *
+                 static_cast<float>(A[k * kTileM + tid]);
         acc[n] += dot;
       }
     }
