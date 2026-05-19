@@ -123,6 +123,11 @@ torch::Tensor w4a8_fp8_fused_gemm(
       M, (int)N, (int)K, (int)group_size,
       (int)a_fp8.stride(0), (int)c_bf16.stride(0));
 
+  auto err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    TORCH_CHECK(false, "Kernel launch failed: ", cudaGetErrorString(err));
+  }
+
   return c_bf16;
 }
 
