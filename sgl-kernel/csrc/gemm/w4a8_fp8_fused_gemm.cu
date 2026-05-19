@@ -10,10 +10,11 @@
  * This kernel prioritizes correctness and bandwidth elimination.
  */
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>
+#include <cuda_runtime.h>
 #include <torch/all.h>
+#include <torch/library.h>
 
 namespace sglang {
 
@@ -109,7 +110,7 @@ torch::Tensor w4a8_fp8_fused_gemm(
   dim3 grid(M / kTileM, (N + kTileN - 1) / kTileN);
   dim3 block(128);
 
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = c10::cuda::getCurrentCUDAStream();
   w4a8_fp8_fused_gemm_kernel<<<grid, block, 0, stream>>>(
       static_cast<const int32_t*>(qweight.const_data_ptr()),
       qzeros.numel() > 0 ? static_cast<const int32_t*>(qzeros.const_data_ptr()) : nullptr,
