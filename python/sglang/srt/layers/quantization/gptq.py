@@ -983,14 +983,22 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     "/root/submission_sim/libw4a8_fused_gemm.so")
                 if os.path.exists(_fused_so):
                     torch.ops.load_library(_fused_so)
-                # Fused kernel requires M % 128 == 0; fall back for small batches.
-                if x.size(0) % 128 != 0:
-                    raise RuntimeError("M not multiple of 128, using fallback")
+                # Fused kernel requires M % 128 == 0.
+                # Pad to next multiple of 128. For very small M (decode),
+                # fall back to Marlin to avoid wasting compute on padding.
+                M_orig = x.size(0)
+                if M_orig < 64:
+                    raise RuntimeError("M < 64, using fallback for efficiency")
+                M_pad = ((M_orig + 127) // 128) * 128
+                if M_pad != M_orig:
+                    x_pad = torch.nn.functional.pad(x, (0, 0, 0, M_pad - M_orig))
+                else:
+                    x_pad = x
                 # DEBUG: log fused kernel call before it executes
                 import sys
-                print(f"[W4A8-FUSED] M={x.size(0)} K={in_features} N={out_features} group={c.group_size} qweight_shape={layer._w4a8_qweight.shape} qzeros_shape={layer._w4a8_qzeros.shape} scales_shape={layer._w4a8_scales.shape}", file=sys.stderr, flush=True)
+                print(f"[W4A8-FUSED] M_orig={M_orig} M_pad={M_pad} K={in_features} N={out_features} group={c.group_size}", file=sys.stderr, flush=True)
                 # Fused kernel expects FP8 activation; convert from BF16.
-                x_fp8 = x.to(torch.float8_e4m3fn).contiguous()
+                x_fp8 = x_pad.to(torch.float8_e4m3fn).contiguous()
                 result = torch.ops.sgl_kernel.w4a8_fp8_fused_gemm(
                     layer._w4a8_qweight,
                     layer._w4a8_qzeros,
@@ -1000,6 +1008,9 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     in_features,   # K
                     c.group_size,
                 )
+                # Slice back to original M
+                if M_pad != M_orig:
+                    result = result[:M_orig]
                 # Fused kernel returns BF16; ensure correct dtype.
                 if result.dtype != x.dtype:
                     result = result.to(x.dtype)
