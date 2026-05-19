@@ -970,7 +970,9 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 # Dequantize weights: INT4 → FP8 e4m3 with 128×128 blockwise scales.
                 # Uses CUDA kernel (sgl-kernel) for speed, falls back to Python dequant.
                 in_features, out_features = c.partition_weight_shape
-                _log.write(f"[W4A8] dequant start: layer={layer_name} N={out_features} K={in_features}\n")
+                _log.write(f"[W4A8] dequant start: layer={layer_name} N={out_features} K={in_features} group={c.group_size}\n")
+                _log.write(f"[W4A8] shapes: qweight={list(layer.qweight.shape)} qzeros={list(layer.qzeros.shape)} scales={list(layer.scales.shape)}\n")
+                _log.write(f"[W4A8] expected qzeros: [{in_features//c.group_size//8}, {out_features}] expected scales: [{in_features//c.group_size}, {out_features}]\n")
                 _log.flush()
                 try:
                     import sgl_kernel  # noqa: F401 — loads .so, registers torch.ops
