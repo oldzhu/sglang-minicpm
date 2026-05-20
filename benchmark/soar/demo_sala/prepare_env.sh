@@ -290,9 +290,6 @@ export SOAR_W4A8_REAL_FP8_GEMM="${SOAR_W4A8_REAL_FP8_GEMM:-1}"
 # DEBUG: disable torch.compile to isolate fused kernel crash
 export SOAR_DISABLE_TORCH_COMPILE="${SOAR_DISABLE_TORCH_COMPILE:-1}"
 
-# DEBUG: enable synchronous CUDA launches to catch kernel errors
-export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
-
 # SOAR CHANGE_0131: opt-in MXFP4 KV cache (--kv-cache-dtype fp4_e2m1).
 # Default off (FP8 e5m2 baseline). Set SOAR_FP4_KV_CACHE=1 to enable.
 # See docs/soar_2026_changes/CHANGE_0131_nvfp4_kv_p2_plumbing.{en,zh}.md.

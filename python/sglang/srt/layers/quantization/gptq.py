@@ -966,6 +966,10 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     x_pad = torch.nn.functional.pad(x, (0, 0, 0, M_pad - M_orig))
                 else:
                     x_pad = x
+                # Crash diagnostics: log before kernel call
+                with open("/tmp/w4a8_crash.log", "a") as f:
+                    f.write(f"PRE  M_orig={M_orig} M_pad={M_pad} N={out_features} K={in_features}\n")
+                    f.flush()
                 x_fp8 = x_pad.to(torch.float8_e4m3fn).contiguous()
                 result = torch.ops.sgl_kernel.w4a8_fp8_fused_gemm(
                     layer._w4a8_qweight,
@@ -976,6 +980,10 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     in_features,   # K
                     c.group_size,
                 )
+                # Log after kernel call
+                with open("/tmp/w4a8_crash.log", "a") as f:
+                    f.write(f"POST M_orig={M_orig} OK\n")
+                    f.flush()
                 if M_pad != M_orig:
                     result = result[:M_orig]
                 if result.dtype != x.dtype:
