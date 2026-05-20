@@ -946,32 +946,21 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         c = self.kernel_config
 
-        # DEBUG: trace apply entry
-        with open("/tmp/w4a8_trace.log", "a") as f:
-            f.write(f"APPLY M={x.size(0)} N={x.size(1)} real={getattr(layer, '_soar_w4a8_real_active', False)} old={getattr(layer, '_soar_w4a8_active', False)}\n")
-            f.flush()
-
         # SOAR W4A8 REAL: use fused INT4→FP8 GEMM kernel when available.
         # The fused kernel dequants INT4→FP8 in shared memory during the GEMM,
         # eliminating the FP8 HBM round-trip and reducing weight bandwidth 2×.
         # CHECKED FIRST — takes priority over old cached FP8 path.
         if getattr(layer, "_soar_w4a8_real_active", False):
-            print(f"[W4A8-ENTER] M={x.size(0)}", flush=True)
             try:
-                import os, sys
+                import os
                 in_features, out_features = c.partition_weight_shape
                 _fused_so = os.environ.get(
                     "SOAR_W4A8_FUSED_SO",
                     "/root/submission_sim/libw4a8_fused_gemm.so")
-                print(f"[W4A8-SO] path={_fused_so} exists={os.path.exists(_fused_so)}", flush=True)
                 if os.path.exists(_fused_so) and not getattr(self, "_fused_so_loaded", False):
-                    print(f"[W4A8-LOAD] loading {_fused_so}", flush=True)
                     torch.ops.load_library(_fused_so)
                     self._fused_so_loaded = True
-                    print(f"[W4A8-LOAD] done", flush=True)
                 M_orig = x.size(0)
-                with open("/tmp/w4a8_crash.log", "a") as f:
-                    f.write(f"ENTRY M={M_orig}\n"); f.flush()
                 if M_orig < 64:
                     raise RuntimeError(f"M={M_orig} < 64, falling back")
                 M_pad = ((M_orig + 127) // 128) * 128
@@ -979,10 +968,6 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     x_pad = torch.nn.functional.pad(x, (0, 0, 0, M_pad - M_orig))
                 else:
                     x_pad = x
-                # Crash diagnostics: log before kernel call
-                with open("/tmp/w4a8_crash.log", "a") as f:
-                    f.write(f"PRE  M_orig={M_orig} M_pad={M_pad} N={out_features} K={in_features}\n")
-                    f.flush()
                 x_fp8 = x_pad.to(torch.float8_e4m3fn).contiguous()
                 result = torch.ops.w4a8_fused.w4a8_fp8_fused_gemm(
                     layer._w4a8_qweight,
@@ -993,18 +978,12 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     in_features,   # K
                     c.group_size,
                 )
-                # Log after kernel call
-                with open("/tmp/w4a8_crash.log", "a") as f:
-                    f.write(f"POST M_orig={M_orig} OK\n")
-                    f.flush()
                 if M_pad != M_orig:
                     result = result[:M_orig]
                 if result.dtype != x.dtype:
                     result = result.to(x.dtype)
                 return result
-            except Exception as exc:
-                with open("/tmp/w4a8_crash.log", "a") as f:
-                    f.write(f"EXC {type(exc).__name__}: {exc}\n"); f.flush()
+            except Exception:
                 pass  # fall through to old cached FP8 path or Marlin
 
         # SOAR W4A8 #1: dispatch to FP8 blockwise GEMM when the cached
