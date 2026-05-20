@@ -969,6 +969,8 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     self._fused_so_loaded = True
                     print(f"[W4A8-LOAD] done", flush=True)
                 M_orig = x.size(0)
+                with open("/tmp/w4a8_crash.log", "a") as f:
+                    f.write(f"ENTRY M={M_orig}\n"); f.flush()
                 if M_orig < 64:
                     raise RuntimeError(f"M={M_orig} < 64, falling back")
                 M_pad = ((M_orig + 127) // 128) * 128
@@ -999,7 +1001,7 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 if result.dtype != x.dtype:
                     result = result.to(x.dtype)
                 return result
-            except (AttributeError, RuntimeError):
+            except Exception:
                 pass  # fall through to old cached FP8 path or Marlin
 
         # SOAR W4A8 #1: dispatch to FP8 blockwise GEMM when the cached
