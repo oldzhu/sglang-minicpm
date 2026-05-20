@@ -94,7 +94,7 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
           int wn = n0 + ns * kMmaN;
 
           wmma::load_matrix_sync(a_frag, &A[wm][0], kMmaK);
-          wmma::load_matrix_sync(b_frag, &W[wn][sk], kTileK);
+          wmma::load_matrix_sync(b_frag, &W[wn - n0][sk], kTileK);
           // C += A * B
           wmma::mma_sync(c_frag[ms][ns], a_frag, b_frag, c_frag[ms][ns]);
         }
