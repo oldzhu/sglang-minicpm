@@ -113,7 +113,7 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
       // Single-warp copy from SMEM to global (no sync needed — only this warp touches its buffer)
       for (int i = lane_id; i < kMmaM * kMmaN; i += kWarpSize) {
         int mi = i / kMmaN, ni = i % kMmaN;
-        int mg = m0 + wm + mi, ng = n0 + wn + ni;
+        int mg = m0 + wm + mi, ng = wn + ni;
         if (mg < M && ng < N)
           c_bf16[mg * ldc + ng] = __float2bfloat16(store_tile[warp_id][mi][ni]);
       }
