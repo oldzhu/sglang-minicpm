@@ -946,10 +946,36 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         c = self.kernel_config
 
-        # DEBUG: log at apply entry to trace code path
-        with open("/tmp/w4a8_apply.log", "a") as f:
-            f.write(f"[APPLY] M={x.size(0)} N={x.size(1)} w4a8_old={getattr(layer, '_soar_w4a8_active', False)} w4a8_real={getattr(layer, '_soar_w4a8_real_active', False)}\n")
-            f.flush()
+        # SOAR W4A8 REAL: use fused INT4→FP8 GEMM kernel when available.
+        # The fused kernel dequants INT4→FP8 in shared memory during the GEMM,
+        # eliminating the FP8 HBM round-trip and reducing weight bandwidth 2×.
+        # CHECKED FIRST — takes priority over old cached FP8 path.
+        if getattr(layer, "_soar_w4a8_real_active", False):
+            try:
+                import os
+                _fused_so = os.environ.get(
+                    "SOAR_W4A8_FUSED_SO",
+                    "/root/submission_sim/libw4a8_fused_gemm.so")
+                if os.path.exists(_fused_so):
+                    torch.ops.load_library(_fused_so)
+                M_orig = x.size(0)
+                if M_orig % 128 != 0:
+                    raise RuntimeError(f"M={M_orig} not multiple of 128, using fallback")
+                x_fp8 = x.to(torch.float8_e4m3fn).contiguous()
+                result = torch.ops.sgl_kernel.w4a8_fp8_fused_gemm(
+                    layer._w4a8_qweight,
+                    layer._w4a8_qzeros,
+                    layer._w4a8_scales,
+                    x_fp8,
+                    out_features,  # N
+                    in_features,   # K
+                    c.group_size,
+                )
+                if result.dtype != x.dtype:
+                    result = result.to(x.dtype)
+                return result
+            except (AttributeError, RuntimeError):
+                pass  # fall through to old cached FP8 path or Marlin
 
         # SOAR W4A8 #1: dispatch to FP8 blockwise GEMM when the cached
         # FP8 weights are present. Falls back to Marlin path on any error.
@@ -972,102 +998,6 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     "[SOAR W4A8] FP8 GEMM raised, reverting layer prefix=%s: %s",
                     getattr(layer, "prefix", "?"),
                     exc,
-                )
-
-        # SOAR W4A8 REAL: use fused INT4→FP8 GEMM kernel when available.
-        # The fused kernel dequants INT4→FP8 in shared memory during the GEMM,
-        # eliminating the FP8 HBM round-trip and reducing weight bandwidth 2×.
-        # Falls back to separate dequant+GEMM if fused kernel not built yet.
-        if getattr(layer, "_soar_w4a8_real_active", False):
-            try:
-                # Load standalone fused kernel .so (built separately from sgl-kernel).
-                # FUTURE: integrate into sgl-kernel wheel build.
-                import os
-                _fused_so = os.environ.get(
-                    "SOAR_W4A8_FUSED_SO",
-                    "/root/submission_sim/libw4a8_fused_gemm.so")
-                if os.path.exists(_fused_so):
-                    torch.ops.load_library(_fused_so)
-                # Fused kernel requires M % 128 == 0.
-                # Pad to next multiple of 128. For decode (M=1), fall back
-                # to Marlin to avoid 99% compute waste from padding.
-                M_orig = x.size(0)
-                # DEBUG: log to file at entry
-                with open("/tmp/w4a8_fused_calls.log", "a") as f:
-                    f.write(f"[W4A8-ENTRY] M_orig={M_orig} K={in_features} N={out_features}\n")
-                    f.flush()
-                if M_orig < 64:
-                    raise RuntimeError(f"M={M_orig} < 64, using fallback")
-                M_pad = ((M_orig + 127) // 128) * 128
-                if M_pad != M_orig:
-                    x_pad = torch.nn.functional.pad(x, (0, 0, 0, M_pad - M_orig))
-                else:
-                    x_pad = x
-                # DEBUG: log to file so we can read after crash
-                with open("/tmp/w4a8_fused_calls.log", "a") as f:
-                    f.write(f"[W4A8-FUSED] M_orig={M_orig} M_pad={M_pad} K={in_features} N={out_features} group={c.group_size}\n")
-                    f.flush()
-                logger.warning(f"[W4A8-FUSED] M_orig={M_orig} M_pad={M_pad} K={in_features} N={out_features} group={c.group_size}")
-                # Fused kernel expects FP8 activation; convert from BF16.
-                x_fp8 = x_pad.to(torch.float8_e4m3fn).contiguous()
-                result = torch.ops.sgl_kernel.w4a8_fp8_fused_gemm(
-                    layer._w4a8_qweight,
-                    layer._w4a8_qzeros,
-                    layer._w4a8_scales,
-                    x_fp8,  # FP8 activation
-                    out_features,  # N
-                    in_features,   # K
-                    c.group_size,
-                )
-                # Slice back to original M
-                if M_pad != M_orig:
-                    result = result[:M_orig]
-                # Fused kernel returns BF16; ensure correct dtype.
-                if result.dtype != x.dtype:
-                    result = result.to(x.dtype)
-                return result
-            except (AttributeError, RuntimeError):
-                # Fused kernel not available — fall back to separate
-                # dequant + FP8 GEMM.
-                pass
-
-            # FALLBACK: separate dequant + FP8 GEMM using cached FP8 weights.
-            try:
-                from sglang.srt.layers.quantization.fp8_utils import (
-                    cutlass_w8a8_block_fp8_linear_with_fallback,
-                )
-                if not hasattr(layer, "_w4a8_cached_fp8_weight"):
-                    # Dequant on first use (for fallback path without setup-time cache).
-                    from sglang.srt.layers.quantization.utils_w4a8_fp8 import (
-                        fp8_blockwise_quantize,
-                        gptq_int4_dequantize,
-                    )
-                    w_kn = gptq_int4_dequantize(
-                        layer._w4a8_qweight,
-                        layer._w4a8_qzeros,
-                        layer._w4a8_scales,
-                        group_size=c.group_size,
-                    )
-                    w_nk = w_kn.t().contiguous()
-                    w_fp8, w_scale = fp8_blockwise_quantize(w_nk, block_size=128)
-                    layer._w4a8_cached_fp8_weight = w_fp8
-                    layer._w4a8_cached_fp8_scale = w_scale
-                w_fp8 = layer._w4a8_cached_fp8_weight
-                w_scale = layer._w4a8_cached_fp8_scale
-                x_contig = x.contiguous()
-                result = cutlass_w8a8_block_fp8_linear_with_fallback(
-                    input=x_contig,
-                    weight=w_fp8,
-                    block_size=[128, 128],
-                    weight_scale=w_scale,
-                    input_scale=None,
-                    bias=bias,
-                ).contiguous()
-                return result
-            except Exception as exc:
-                layer._soar_w4a8_real_active = False
-                logger.warning(
-                    "[SOAR W4A8-REAL] FP8 GEMM failed, reverting layer: %s", exc
                 )
 
         def _get_weight_params(
