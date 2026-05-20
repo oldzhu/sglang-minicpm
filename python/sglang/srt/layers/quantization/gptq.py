@@ -946,6 +946,11 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         c = self.kernel_config
 
+        # DEBUG: trace apply entry
+        with open("/tmp/w4a8_trace.log", "a") as f:
+            f.write(f"APPLY M={x.size(0)} N={x.size(1)} real={getattr(layer, '_soar_w4a8_real_active', False)} old={getattr(layer, '_soar_w4a8_active', False)}\n")
+            f.flush()
+
         # SOAR W4A8 REAL: use fused INT4→FP8 GEMM kernel when available.
         # The fused kernel dequants INT4→FP8 in shared memory during the GEMM,
         # eliminating the FP8 HBM round-trip and reducing weight bandwidth 2×.
