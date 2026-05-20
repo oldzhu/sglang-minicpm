@@ -959,6 +959,7 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
             print(f"[W4A8-ENTER] M={x.size(0)}", flush=True)
             try:
                 import os, sys
+                in_features, out_features = c.partition_weight_shape
                 _fused_so = os.environ.get(
                     "SOAR_W4A8_FUSED_SO",
                     "/root/submission_sim/libw4a8_fused_gemm.so")
