@@ -113,6 +113,7 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
   // Phase 4: Write output from accumulators to global memory
   // Per-warp SMEM staging (4 warps × 16×16 float = 4KB)
   __shared__ float store_tile[kWarps][kMmaM][kMmaN];
+  using namespace nvcuda;
   for (int ms = 0; ms < 2; ++ms) {
     int wm = warp_m0 + ms * kMmaM;
     for (int ns = 0; ns < 8; ++ns) {
