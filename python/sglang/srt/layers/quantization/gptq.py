@@ -961,8 +961,9 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 _fused_so = os.environ.get(
                     "SOAR_W4A8_FUSED_SO",
                     "/root/submission_sim/libw4a8_fused_gemm.so")
-                if os.path.exists(_fused_so):
+                if os.path.exists(_fused_so) and not getattr(self, "_fused_so_loaded", False):
                     torch.ops.load_library(_fused_so)
+                    self._fused_so_loaded = True
                 M_orig = x.size(0)
                 if M_orig < 64:
                     raise RuntimeError(f"M={M_orig} < 64, falling back")
