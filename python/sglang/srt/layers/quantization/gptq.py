@@ -987,6 +987,10 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 # Pad to next multiple of 128. For decode (M=1), fall back
                 # to Marlin to avoid 99% compute waste from padding.
                 M_orig = x.size(0)
+                # DEBUG: log to file at entry
+                with open("/tmp/w4a8_fused_calls.log", "a") as f:
+                    f.write(f"[W4A8-ENTRY] M_orig={M_orig} K={in_features} N={out_features}\n")
+                    f.flush()
                 if M_orig < 64:
                     raise RuntimeError(f"M={M_orig} < 64, using fallback")
                 M_pad = ((M_orig + 127) // 128) * 128
