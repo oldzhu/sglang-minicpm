@@ -959,9 +959,14 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 if os.path.exists(_fused_so):
                     torch.ops.load_library(_fused_so)
                 M_orig = x.size(0)
-                if M_orig % 128 != 0:
-                    raise RuntimeError(f"M={M_orig} not multiple of 128, using fallback")
-                x_fp8 = x.to(torch.float8_e4m3fn).contiguous()
+                if M_orig < 64:
+                    raise RuntimeError(f"M={M_orig} < 64, falling back")
+                M_pad = ((M_orig + 127) // 128) * 128
+                if M_pad != M_orig:
+                    x_pad = torch.nn.functional.pad(x, (0, 0, 0, M_pad - M_orig))
+                else:
+                    x_pad = x
+                x_fp8 = x_pad.to(torch.float8_e4m3fn).contiguous()
                 result = torch.ops.sgl_kernel.w4a8_fp8_fused_gemm(
                     layer._w4a8_qweight,
                     layer._w4a8_qzeros,
@@ -971,6 +976,8 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     in_features,   # K
                     c.group_size,
                 )
+                if M_pad != M_orig:
+                    result = result[:M_orig]
                 if result.dtype != x.dtype:
                     result = result.to(x.dtype)
                 return result
