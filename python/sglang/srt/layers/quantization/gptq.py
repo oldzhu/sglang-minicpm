@@ -1001,7 +1001,9 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 if result.dtype != x.dtype:
                     result = result.to(x.dtype)
                 return result
-            except Exception:
+            except Exception as exc:
+                with open("/tmp/w4a8_crash.log", "a") as f:
+                    f.write(f"EXC {type(exc).__name__}: {exc}\n"); f.flush()
                 pass  # fall through to old cached FP8 path or Marlin
 
         # SOAR W4A8 #1: dispatch to FP8 blockwise GEMM when the cached
