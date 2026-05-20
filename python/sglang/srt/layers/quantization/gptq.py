@@ -946,6 +946,11 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         c = self.kernel_config
 
+        # DEBUG: log at apply entry to trace code path
+        with open("/tmp/w4a8_apply.log", "a") as f:
+            f.write(f"[APPLY] M={x.size(0)} N={x.size(1)} w4a8_old={getattr(layer, '_soar_w4a8_active', False)} w4a8_real={getattr(layer, '_soar_w4a8_real_active', False)}\n")
+            f.flush()
+
         # SOAR W4A8 #1: dispatch to FP8 blockwise GEMM when the cached
         # FP8 weights are present. Falls back to Marlin path on any error.
         if getattr(layer, "_soar_w4a8_active", False):
