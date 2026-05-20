@@ -994,7 +994,10 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     x_pad = torch.nn.functional.pad(x, (0, 0, 0, M_pad - M_orig))
                 else:
                     x_pad = x
-                # DEBUG: log fused kernel call via logger (visible in server output)
+                # DEBUG: log to file so we can read after crash
+                with open("/tmp/w4a8_fused_calls.log", "a") as f:
+                    f.write(f"[W4A8-FUSED] M_orig={M_orig} M_pad={M_pad} K={in_features} N={out_features} group={c.group_size}\n")
+                    f.flush()
                 logger.warning(f"[W4A8-FUSED] M_orig={M_orig} M_pad={M_pad} K={in_features} N={out_features} group={c.group_size}")
                 # Fused kernel expects FP8 activation; convert from BF16.
                 x_fp8 = x_pad.to(torch.float8_e4m3fn).contiguous()
