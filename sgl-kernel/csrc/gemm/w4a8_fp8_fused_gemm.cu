@@ -39,16 +39,12 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
   // Shared memory: weight dequant buffer (FP16) + activation tile (FP16)
   __shared__ __half W[kTileN][kTileK];        // 128x128 half = 32KB
   __shared__ __half A[kTileM][kMmaK];          // 128x16 half = 4KB
-  // Output staging: each warp writes its 32x128 sub-result here
-  __shared__ float C_smem[kTileM][kTileN];     // 128x128 float = 64KB
 
   // Each warp handles 32 rows of M
   const int warp_m0 = warp_id * (kTileM / kWarps);  // 0, 32, 64, or 96
 
-  // Initialize output SMEM (all warps participate)
-  for (int i = tid; i < kTileM * kTileN; i += blockDim.x)
-    C_smem[i / kTileN][i % kTileN] = 0.0f;
-  __syncthreads();
+  // Per-warp accumulator: 8 floats for 16×16 MMA output
+  float acc_buf[8];
 
   for (int kb = 0; kb < K; kb += kTileK) {
     // Phase 1: Dequant INT4 -> FP16 into W[][]
@@ -86,10 +82,18 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
       __syncthreads();
 
       // Each warp computes its 32x128 output using m16n16k16 MMA
+      // Accumulators in registers: 2 M-steps × 8 N-steps
       using namespace nvcuda;
       wmma::fragment<wmma::matrix_a, kMmaM, kMmaN, kMmaK, half, wmma::row_major> a_frag;
       wmma::fragment<wmma::matrix_b, kMmaM, kMmaN, kMmaK, half, wmma::col_major> b_frag;
-      wmma::fragment<wmma::accumulator, kMmaM, kMmaN, kMmaK, float> c_frag;
+      wmma::fragment<wmma::accumulator, kMmaM, kMmaN, kMmaK, float> c_frag[2][8];
+
+      // Initialize accumulators for first K-tile
+      if (kb == 0) {
+        for (int ms = 0; ms < 2; ++ms)
+          for (int ns = 0; ns < 8; ++ns)
+            wmma::fill_fragment(c_frag[ms][ns], 0.0f);
+      }
 
       // 2 M-steps (32/16), 8 N-steps (128/16)
       for (int ms = 0; ms < 2; ++ms) {
@@ -97,30 +101,31 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
         for (int ns = 0; ns < 8; ++ns) {
           int wn = n0 + ns * kMmaN;
 
-          // Load A from SMEM
           wmma::load_matrix_sync(a_frag, &A[wm][0], kMmaK);
-          // Load B from SMEM (W is [N][K] row-major; MMA uses col-major B)
           wmma::load_matrix_sync(b_frag, &W[wn][sk], kTileK);
-          // Load accumulator from output SMEM
-          wmma::fill_fragment(c_frag, 0.0f);
-
-          // MMA: C += A * B
-          wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-
-          // Accumulate back to SMEM
-          wmma::store_matrix_sync(&C_smem[wm][wn], c_frag, kTileN, wmma::mem_row_major);
+          // C += A * B
+          wmma::mma_sync(c_frag[ms][ns], a_frag, b_frag, c_frag[ms][ns]);
         }
       }
     }
   }
 
-  // Phase 4: Write output from SMEM to global (BF16)
-  __syncthreads();
-  for (int i = tid; i < kTileM * kTileN; i += blockDim.x) {
-    int m = i / kTileN, n = i % kTileN;
-    int mg = m0 + m, ng = n0 + n;
-    if (mg < M && ng < N)
-      c_bf16[mg * ldc + ng] = __float2bfloat16(C_smem[m][n]);
+  // Phase 4: Write output from accumulators to global memory
+  // Per-warp SMEM staging (4 warps × 16×16 float = 4KB)
+  __shared__ float store_tile[kWarps][kMmaM][kMmaN];
+  for (int ms = 0; ms < 2; ++ms) {
+    int wm = warp_m0 + ms * kMmaM;
+    for (int ns = 0; ns < 8; ++ns) {
+      int wn = n0 + ns * kMmaN;
+      wmma::store_matrix_sync(&store_tile[warp_id][0][0], c_frag[ms][ns], kMmaN, wmma::mem_row_major);
+      // Single-warp copy from SMEM to global (no sync needed — only this warp touches its buffer)
+      for (int i = lane_id; i < kMmaM * kMmaN; i += kWarpSize) {
+        int mi = i / kMmaN, ni = i % kMmaN;
+        int mg = m0 + wm + mi, ng = n0 + wn + ni;
+        if (mg < M && ng < N)
+          c_bf16[mg * ldc + ng] = __float2bfloat16(store_tile[warp_id][mi][ni]);
+      }
+    }
   }
 }
 
