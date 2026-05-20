@@ -981,7 +981,7 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     f.write(f"PRE  M_orig={M_orig} M_pad={M_pad} N={out_features} K={in_features}\n")
                     f.flush()
                 x_fp8 = x_pad.to(torch.float8_e4m3fn).contiguous()
-                result = torch.ops.sgl_kernel.w4a8_fp8_fused_gemm(
+                result = torch.ops.w4a8_fused.w4a8_fp8_fused_gemm(
                     layer._w4a8_qweight,
                     layer._w4a8_qzeros,
                     layer._w4a8_scales,

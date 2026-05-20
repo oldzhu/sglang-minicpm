@@ -131,12 +131,12 @@ torch::Tensor w4a8_fp8_fused_gemm(
 
 }  // namespace sglang
 
-// Python binding
-TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+// Python binding — use unique namespace to avoid conflict with sgl_kernel wheel
+TORCH_LIBRARY_FRAGMENT(w4a8_fused, m) {
   m.def("w4a8_fp8_fused_gemm(Tensor qweight, Tensor qzeros, Tensor scales, "
         "Tensor a_fp8, int N, int K, int group_size) -> Tensor");
 }
 
-TORCH_LIBRARY_IMPL(sgl_kernel, CUDA, m) {
+TORCH_LIBRARY_IMPL(w4a8_fused, CUDA, m) {
   m.impl("w4a8_fp8_fused_gemm", &sglang::w4a8_fp8_fused_gemm);
 }
