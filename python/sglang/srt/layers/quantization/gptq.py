@@ -956,14 +956,18 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         # eliminating the FP8 HBM round-trip and reducing weight bandwidth 2×.
         # CHECKED FIRST — takes priority over old cached FP8 path.
         if getattr(layer, "_soar_w4a8_real_active", False):
+            print(f"[W4A8-ENTER] M={x.size(0)}", flush=True)
             try:
-                import os
+                import os, sys
                 _fused_so = os.environ.get(
                     "SOAR_W4A8_FUSED_SO",
                     "/root/submission_sim/libw4a8_fused_gemm.so")
+                print(f"[W4A8-SO] path={_fused_so} exists={os.path.exists(_fused_so)}", flush=True)
                 if os.path.exists(_fused_so) and not getattr(self, "_fused_so_loaded", False):
+                    print(f"[W4A8-LOAD] loading {_fused_so}", flush=True)
                     torch.ops.load_library(_fused_so)
                     self._fused_so_loaded = True
+                    print(f"[W4A8-LOAD] done", flush=True)
                 M_orig = x.size(0)
                 if M_orig < 64:
                     raise RuntimeError(f"M={M_orig} < 64, falling back")
