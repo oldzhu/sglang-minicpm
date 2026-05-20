@@ -1,0 +1,66 @@
+# Standalone CMakeLists.txt for libw4a8_fused_gemm.so
+#
+# Builds the W4A8 fused INT4→FP8 dequant + tcgen05 QMMA GEMM kernel
+# as an independent .so that can be loaded via torch.ops.load_library().
+#
+# Usage (on fcloud):
+#   mkdir -p /root/standalone_fused/build && cd /root/standalone_fused/build
+#   cmake .. \
+#     -DTorch_DIR=/app/sglang_minicpm_sala_env/lib/python3.10/site-packages/torch/share/cmake/Torch \
+#     -DCMAKE_CUDA_ARCHITECTURES=120 \
+#     -DCMAKE_BUILD_TYPE=Release
+#   cmake --build . -- -j2
+#
+# Then copy to submission_sim:
+#   cp libw4a8_fused_gemm.so /root/submission_sim/
+#
+# IMPORTANT: Requires SM120 (Blackwell). The tcgen05 PTX instructions are
+# only available on compute capability 12.0+. Must compile with
+# -DCMAKE_CUDA_ARCHITECTURES=120 or the build will fail with undefined
+# PTX instruction errors.
+
+cmake_minimum_required(VERSION 3.18)
+project(w4a8_fused_gemm LANGUAGES CXX CUDA)
+
+# Find Torch (required for torch::Tensor, TORCH_CHECK, TORCH_LIBRARY, etc.)
+find_package(Torch REQUIRED)
+
+# CUDA 12.8+ required for tcgen05 PTX instructions
+find_package(CUDA REQUIRED)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+# ---- Source files ----
+# Use the QMMA version (w4a8_fp8_qmma.cu) for SM120 tcgen05 path.
+# Fallback: w4a8_fp8_fused_gemm.cu is the old wmma kernel (148 TFLOPS).
+set(SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/../sgl-kernel/csrc/gemm/w4a8_fp8_qmma.cu
+)
+
+# ---- Build the shared library ----
+add_library(w4a8_fused_gemm SHARED ${SOURCES})
+
+target_include_directories(w4a8_fused_gemm PRIVATE
+    ${Torch_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../sgl-kernel/csrc
+)
+
+target_compile_options(w4a8_fused_gemm PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-arch=sm_120a>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>
+)
+
+target_link_libraries(w4a8_fused_gemm PRIVATE
+    ${TORCH_LIBRARIES}
+    ${CUDA_LIBRARIES}
+    c10
+)
+
+# Set output name
+set_target_properties(w4a8_fused_gemm PROPERTIES
+    OUTPUT_NAME w4a8_fused_gemm
+    PREFIX lib
+    SUFFIX .so
+)

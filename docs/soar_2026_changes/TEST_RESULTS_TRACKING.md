@@ -268,6 +268,22 @@ v19 tarball (uploaded earlier, Apr-20) extracted to `/root/submission_sim_C`; sa
 
 Using Test 12 official score as reference:
 - Performance Score (projected): S1=110.79 (−9.0%), S8=40.51 (−8.1%), Smax=32.67 (−8.9%)
+
+## v26 W4A8 QMMA tcgen05 Results (TBD, new kernel at w4a8_fp8_qmma.cu)
+
+### Accuracy
+
+| Test | Date | Commit | Instance | Config | ori_acc | norm | C | mcq | cwe | fwe | niah | qa | Duration | Speed | Notes |
+|------|------|--------|----------|--------|---------|------|---|-----|-----|-----|------|-----|----------|-------|-------|
+| W4A8-QMMA-v26 | TBD | TBD | TBD | W4A8 tcgen05 QMMA (SOAR_W4A8_REAL_FP8_GEMM=1): GPTQ INT4 + FP8 activations + SM120 tcgen05.mma fused dequant+GEMM at 296 TFLOPS. GPTQ+FP8 KV+dense+compile bs=24+mixed-chunk+Tier1. | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | **Pending build+test on fcloud.** New kernel: sgl-kernel/csrc/gemm/w4a8_fp8_qmma.cu. See CHANGE_W4A8_QMMA_TCGEN05.{en,zh}.md. |
+
+### Speed
+
+| Variant | Duration | vs Test 12 (121.71s) | Notes |
+|---------|----------|----------------------|-------|
+| S1 | TBD | TBD | Concurrency=1, 48 req |
+| S8 | TBD | TBD | Concurrency=8 |
+| Smax | TBD | TBD | No concurrency cap, 96 req |
 - C=1.0 (accuracy 81.07% > 99% normalized)
 - Expected improvement: ~8-9% over Test 12's 56.63 → projected ~61.7
 
