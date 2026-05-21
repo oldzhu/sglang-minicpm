@@ -105,8 +105,8 @@ struct CollectiveBuilderMixedInput<
   static_assert(is_static<TileShape_MNK>::value);
   static_assert(is_static<ClusterShape_MNK>::value);
 
-  static constexpr cute::UMMA::Major UmmaMajorA = detail::sm1xx_tag_to_umma_major_A<GmemLayoutATag>();
-  static constexpr cute::UMMA::Major UmmaMajorB = detail::sm1xx_tag_to_umma_major_B<GmemLayoutBTag>();
+  static constexpr cute::UMMA::Major UmmaMajorA = detail::tag_to_umma_major_A<GmemLayoutATag>();
+  static constexpr cute::UMMA::Major UmmaMajorB = detail::tag_to_umma_major_B<GmemLayoutBTag>();
 
   // No operand swap needed — B is always the narrow one
   static constexpr bool SwapAB = false;
@@ -144,26 +144,39 @@ struct CollectiveBuilderMixedInput<
       Layout<Shape<_2, _2, _1>>,
       Layout<Shape<_1, _1, _1>>>;
 
+  using PermTileM = decltype(cute::min(size<0>(TileShape_MNK{}), _128{}));
+  using PermTileN = decltype(cute::min(size<1>(TileShape_MNK{}),  _32{}));
+
   using TiledMma = decltype(cute::make_tiled_mma(
       cute::rr_op_selector_sm120<ElementAMma, ElementBMma, ElementAccumulator>(),
-      AtomLayoutMNK{}));
+      AtomLayoutMNK{},
+      Tile<PermTileM, PermTileN, _32>{}));
 
   // SMEM capacity for SM120
-  static constexpr int KernelSmemCarveout = 0;  // No extra carveout needed for mixed-input
+  static constexpr int KernelSmemCarveout = 0;  // No extra carveout for mixed-input
   static constexpr int Sm120ReducedSmemCapacityBytes =
       detail::sm120_smem_capacity_bytes - KernelSmemCarveout;
 
-  // Pipeline stages
-  static constexpr int PipelineStages =
-      detail::sm120_compute_stage_count_or_override_mixed_input<
-          Sm120ReducedSmemCapacityBytes,
-          SmemAllocTypeA, SmemAllocTypeB,
-          TileShape_MNK,
-          ElementScale, ElementZero>(StageCountType{});
+  // Pipeline storage
+  using MainloopPipelineStorage = typename cutlass::PipelineTmaUmmaAsync<1>::SharedStorage;
 
-  // Dispatch policy
-  using DispatchPolicy = MainloopSm120TmaRrWarpSpecializedMixedInput<
-      PipelineStages, ClusterShape_MNK, KernelScheduleType>;
+  // Pipeline stages (use standard SM100 stage count for now; mixed-input
+  // tuning can be refined after correctness is confirmed)
+  static constexpr int PipelineStages = detail::sm100_compute_stage_count_or_override<
+      Sm120ReducedSmemCapacityBytes, SmemAllocTypeA,
+      SmemAllocTypeB, TileShape_MNK, MainloopPipelineStorage>(StageCountType{});
+
+  // Dispatch policy — use standard SM120 TMA warp-specialized mainloop
+  // (the mixed-input dequant transform is handled via the ElementPairB tuple)
+  static constexpr bool IsCooperative =
+      !cute::is_base_of_v<KernelTmaWarpSpecializedPingpong, KernelScheduleType>;
+  static constexpr uint32_t SchedulerPipelineStageCount = 2;
+  using KernelSchedule = cute::conditional_t<
+      IsCooperative,
+      KernelTmaWarpSpecializedCooperativeSm120<SchedulerPipelineStageCount>,
+      KernelTmaWarpSpecializedPingpongSm120<SchedulerPipelineStageCount>>;
+  using DispatchPolicy = MainloopSm120TmaWarpSpecialized<
+      PipelineStages, SchedulerPipelineStageCount, ClusterShape_MNK, KernelSchedule>;
 
   // Strides
   using StrideA = cute::conditional_t<
