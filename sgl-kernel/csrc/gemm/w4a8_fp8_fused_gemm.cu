@@ -168,3 +168,4 @@ TORCH_LIBRARY_FRAGMENT(w4a8_fused, m) {
 TORCH_LIBRARY_IMPL(w4a8_fused, CUDA, m) {
   m.impl("w4a8_fp8_fused_gemm", &sglang::w4a8_fp8_fused_gemm);
 }
+
