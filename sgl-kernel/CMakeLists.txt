@@ -296,7 +296,6 @@ set(SOURCES
     "csrc/gemm/fp8_blockwise_gemm_kernel.cu"
     "csrc/gemm/w4a8_fp8_dequant.cu"
     "csrc/gemm/w4a8_fp8_fused_gemm.cu"
-    "csrc/gemm/w4a8_fp8_qmma.cu"
     "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"
     "csrc/gemm/nvfp4_expert_quant.cu"

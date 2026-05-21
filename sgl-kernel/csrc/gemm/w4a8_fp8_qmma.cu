@@ -136,6 +136,8 @@ static constexpr int kSmemTotal = kOffTma + 256;             // 65792 (~64.25 KB
 /// Execute elect_one.sync for the full warp-group (128 threads).
 /// Returns true only for one elected thread.
 /// All 128 threads must call this in lockstep.
+/// REQUIRES: __CUDA_ARCH__ >= 1200 (SM120+)
+#if __CUDA_ARCH__ >= 1200
 __device__ inline bool elect_one_sync_warpgroup() {
   uint32_t elected;
   asm volatile(
@@ -428,6 +430,8 @@ __global__ void w4a8_fp8_qmma_kernel(
     }
   }
 }
+
+#endif  // __CUDA_ARCH__ >= 1200
 
 // ============================================================================
 // Host-side launch function
