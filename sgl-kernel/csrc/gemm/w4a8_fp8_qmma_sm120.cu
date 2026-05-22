@@ -55,7 +55,7 @@ static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 // Non-grouped problem shape: {M, N, K, batch=1}
 using ProblemShape = cute::Shape<int, int, int, int>;
 
-using KernelSchedule   = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
+using KernelSchedule   = cutlass::gemm::KernelTmaWarpSpecialized1SmMixedInputSm100;
 using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
 
 template <typename TileShape, typename ClusterShape>
@@ -127,10 +127,10 @@ torch::Tensor w4a8_fp8_fused_gemm(
   using StrideD = typename GemmConfig::StrideD;
   using StrideS = typename GemmConfig::StrideS;
 
-  auto stride_a = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, Int<1>{}));
-  auto stride_b = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, Int<1>{}));
-  auto stride_d = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, Int<1>{}));
-  auto stride_s = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(K / group_size, N, Int<1>{}));
+  auto stride_a = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+  auto stride_b = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+  auto stride_d = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+  auto stride_s = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(static_cast<int>(K / group_size), static_cast<int>(N), 1));
 
   // Pointers
   auto a_ptr   = static_cast<const MmaType*>(a_fp8.const_data_ptr());
