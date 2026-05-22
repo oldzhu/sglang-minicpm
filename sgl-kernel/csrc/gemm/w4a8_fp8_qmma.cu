@@ -55,7 +55,7 @@ __global__ void w4a8_fp8_qmma_kernel(
     for (int i = tid; i < kTileN * kTileK; i += blockDim.x) {
       int n = i / kTileK, k = i % kTileK;
       int kg = kb + k, ng = n0 + n;
-      __nv_fp8_e4m3 val{0};
+      __nv_fp8_e4m3 val;
       if (kg < K && ng < N) {
         int kp = kg / 8, kbit = (kg % 8) * 4;
         int w4 = (qweight[kp * N + ng] >> kbit) & 0xF;
