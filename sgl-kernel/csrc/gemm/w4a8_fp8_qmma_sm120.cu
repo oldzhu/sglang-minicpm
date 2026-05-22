@@ -48,9 +48,14 @@ using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::ty
 using LayoutB_Transpose = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
 using LayoutC_Transpose = typename cutlass::layout::LayoutTranspose<LayoutC>::type;
 
-static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<MmaType>::value;
-static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<QuantType>::value;
-static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+// TMA requires 128-byte alignment. Use byte-based sizes not bit-based.
+static constexpr int AlignmentA = 128 / static_cast<int>(sizeof(MmaType));   // 128 fp8 elems = 128 bytes
+static constexpr int AlignmentB = 128 / static_cast<int>(sizeof(QuantType)); // 128 int4 elems = 64 bytes but pack
+// Actually need to satisfy: sizeof(float)*Alignment % 128 == 0
+// sizeof(float)=4, so Alignment must be multiple of 32.
+// Use 128 for both.
+static_assert(AlignmentA == 128 && AlignmentB == 128, "TMA alignment check");
+static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;  // 128/16 = 8
 
 // Non-grouped problem shape: {M, N, K, batch=1}
 using ProblemShape = cute::Shape<int, int, int, int>;
