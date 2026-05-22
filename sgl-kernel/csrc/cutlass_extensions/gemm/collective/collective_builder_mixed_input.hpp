@@ -50,4 +50,10 @@ struct CollectiveBuilderMixedInput {
 
 #include "cutlass_extensions/gemm/collective/builders/sm90_gmma_builder_mixed_input.inl"
 #include "cutlass_extensions/gemm/collective/builders/sm120_mixed_input_mma_builder.inl"
+
+// SM120 hardware is backward-compatible with SM100.  Use the NVIDIA SM100
+// mixed-input UMMA builder (which has a proper dequant mainloop) for SM120.
+// The SM120-specific builder above only handles the standard (non-mixed) path.
+#include "cutlass/gemm/collective/builders/sm100_mixed_input_umma_builder.inl"
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
