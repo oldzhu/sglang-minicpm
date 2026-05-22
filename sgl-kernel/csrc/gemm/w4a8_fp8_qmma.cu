@@ -65,7 +65,8 @@ __global__ void w4a8_fp8_qmma_kernel(
           z4 = ((qzeros[gid * (N / 8) + zn] >> zb) & 0xF) + 1;
         }
         float fv = ((float)w4 - (float)z4) * scales[gid * N + ng];
-        val = __nv_cvt_float_to_fp8(fv, __NV_SATFINITE, __NV_E4M3);
+        val = static_cast<__nv_fp8_e4m3>(
+            __nv_cvt_float_to_fp8(fv, __NV_SATFINITE, __NV_E4M3));
       }
       W_fp8[n * kTileK + k] = val;
     }
