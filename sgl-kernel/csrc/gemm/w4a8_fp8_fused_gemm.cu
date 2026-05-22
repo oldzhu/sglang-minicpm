@@ -57,14 +57,18 @@ __global__ void w4a8_fp8_fused_gemm_kernel(
       int n = i / kTileK, k = i % kTileK;
       int kg = kb + k, ng = n0 + n;
       if (kg < K && ng < N) {
-        int kp = kg / 8, kbit = (kg % 8) * 4;
-        int w4 = (qweight[kp * N + ng] >> kbit) & 0xF;
+        // GPTQ standard format: qweight has shape [K, N/8], each int32
+        // packs 8 4-bit values along the N dimension (not K dimension).
+        int np = ng / 8, nbit = (ng % 8) * 4;
+        int w4 = (qweight[kg * (N / 8) + np] >> nbit) & 0xF;
         int gid = kg / group;
         int z4 = 0;
         if (qzeros != nullptr) {
+          // qzeros has shape [K/group, N/8], also packs along N dimension.
           int zn = ng / 8, zb = (ng % 8) * 4;
           z4 = ((qzeros[gid * (N / 8) + zn] >> zb) & 0xF) + 1;
         }
+        // scales has shape [K/group, N] (no packing along N).
         float v = ((float)w4 - (float)z4) * scales[gid * N + ng];
         W[n][k] = __float2half(v);
       } else {
