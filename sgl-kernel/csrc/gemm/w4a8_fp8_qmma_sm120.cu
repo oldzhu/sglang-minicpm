@@ -56,7 +56,7 @@ static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 using ProblemShape = cute::Shape<int, int, int, int>;
 
 using KernelSchedule   = cutlass::gemm::KernelTmaWarpSpecialized1SmMixedInputSm100;
-using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
+using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized1Sm;
 
 template <typename TileShape, typename ClusterShape>
 struct sm120_qmma_w4a8_gemm {
