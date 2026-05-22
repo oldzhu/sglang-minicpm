@@ -47,6 +47,7 @@ using LayoutC = cutlass::layout::RowMajor;
 using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
 using LayoutB_Transpose = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
 using LayoutC_Transpose = typename cutlass::layout::LayoutTranspose<LayoutC>::type;
+using LayoutScale = cutlass::layout::RowMajor;  // scales: [K/g, N] row-major
 
 // TMA requires 128-byte alignment. Use byte-based sizes not bit-based.
 static constexpr int AlignmentA = 128 / static_cast<int>(sizeof(MmaType));   // 128 fp8 elems = 128 bytes
@@ -78,15 +79,16 @@ struct sm120_qmma_w4a8_gemm {
       ElementD, LayoutC_Transpose*, AlignmentC,
       EpilogueSchedule>::CollectiveOp;
 
-  // SM100 specialization is for CollectiveBuilder (NOT CollectiveBuilderMixedInput).
-  // ElementA = narrow/tuple type (our INT4 weights + scales).
-  // ElementB = wide type (our FP8 activations).
+  // SM100 specialization: CollectiveBuilder (NOT CollectiveBuilderMixedInput).
+  // ElementA tuple = (weight_type, scale_type, zero_type).
+  // GmemLayoutA tuple = (weight_layout*, scale_layout*). [SM100 maps: A=weights+scales]
+  // ElementB = wide type (FP8 activation). GmemLayoutB = activation layout*.
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       ArchTag, OperatorClass,
-      cute::tuple<QuantType, ElementScalePacked>,  // ElementA: tuple(INT4, scale)
-      LayoutB_Transpose*, AlignmentB,               // Layout for B (weights)
-      MmaType,                                       // ElementB: FP8 activation
-      LayoutA_Transpose*, AlignmentA,               // Layout for A (activations)
+      cute::tuple<QuantType, ElementScalePacked>,              // ElementA: tuple(INT4, packed_scale)
+      cute::tuple<LayoutB_Transpose*, LayoutScale*>, AlignmentB, // LayoutA: tuple(weight_layout*, scale_layout*)
+      MmaType,                                                   // ElementB: FP8 activation
+      LayoutA_Transpose*, AlignmentA,                            // LayoutB: activation layout*
       ElementAccumulator,
       TileShape, ClusterShape,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
