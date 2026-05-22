@@ -78,12 +78,15 @@ struct sm120_qmma_w4a8_gemm {
       ElementD, LayoutC_Transpose*, AlignmentC,
       EpilogueSchedule>::CollectiveOp;
 
-  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilderMixedInput<
+  // SM100 specialization is for CollectiveBuilder (NOT CollectiveBuilderMixedInput).
+  // ElementA = narrow/tuple type (our INT4 weights + scales).
+  // ElementB = wide type (our FP8 activations).
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       ArchTag, OperatorClass,
-      cute::tuple<QuantType, ElementScalePacked>,
-      LayoutB_Transpose*, AlignmentB,
-      MmaType,
-      LayoutA_Transpose*, AlignmentA,
+      cute::tuple<QuantType, ElementScalePacked>,  // ElementA: tuple(INT4, scale)
+      LayoutB_Transpose*, AlignmentB,               // Layout for B (weights)
+      MmaType,                                       // ElementB: FP8 activation
+      LayoutA_Transpose*, AlignmentA,               // Layout for A (activations)
       ElementAccumulator,
       TileShape, ClusterShape,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
