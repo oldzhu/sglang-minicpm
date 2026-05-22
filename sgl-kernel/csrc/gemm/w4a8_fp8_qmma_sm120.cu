@@ -94,7 +94,7 @@ struct sm120_qmma_w4a8_gemm {
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       ArchTag, OperatorClass,
       cute::tuple<QuantType, ElementScalePacked>,          // ElementA: (INT4, packed_scale)
-      cute::tuple<LayoutB_Transpose, LayoutScale>, AlignmentB, // LayoutA: (weight_layout, scale_layout)
+      cute::tuple<LayoutB_Transpose, void>, AlignmentB, // LayoutA: (weight_layout, void=no-scale-layout)
       MmaType,                                               // ElementB: FP8 activation
       LayoutA_Transpose*, AlignmentA,                        // LayoutB: activation layout pointer
       ElementAccumulator,
