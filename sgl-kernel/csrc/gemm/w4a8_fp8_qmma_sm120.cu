@@ -65,8 +65,8 @@ static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;  
 // Problem shape: {M, N, K, batch=1} for non-grouped GEMM
 using ProblemShape = cute::Shape<int, int, int, int>;
 
-// SM100 mixed-input schedule (must derive from KernelScheduleSm100MixedInputGemm)
-using KernelSchedule   = cutlass::gemm::KernelTmaWarpSpecialized1SmMixedInputSm100;
+// SM100 mixed-input schedule
+using KernelSchedule   = cutlass::gemm::KernelTmaWarpSpecializedMixedInputSmemSm100;
 using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized1Sm;
 
 // --- Kernel template ---
@@ -99,8 +99,7 @@ struct sm120_qmma_w4a8_gemm {
       LayoutA_Transpose*, AlignmentA,                        // LayoutB: activation layout pointer
       ElementAccumulator,
       TileShape, ClusterShape,
-      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
-          sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      cutlass::gemm::collective::StageCount<3>,
       KernelSchedule>::CollectiveOp;
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
