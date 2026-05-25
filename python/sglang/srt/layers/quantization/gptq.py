@@ -961,8 +961,10 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                     torch.ops.load_library(_fused_so)
                     self._fused_so_loaded = True
                 M_orig = x.size(0)
-                if M_orig < 64:
-                    raise RuntimeError(f"M={M_orig} < 64, falling back")
+                # With padding, even M=1 works (padded to 128).
+                # Only reject M=0 (should never happen in practice).
+                if M_orig <= 0:
+                    raise RuntimeError(f"M={M_orig} <= 0, falling back")
                 M_pad = ((M_orig + 127) // 128) * 128
                 if M_pad != M_orig:
                     x_pad = torch.nn.functional.pad(x, (0, 0, 0, M_pad - M_orig))
