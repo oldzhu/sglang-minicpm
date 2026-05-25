@@ -24,6 +24,7 @@ static constexpr int kMmaN = 8;
 static constexpr int kMmaK = 32;
 static constexpr int kWarpSize = 32;
 static constexpr int kWarps = 4;
+static constexpr int kWPadN = 24;  // extra N padding for B fragment over-read
 
 __global__ void w4a8_fp8_qmma_kernel(
     const int32_t* __restrict__ qweight,
