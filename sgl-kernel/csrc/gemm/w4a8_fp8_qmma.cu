@@ -80,6 +80,15 @@ __global__ void w4a8_fp8_qmma_kernel(
     }
     __syncthreads();
 
+    // DIAGNOSTIC: print SMEM byte values for thread 0, block (0,0), first kb
+    if (tid == 0 && mb == 0 && nb == 0 && kb == 0) {
+      uint8_t wb, ab;
+      memcpy(&wb, &W_fp8[0], 1);
+      memcpy(&ab, &A_fp8_smem[0], 1);
+      printf("[DIAG] W_fp8[0]=0x%02x(%g) A_fp8_smem[0]=0x%02x(%g)\n",
+             (unsigned)wb, (float)W_fp8[0], (unsigned)ab, (float)A_fp8_smem[0]);
+    }
+
     // Phase 3: FP8 warp-level mma.sync m16n8k32
     for (int sk = 0; sk < kTileK; sk += kMmaK) {
       for (int ms = 0; ms < 2; ++ms) {
@@ -125,6 +134,12 @@ __global__ void w4a8_fp8_qmma_kernel(
       }
     }
     __syncthreads();
+  }
+
+  // DIAGNOSTIC: print accumulator for thread 0, block (0,0)
+  if (tid == 0 && mb == 0 && nb == 0) {
+    printf("[DIAG] c_regs[ms=0][ns=0] = {%g,%g,%g,%g} (expect 768 each)\n",
+           c_regs[0][0][0], c_regs[0][0][1], c_regs[0][0][2], c_regs[0][0][3]);
   }
 
   // Epilogue: accumulators -> BF16
