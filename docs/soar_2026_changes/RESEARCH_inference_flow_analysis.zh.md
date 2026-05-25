@@ -1,398 +1,166 @@
-# MiniCPM-SALA Inference Flow Analysis
-## SOAR 2026 — Kernel Optimization Roadmap
+# MiniCPM-SALA 推理流程分析
+## SOAR 2026 — 内核优化路线图
 
-**Date**: 2026-05-25 | **Model**: MiniCPM-SALA-90B (GPTQ INT4, dense mode)  
-**Baseline Config**: GPTQ (sparse_qkv_w8) + FP8 KV cache + `--force-dense-minicpm`
+**日期**: 2026-05-25 | **模型**: MiniCPM-SALA-90B (GPTQ INT4, dense mode)  
+**基线配置**: GPTQ (sparse_qkv_w8) + FP8 KV cache + `--force-dense-minicpm`
 
 ---
 
-## 1. Model Architecture Summary
+## 1. 模型架构总览
 
-### 1.1 Global Dimensions
+### 1.1 全局参数
 
-| Parameter | Value |
-|-----------|-------|
-| `num_hidden_layers` | **32** |
-| `hidden_size` (D) | **4096** |
-| `num_attention_heads` (Q heads) | **32** |
-| `num_key_value_heads` (KV heads) | **8** (GQA ratio = 4:1) |
-| `head_dim` | **128** (= 4096/32) |
-| `intermediate_size` (MLP hidden) | **14336** |
-| `vocab_size` | **150528** |
+| 参数 | 值 |
+|------|-----|
+| `num_hidden_layers`（总层数） | **32** |
+| `hidden_size`（隐藏维度 D） | **4096** |
+| `num_attention_heads`（Q 头数） | **32** |
+| `num_key_value_heads`（KV 头数） | **8**（GQA 比率 = 4:1） |
+| `head_dim`（每头维度） | **128**（= 4096/32） |
+| `intermediate_size`（MLP 中间层） | **14336** |
+| `vocab_size`（词表大小） | **150528** |
 
-### 1.2 Layer Type Distribution
+### 1.2 层类型分布
 
-| Mixer Type | Count | Class | KV Cache? | Attention Type |
-|------------|-------|-------|-----------|----------------|
-| `minicpm4` (sparse) | **8 layers** | `MiniCPMAttention` | ✅ Paged KV | Sparse/dense attention |
-| `lightning` (linear) | **24 layers** | `MiniCPMLightningMixer` | ❌ Recurrent state | Linear (GLA) attention |
+> **关键澄清**: `--force-dense-minicpm` **不会**把 lightning 层转换为标准 attention。
+> 它仅设置 `model_config.has_sparse_attention=False` 和 `sparse_layer_ids=[]`，
+> 影响的是 `MiniCPMAttention` 内部的 attention 路由（sparse→dense FA3）。
+> 层的 MODULE CLASS 由 `config.mixer_types[layer_id]` 在初始化时决定，
+> 完全独立于 `--force-dense-minicpm`。
+> 24 个 lightning 层始终使用 `MiniCPMLightningMixer`（GLA 循环注意力）。
 
-**Lightning layer sub-config** (`config.lightning_*`):
-| Parameter | Value |
-|-----------|-------|
-| `lightning_nh` (heads) | **16** |
-| `lightning_nkv` (KV heads) | **16** |
+| Mixer 类型 | 数量 | 模块类 | KV Cache? | 当前 Attention 类型 |
+|------------|------|--------|-----------|---------------------|
+| `minicpm4` | **8 层** | `MiniCPMAttention` | ✅ Paged KV | Dense FA3（因 force_dense） |
+| `lightning` | **24 层** | `MiniCPMLightningMixer` | ❌ 循环状态 | GLA chunk/recurrent |
+
+### 1.3 Lightning 层子配置
+
+| 参数 | 值 |
+|------|-----|
+| `lightning_nh`（heads） | **16** |
+| `lightning_nkv`（KV heads） | **16** |
 | `lightning_head_dim` | **64** |
 
-**Key**: Lightning layers use **recurrent state** (no KV cache), while sparse layers use **paged KV cache**. Lightning layers have different head dimensions (64 vs 128) and different quantization paths.
-
-### 1.3 Quantization Layout
-
-All linear layers use **GPTQ INT4** (4-bit, `group_size=128`, symmetric, `desc_act=False`). Weight storage per layer:
-
-| Projection | Shape (in×out) | Storage (INT4) |
-|------------|-------------------|----------------|
-| **Sparse: QKV** | 4096 × (32×128 + 2×8×128) = 4096 × 6144 | ~3.1 MB |
-| **Sparse: O** | 4096 × 4096 | ~2.0 MB |
-| **Sparse: Gate-Up** | 4096 × (2×14336) = 4096 × 28672 | ~14.3 MB |
-| **Sparse: Down** | 14336 × 4096 | ~14.3 MB |
-| **Lightning: QKV** | 4096 × (16×64 + 2×16×64) = 4096 × 3072 | ~1.5 MB |
-| **Lightning: O** | 1024 × 4096 | ~0.5 MB |
-| **Lightning: Z (gate)** | 4096 × 1024 (if enabled) | ~0.5 MB |
-
 ---
 
-## 2. Per-Layer Forward Pass Trace
+## 2. 关键澄清：QKV/O 的 "sparse only" 问题
 
-### 2.1 Sparse Attention Layer (`minicpm4`, 8 layers)
+### 2.1 `--force-dense-minicpm` 做了什么？
 
-The `MiniCPMDecoderLayer.forward()` executes:
-
-```
-Input: hidden_states [B×T, 4096], residual, positions, forward_batch
-
-Step 1: INPUT LAYERNORM + RESIDUAL
-├─ hidden_states, residual = input_layernorm(hidden_states, residual)
-│  └─ Op: RMSNorm(4096), element-wise, ~32K FLOPs/token
-│  └─ In-place residual add: residual += hidden_states (fused)
-
-Step 2: QKV PROJECTION (MATMUL — HEAVY)
-├─ qkv, _ = qkv_proj(hidden_states)
-│  └─ Op: Linear(4096 → 6144), GPTQ INT4
-│  └─ Kernel: GPTQ Marlin (default, 148 TFLOPS) or W4A8 FP8 fused (if enabled)
-│  └─ FLOPs: 2 × 4096 × 6144 ≈ 50M FLOPs/token
-│  └─ W4A8 eligible: YES ✅
-
-Step 3: SPLIT Q/K/V
-├─ q, k, v = qkv.split([4096, 1024, 1024], dim=-1)
-│  └─ Op: Split tensor (view/reshape, zero FLOPs)
-
-Step 4: ROPE (if attn_use_rope=True)
-├─ q, k = rotary_emb(positions, q, k)
-│  └─ Op: RoPE (YaRN variant), ~2 × 4096 × 128 ≈ 1M FLOPs/token
-│  └─ Can use fused_qk_norm_rope kernel if enabled
-
-Step 5: ATTENTION COMPUTE (HEAVY)
-├─ attn_output = self_attn(q, k, v, forward_batch)
-│  └─ RadixAttention dispatches to MiniCPMBackend:
-│
-│  [PREFILL path]:
-│  ├─ Dense (seq_len < dense_len threshold): FlashAttention v3
-│  │  └─ FLOPs: O(T² × head_dim), memory-bound for long T
-│  │
-│  ├─ Sparse (seq_len ≥ dense_len): MiniCPM sparse attention
-│  │  └─ TopK selection + compressed K1/K2 + sparse_kernel_extension
-│  │  └─ Currently FORCE_DENSE = 1, so this path is SKIPPED
-│  │
-│  [DECODE path]:
-│  └─ FlashAttention v3 decode (1 token × KV cache)
-│     └─ FLOPs: O(T_cache × head_dim) per head = ~128K FLOPs
-
-Step 6: OUTPUT GATE (if use_output_gate)
-├─ o_gate_output = sigmoid(o_gate(hidden_states))
-│  └─ Op: Linear(4096→4096) + sigmoid, GPTQ INT4
-│  └─ NOT W4A8 eligible
-├─ attn_output *= o_gate_output
-
-Step 7: O PROJECTION (MATMUL — HEAVY)
-├─ output, _ = o_proj(attn_output)
-│  └─ Op: Linear(4096 → 4096), GPTQ INT4
-│  └─ Kernel: GPTQ Marlin or W4A8 FP8 fused
-│  └─ FLOPs: 2 × 4096 × 4096 ≈ 33M FLOPs/token
-│  └─ W4A8 eligible: YES ✅
-
-Step 8: RESIDUAL SCALE
-├─ hidden_states *= residual_scale  (depth-dependent, ~0.18)
-
-Step 9: POST-ATTN LAYERNORM + RESIDUAL
-├─ hidden_states, residual = post_attention_layernorm(hidden_states, residual)
-│  └─ Op: RMSNorm(4096)
-
-Step 10: MLP GATE-UP PROJECTION (MATMUL — HEAVIEST)
-├─ gate_up, _ = gate_up_proj(hidden_states)
-│  └─ Op: Linear(4096 → 28672), GPTQ INT4
-│  └─ FLOPs: 2 × 4096 × 28672 ≈ 235M FLOPs/token  ← LARGEST SINGLE OP
-│  └─ W4A8 eligible: YES ✅
-
-Step 11: SILU GATE + MULTIPLY
-├─ x = SiluAndMul(gate_up)
-│  └─ Op: Split → siLU(gate) × up, fused
-│  └─ FLOPs: ~29K FLOPs/token (negligible vs matmuls)
-
-Step 12: MLP DOWN PROJECTION (MATMUL — HEAVY)
-├─ x, _ = down_proj(x)
-│  └─ Op: Linear(14336 → 4096), GPTQ INT4
-│  └─ FLOPs: 2 × 14336 × 4096 ≈ 117M FLOPs/token
-│  └─ W4A8 eligible: YES ✅
-
-Step 13: RESIDUAL SCALE + OUTPUT
-├─ hidden_states *= residual_scale
-└─ Return (hidden_states, residual)
-```
-
-**Sparse layer FLOPs per token (decode)**:
-| Op | FLOPs | % Total |
-|----|-------|---------|
-| Gate-Up matmul | 235M | 54% |
-| Down matmul | 117M | 27% |
-| QKV matmul | 50M | 11% |
-| O matmul | 33M | 8% |
-| **Total** | **~435M** | 100% |
-
-### 2.2 Lightning Attention Layer (`lightning`, 24 layers)
-
-```
-Input: hidden_states [B×T, 4096], residual, positions, forward_batch
-
-Step 1: INPUT LAYERNORM + RESIDUAL
-├─ Same as sparse layer (RMSNorm)
-
-Step 2: QKV PROJECTION (MATMUL)
-├─ qkv, _ = qkv_proj(hidden_states)
-│  └─ Op: Linear(4096 → 3072), GPTQ INT4
-│  └─ lightning_nh=16, head_dim=64, kv_heads=16
-│  └─ Q: 16×64=1024, K: 16×64=1024, V: 16×64=1024
-│  └─ FLOPs: 2 × 4096 × 3072 ≈ 25M FLOPs/token
-│  └─ W4A8 eligible: ❌ NO (stays on Marlin BF16)
-
-Step 3: Q/K NORM + ROPE (fused if enabled)
-├─ q, k, v = _apply_qk_norm_rope(qkv, positions)
-│  ├─ q_norm: RMSNorm(64) per head
-│  ├─ k_norm: RMSNorm(64) per head
-│  └─ RoPE: rotary embedding
-│  └─ Can use fused_qk_norm_rope CUDA kernel (enabled)
-
-Step 4: RESHAPE FOR BACKEND
-├─ Reshape to 4D: (B×T, heads, head_dim) → (1, B×T, heads, head_dim)
-
-Step 5: LINEAR ATTENTION (GLA KERNEL - HEAVY)
-├─ o = linear_attn_backend.forward(q, k, v, forward_batch, layer_id)
-│
-│  [PREFILL/EXTEND]:
-│  └─ chunk_simple_gla(q, k, v, ...)
-│     └─ FLA kernel: chunked GLA with chunk_size=64
-│     └─ FLOPs: O(T × heads × head_dim²)
-│
-│  [DECODE]:
-│  └─ fused_recurrent_simple_gla(q, k, v, ...)
-│     └─ FLA kernel: recurrent GLA update
-│     └─ FLOPs: O(heads × head_dim²) per token ≈ 16×64×64 ≈ 65K
-│     └─ Much cheaper than sparse attention decode!
-
-Step 6: OUTPUT EPILOGUE
-├─ o = _apply_output_epilogue(o, hidden_states)
-│  ├─ o_norm: RMSNorm(1024) if enabled
-│  ├─ Gate: z = sigmoid(z_proj(hidden_states)), o *= z  (if enabled)
-│  │  └─ z_proj: Linear(4096→1024), NOT W4A8 eligible
-│  └─ o_proj: Linear(1024 → 4096), NOT W4A8 eligible
-│
-Step 7-9: MLP (same as sparse layer)
-├─ gate_up_proj + SiLU + down_proj
-└─ Same dimensions: 4096→28672→4096
-   └─ W4A8 eligible: YES ✅ (MLP linears ARE tagged)
-```
-
-**Lightning layer FLOPs per token (decode)**:
-| Op | FLOPs | % Total |
-|----|-------|---------|
-| Gate-Up matmul | 235M | 62% |
-| Down matmul | 117M | 31% |
-| QKV matmul | 25M | 7% |
-| GLA compute | ~65K | <1% |
-| O proj | 8M | 2% |
-| **Total** | **~385M** | 100% |
-
----
-
-## 3. W4A8 Fused Kernel Integration
-
-### 3.1 Call Sites
-
-The W4A8 fused kernel (`torch.ops.w4a8_fused.w4a8_fp8_fused_gemm`) is called from a **SINGLE** location:
-
-**File**: `python/sglang/srt/layers/quantization/gptq.py`  
-**Method**: `GPTQMarlinLinearMethod.apply()` (line ~951)
-
-**Activation flow**:
-```
-GPTQMarlinLinearMethod.apply(layer, x)
-├─ if layer._soar_w4a8_real_active AND M >= 64:
-│  ├─ Pad x to M%128==0
-│  ├─ Convert x to FP8 e4m3
-│  ├─ torch.ops.w4a8_fused.w4a8_fp8_fused_gemm(
-│  │    layer._w4a8_qweight,    # INT4 weights (original GPTQ format)
-│  │    layer._w4a8_qzeros,     # INT4 zero points
-│  │    layer._w4a8_scales,     # BF16 scales
-│  │    x_fp8,                  # FP8 input
-│  │    out_features, in_features, group_size)
-│  └─ Unpad result, convert to input dtype
-│
-├─ elif layer._soar_w4a8_active:
-│  └─ cutlass_w8a8_block_fp8_linear (old W8A8, doubled HBM)
-│
-└─ else:
-   └─ Standard GPTQ Marlin (Marlin repack + cuBLAS GEMM)
-```
-
-### 3.2 Eligible Layers
-
-| Layer Type | Projection | Shape | W4A8? | Status |
-|------------|-----------|-------|-------|--------|
-| **Sparse Attn** | QKV | 4096×6144 | ✅ | Kernel ready, M%128 issue |
-| **Sparse Attn** | O | 4096×4096 | ✅ | Kernel ready, M%128 issue |
-| **Sparse MLP** | Gate-Up | 4096×28672 | ✅ | Kernel ready, M%128 issue |
-| **Sparse MLP** | Down | 14336×4096 | ✅ | Kernel ready, M%128 issue |
-| Lightning Attn | QKV | 4096×3072 | ❌ | Not tagged |
-| Lightning Attn | O | 1024×4096 | ❌ | Not tagged |
-| Lightning Attn | Z (gate) | 4096×1024 | ❌ | Not tagged |
-| Lightning MLP | Gate-Up | 4096×28672 | ✅ | Same as sparse |
-| Lightning MLP | Down | 14336×4096 | ✅ | Same as sparse |
-
-**Total W4A8-eligible projections**: 8 (sparse attn) + 2 (MLP × 24 lightning) + 2 (MLP × 8 sparse) = **4 per attention layer** × 8 sparse + **2 per MLP** × 32 all layers = 32 + 64 = 96 projections total.
-
-But MLP dimensions are SAME across all 32 layers, so the W4A8 kernel handles:
-- **Gate-Up**: 4096×28672 — this is the single biggest op (54-62% of layer FLOPs)
-- **Down**: 14336×4096
-- **QKV (sparse only)**: 4096×6144
-- **O (sparse only)**: 4096×4096
-
-### 3.3 Current Blocker: M % 128 == 0
-
-The fused FP8 MMA kernel requires `M % 128 == 0`:
-- **Decode**: M=1-24 (batch sizes for CUDA graph) → kernel REFUSED, falls back to Marlin
-- **Prefill**: M=prompt_length (typically 100-10000+) → kernel WORKS for most prefill batches
-
-### 3.4 Padding Strategy
-
-`gptq.py` already implements M-padding:
+`--force-dense-minicpm` 仅影响以下两处（见 `model_config.py` line 238-248）：
 ```python
-M_pad = ((M_orig + 127) // 128) * 128  # Round up to 128
-if M_pad != M_orig:
-    x_pad = torch.nn.functional.pad(x, (0, 0, 0, M_pad - M_orig))
+@property
+def has_sparse_attention(self):
+    return getattr(self.hf_config, "has_sparse_attention", False) \
+           if not self.force_dense_minicpm else False  # ← 强制返回 False
+
+@property
+def sparse_layer_ids(self):
+    return getattr(self.hf_config, "sparse_layer_ids", []) \
+           if not self.force_dense_minicpm else []   # ← 强制返回 []
 ```
-But the kernel's `TORCH_CHECK(M % kTileM == 0)` REJECTS small M before padding can even be applied (the check is inside the kernel, and the kernel requires M ≥ 64).
+
+它**不改变** `MiniCPMDecoderLayer.__init__` 中的模块类选择逻辑：
+```python
+if self.mixer_type == "minicpm4":
+    self.self_attn = MiniCPMAttention(...)        # ← 8 层
+elif self.mixer_type in ["lightning", ...]:
+    self.self_attn = MiniCPMLightningMixer(...)    # ← 24 层
+```
+
+### 2.2 为什么 QKV/O 仅 sparse 层可用 W4A8？
+
+- `MiniCPMAttention.__init__` 设置 `self.qkv_proj._soar_w4a8_eligible = True`（line 235-236）
+- `MiniCPMLightningMixer.__init__` **不设置**此标记（line ~330-350）
+- `--force-dense-minicpm` 不改变模块类 → 24 个 lightning 层仍使用 `MiniCPMLightningMixer` → QKV/O 不标记
+
+### 2.3 Sparse vs Lightning — QKV/O 维度差异
+
+| | Sparse Attn（8 层） | Lightning Attn（24 层） |
+|---|---|---|
+| **模块类** | `MiniCPMAttention` | `MiniCPMLightningMixer` |
+| **Q heads × dim** | 32 × 128 = **4096** | 16 × **64** = **1024** |
+| **KV heads × dim** | 8 × 128 = **1024** | 16 × 64 = **1024** |
+| **QKV proj 形状** | 4096 → **6144** | 4096 → **3072** |
+| **O proj 形状** | **4096** → 4096 | **1024** → 4096 |
+| **W4A8 可用?** | ✅ Yes | ❌ No（未标记） |
+| **Attention 内核** | FA3（dense） | FLA GLA chunk/recurrent |
+| **KV Cache?** | ✅ Paged KV（FP8 e5m2） | ❌ 循环状态 |
+
+### 2.4 MLP 线形层不受影响
+
+MLP 线形层（gate_up_proj, down_proj）在所有 32 层使用相同的 `MiniCPMMLP` 类，
+该类在 line 151-152 设置 `_soar_w4a8_eligible = True`。所以 MLP 的 W4A8 覆盖全部 32 层。
 
 ---
 
-## 4. Op Inventory & Optimization Targets
+## 3. 逐层前向传播与操作清单
 
-### 4.1 Matmul Ops (Ranked by FLOPs Impact)
+### 3.1 Sparse Attention 层前向传播
 
-| Rank | Op | FLOPs/token | % Total | W4A8? | Optimization |
-|------|-----|-------------|---------|-------|--------------|
-| **1** | **Gate-Up MLP** | 235M | 54-62% | ✅ | FP8 `mma.sync` 296 TFLOPS (current: BF16 148 TFLOPS) |
-| **2** | **Down MLP** | 117M | 27-31% | ✅ | Same as above |
-| 3 | QKV Sparse | 50M | 11% | ✅ | Small op, marginal gain |
-| 4 | O Sparse | 33M | 8% | ✅ | Small op |
-| 5 | QKV Lightning | 25M | 7% | ❌ | Marlin BF16 only |
-| 6 | O Lightning | 8M | 2% | ❌ | Negligible |
+```
+输入: hidden_states [B×T, 4096]
 
-**Key insight**: The Gate-Up MLP projection alone accounts for >50% of all FLOPs. Optimizing just this ONE op to FP8 `mma.sync` (296 TFLOPS) would give the largest speedup.
+├─ RMSNorm (32K FLOPs)
+├─ QKV: Linear(4096→6144) = 50M FLOPs  ← W4A8 ✅
+├─ RoPE (~1M FLOPs, fused)
+├─ Attention: FA3 dense decode (~128K FLOPs, 内存受限)
+├─ O: Linear(4096→4096) = 33M FLOPs     ← W4A8 ✅
+├─ Gate-Up: Linear(4096→28672) = 235M   ← W4A8 ✅  **最大操作**
+├─ SiLU × Up (融合)
+├─ Down: Linear(14336→4096) = 117M      ← W4A8 ✅
+└─ × residual_scale
+```
 
-### 4.2 Attention Ops
+**Sparse 层 FLOPs 占比（decode）**: Gate-Up 54% > Down 27% > QKV 11% > O 8%
 
-| Op | Kernel | Prefill Cost | Decode Cost | Optimizable? |
-|----|--------|-------------|-------------|--------------|
-| Sparse attn (prefill) | FlashAttention v3 | O(T²d) | N/A | (already fast) |
-| Sparse attn (decode) | FA3 decode | O(T_cache × d) | ~128K FLOPs | Memory-bound, not compute-bound |
-| Lightning attn (prefill) | `chunk_simple_gla` (FLA) | O(Td²) | N/A | FLA kernel (C++/CUDA) |
-| Lightning attn (decode) | `fused_recurrent_simple_gla` | N/A | ~65K FLOPs | Very cheap |
+### 3.2 Lightning Attention 层前向传播
 
-**Key insight**: Attention ops are **memory-bound** or very cheap. They are NOT the bottleneck for speed optimization at current stage.
+```
+输入: hidden_states [B×T, 4096]
 
-### 4.3 Norm & Activation Ops
+├─ RMSNorm
+├─ QKV: Linear(4096→3072) = 25M FLOPs   ← Marlin BF16 only ❌
+├─ QK Norm + RoPE (fused)
+├─ GLA recurrent decode (~65K FLOPs)     ← 极快
+├─ O proj + gate
+├─ Gate-Up: Linear(4096→28672) = 235M   ← W4A8 ✅  **最大操作**
+├─ SiLU × Up (融合)
+├─ Down: Linear(14336→4096) = 117M      ← W4A8 ✅
+└─ × residual_scale
+```
 
-| Op | Cost | Optimizable? |
-|----|------|-------------|
-| RMSNorm (×2 per layer) | ~32K FLOPs each | Negligible, already fused |
-| SiLU+Mul (SiluAndMul) | ~29K FLOPs | Fused, negligible |
-| RoPE (Q & K) | ~1M FLOPs | `fused_qk_norm_rope` already enabled |
-| Q/K Norm (lightning) | ~1K FLOPs | Fused in `fused_qk_norm_rope` |
-| Residual scale | 1 multiply | Negligible |
-
-### 4.4 Fused Kernels Already Active
-
-| Kernel | Layer Type | Enabled? | Impact |
-|--------|-----------|----------|--------|
-| `fused_qk_norm_rope` | Both | ✅ Yes | Fuses Q/K norm + RoPE, reduces kernel launches |
-| `lightning_fast_state_io` | Lightning | ✅ Yes | Fast recurrent state save/load |
-| `lightning_fast_output_gate` | Lightning | ✅ Yes | Fused output gate + sigmoid |
-| Marlin GPTQ | All linears | ✅ Yes (baseline) | 148 TFLOPS INT4 GEMM |
-| W4A8 FP8 fused | Sparse attn + MLP | 🔧 WIP | 296 TFLOPS target |
+**Lightning 层 FLOPs 占比（decode）**: Gate-Up 62% > Down 31% > QKV 7% > O 2%
 
 ---
 
-## 5. Optimization Strategy Recommendation
+## 4. 优化目标优先级
 
-### 5.1 Phase 1: Get W4A8 Fused Kernel Working (Current)
+| 排名 | 操作 | FLOPs/token | 覆盖范围 | W4A8? | 预估收益 |
+|------|------|-------------|----------|-------|----------|
+| **1** | Gate-Up MLP | 235M | 全部 32 层 | ✅ | 2× 矩阵乘法加速 |
+| **2** | Down MLP | 117M | 全部 32 层 | ✅ | 2× 矩阵乘法加速 |
+| 3 | QKV (sparse) | 50M | 8 层 | ✅ | 小 |
+| 4 | O (sparse) | 33M | 8 层 | ✅ | 小 |
 
-**Approach**: Fix M%128 tile restriction in `w4a8_fp8_qmma.cu`:
+### 4.1 当前已启用的融合内核
 
-Option A: **Add boundary masking** — Process full 128×128 tiles with masking for partial M
-Option B: **Add smaller tile dispatch** — Use m16n8k32 with padding for M < 128
-Option C: **Hybrid dispatch** — Use fused kernel for M ≥ 128 (prefill), Marlin for M < 128 (decode)
+| 内核 | 作用 | 状态 |
+|------|------|------|
+| `fused_qk_norm_rope` | Q/K Norm + RoPE 融合 | ✅ 已启用 |
+| `lightning_fast_state_io` | 循环状态快速 I/O | ✅ 已启用 |
+| `lightning_fast_output_gate` | 输出门融合 | ✅ 已启用 |
+| GPTQ Marlin | INT4 GEMM（148 TFLOPS） | ✅ 基线 |
+| W4A8 FP8 fused | INT4+FP8 GEMM（296 TFLOPS） | 🔧 M%128 限制待修复 |
 
-**Estimated gain**: 296/148 = **2× on matmul ops** → ~1.5× overall speedup on decode, ~1.8× on prefill
+### 4.2 下一步：修复 W4A8 融合内核
 
-### 5.2 Phase 2: Optimize Attention (If Needed)
+当前阻止融合内核工作的根因：kernel 的 `kTileM=128` 要求 `M % 128 == 0`，
+但 decode 阶段 batch size 为 1-24。`gptq.py` 已有 M-padding 逻辑（填充到 128 的倍数），
+但 kernel 内部还有 `M >= 64` 检查。
 
-- Lightning attention recurrent kernel is already very fast (<1% FLOPs)
-- Sparse attention is memory-bound; FP8 KV cache already used
-- FA3 is already optimal
-
-### 5.3 Phase 3: Scheduling / Batching Optimizations
-
-- Already using `--schedule-conservativeness 0.8`, chunked prefill
-- CUDA graph capture covers bs 1-24
-
----
-
-## 6. Appendix: Data Flow Diagram
-
-```
-                    ┌──────────────────────────────┐
-                    │     Token Embedding           │
-                    │  (scale_emb × embed_tokens)   │
-                    └──────────┬───────────────────┘
-                               │ [B×T, 4096] BF16
-                    ┌──────────▼───────────────────┐
-                    │   FOR layer_id = 0..31:       │
-                    │                               │
-                    │  ┌─ RMSNorm ─────────────────┐│
-                    │  │                             ││
-                    │  │  IF mixer_type == minicpm4: ││
-                    │  │    W4A8: QKV [4096→6144]    ││
-                    │  │    RoPE (fused qk_norm)     ││
-                    │  │    FA3 Sparse Attn           ││
-                    │  │    W4A8: O   [4096→4096]    ││
-                    │  │                             ││
-                    │  │  ELSE (lightning):           ││
-                    │  │    QKV [4096→3072] Marlin    ││
-                    │  │    Fused QK Norm + RoPE      ││
-                    │  │    FLA chunk/recurrent GLA   ││
-                    │  │    O proj + gate (Marlin)    ││
-                    │  └─────────────────────────────┘│
-                    │                                 │
-                    │  ┌─ RMSNorm + residual ────────┐│
-                    │  │   W4A8: Gate-Up [4096→28672]││ ← HEAVIEST (54%)
-                    │  │   SiLU × Up (fused)          ││
-                    │  │   W4A8: Down   [14336→4096] ││ ← 2ND HEAVIEST (27%)
-                    │  │   × residual_scale           ││
-                    │  └─────────────────────────────┘│
-                    └──────────┬───────────────────┘
-                               │
-                    ┌──────────▼───────────────────┐
-                    │   Final RMSNorm + LM Head     │
-                    │   (if not tied embeddings)     │
-                    └──────────────────────────────┘
-```
+修复方案：
+- 方案 A: 在 kernel 中添加边界掩码，支持部分 tile
+- 方案 B: 使用更小的 MMA tile（m16n8k32），M≥16 即可
+- 方案 C: M≥128 用融合 kernel（prefill），M<128 回退 Marlin（decode）

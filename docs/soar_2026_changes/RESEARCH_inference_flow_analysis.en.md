@@ -22,10 +22,17 @@
 
 ### 1.2 Layer Type Distribution
 
-| Mixer Type | Count | Class | KV Cache? | Attention Type |
-|------------|-------|-------|-----------|----------------|
-| `minicpm4` (sparse) | **8 layers** | `MiniCPMAttention` | ✅ Paged KV | Sparse/dense attention |
-| `lightning` (linear) | **24 layers** | `MiniCPMLightningMixer` | ❌ Recurrent state | Linear (GLA) attention |
+> **CRITICAL**: `--force-dense-minicpm` does **NOT** convert lightning layers to
+> standard attention. It only sets `model_config.has_sparse_attention=False` and
+> `model_config.sparse_layer_ids=[]`, which affects attention routing inside
+> `MiniCPMAttention` (sparse→dense FA3). The module CLASS is determined by
+> `config.mixer_types[layer_id]` at init time, independent of `--force-dense-minicpm`.
+> The 24 lightning layers always use `MiniCPMLightningMixer` (GLA recurrent).
+
+| Mixer Type | Count | Module Class | KV Cache? | Attention (current) |
+|------------|-------|-------------|-----------|---------------------|
+| `minicpm4` | **8 layers** | `MiniCPMAttention` | ✅ Paged KV | Dense FA3 (force_dense) |
+| `lightning` | **24 layers** | `MiniCPMLightningMixer` | ❌ Recurrent state | GLA chunk/recurrent |
 
 **Lightning layer sub-config** (`config.lightning_*`):
 | Parameter | Value |
@@ -223,6 +230,11 @@ The W4A8 fused kernel (`torch.ops.w4a8_fused.w4a8_fp8_fused_gemm`) is called fro
 **File**: `python/sglang/srt/layers/quantization/gptq.py`  
 **Method**: `GPTQMarlinLinearMethod.apply()` (line ~951)
 
+> **KEY**: This method intercepts EVERY GPTQ linear forward pass — QKV, O,
+> Gate-Up, Down — across all 32 layers. Whether the fused kernel is actually
+> used depends on `layer._soar_w4a8_real_active`, which is only set for
+> `MiniCPMAttention` linears (8 layers) and `MiniCPMMLP` linears (all 32 layers).
+
 **Activation flow**:
 ```
 GPTQMarlinLinearMethod.apply(layer, x)
@@ -246,19 +258,23 @@ GPTQMarlinLinearMethod.apply(layer, x)
 
 ### 3.2 Eligible Layers
 
+> **Why only 8 layers for QKV/O?** `MiniCPMLightningMixer` does NOT set
+> `_soar_w4a8_eligible` on its linears (see `minicpm.py` lines ~330-350).
+> `--force-dense-minicpm` only affects attention routing, not module class.
+> The 24 lightning layers always use `MiniCPMLightningMixer` regardless.
+>
+> **MLP linears** (gate_up_proj, down_proj) are tagged for ALL 32 layers
+> because both layer types use the same `MiniCPMMLP` class.
+
 | Layer Type | Projection | Shape | W4A8? | Status |
 |------------|-----------|-------|-------|--------|
-| **Sparse Attn** | QKV | 4096×6144 | ✅ | Kernel ready, M%128 issue |
-| **Sparse Attn** | O | 4096×4096 | ✅ | Kernel ready, M%128 issue |
-| **Sparse MLP** | Gate-Up | 4096×28672 | ✅ | Kernel ready, M%128 issue |
-| **Sparse MLP** | Down | 14336×4096 | ✅ | Kernel ready, M%128 issue |
-| Lightning Attn | QKV | 4096×3072 | ❌ | Not tagged |
-| Lightning Attn | O | 1024×4096 | ❌ | Not tagged |
-| Lightning Attn | Z (gate) | 4096×1024 | ❌ | Not tagged |
-| Lightning MLP | Gate-Up | 4096×28672 | ✅ | Same as sparse |
-| Lightning MLP | Down | 14336×4096 | ✅ | Same as sparse |
-
-**Total W4A8-eligible projections**: 8 (sparse attn) + 2 (MLP × 24 lightning) + 2 (MLP × 8 sparse) = **4 per attention layer** × 8 sparse + **2 per MLP** × 32 all layers = 32 + 64 = 96 projections total.
+| **minicpm4 Attn (8 layers)** | QKV | 4096×6144 | ✅ | Kernel ready, M%128 issue |
+| **minicpm4 Attn (8 layers)** | O | 4096×4096 | ✅ | Kernel ready, M%128 issue |
+| **MLP (all 32 layers)** | Gate-Up | 4096×28672 | ✅ | Kernel ready, M%128 issue |
+| **MLP (all 32 layers)** | Down | 14336×4096 | ✅ | Kernel ready, M%128 issue |
+| Lightning Attn (24 layers) | QKV | 4096×3072 | ❌ | `MiniCPMLightningMixer` — not tagged |
+| Lightning Attn (24 layers) | O | 1024×4096 | ❌ | `MiniCPMLightningMixer` — not tagged |
+| Lightning Attn (24 layers) | Z (gate) | 4096×1024 | ❌ | Not tagged |
 
 But MLP dimensions are SAME across all 32 layers, so the W4A8 kernel handles:
 - **Gate-Up**: 4096×28672 — this is the single biggest op (54-62% of layer FLOPs)
