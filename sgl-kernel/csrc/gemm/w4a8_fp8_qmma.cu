@@ -113,15 +113,13 @@ __global__ void w4a8_fp8_qmma_kernel(
           }
 
           float* cp = c_regs[ms][ns];
-          float c0 = cp[0], c1 = cp[1], c2 = cp[2], c3 = cp[3];
           asm volatile(
               "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
               "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
-              : "=f"(c0), "=f"(c1), "=f"(c2), "=f"(c3)
+              : "+f"(cp[0]), "+f"(cp[1]), "+f"(cp[2]), "+f"(cp[3])
               : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
                 "r"(b_regs[0]), "r"(b_regs[1]),
-                "f"(c0), "f"(c1), "f"(c2), "f"(c3));
-          cp[0] = c0; cp[1] = c1; cp[2] = c2; cp[3] = c3;
+                "f"(cp[0]), "f"(cp[1]), "f"(cp[2]), "f"(cp[3]));
         }
       }
     }
