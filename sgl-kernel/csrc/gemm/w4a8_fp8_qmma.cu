@@ -118,10 +118,12 @@ __global__ void w4a8_fp8_qmma_kernel(
 
           // DIAG: check A fragment values for warp 0, first iteration
           if (warp_id == 0 && ms == 0 && ns == 0 && sk == 0 && kb == 0) {
+            int d_row0 = wm + lane_id / 4;
+            int d_col0 = sk + (lane_id % 4) * 4;
             float a0_f = (float)*reinterpret_cast<const __nv_fp8_e4m3*>(&a_regs[0]);
             float a1_f = (float)*reinterpret_cast<const __nv_fp8_e4m3*>(&a_regs[1]);
             printf("[DIAG-A] tid=%d lane=%d row0=%d col0=%d a_regs[0]=0x%08x(%g) a_regs[1]=0x%08x(%g)\n",
-                   tid, lane_id, row0, col0, a_regs[0], a0_f, a_regs[1], a1_f);
+                   tid, lane_id, d_row0, d_col0, a_regs[0], a0_f, a_regs[1], a1_f);
           }
 
           float* cp = c_regs[ms][ns];
