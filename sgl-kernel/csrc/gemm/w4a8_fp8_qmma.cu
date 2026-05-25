@@ -40,10 +40,8 @@ __global__ void w4a8_fp8_qmma_kernel(
   const int warp_m0 = warp_id * (kTileM / kWarps);
 
   extern __shared__ char smem_raw[];
-  // W_fp8: col-major [K][N], need extra N padding for B fragment (reads N+16..N+19)
-  constexpr int kWPadN = 24;  // extra N padding for B fragment over-read
   __nv_fp8_e4m3* W_fp8 = reinterpret_cast<__nv_fp8_e4m3*>(smem_raw);
-  __nv_fp8_e4m3* A_fp8_smem = W_fp8 + kTileK * (kTileN + kWPadN);
+  __nv_fp8_e4m3* A_fp8_smem = W_fp8 + kTileN * kTileK;
 
   float c_regs[2][16][4];
   for (int ms = 0; ms < 2; ++ms)
@@ -116,6 +114,11 @@ __global__ void w4a8_fp8_qmma_kernel(
             memcpy(&b_regs[0], &W_fp8[d_k0 * kTileN + d_n_start], sizeof(uint32_t));
             memcpy(&b_regs[1], &W_fp8[(d_k0 + 16) * kTileN + d_n_start], sizeof(uint32_t));
           }
+          // DIAG: check B fragment for warp 0
+          if (warp_id == 0 && ms == 0 && ns == 0 && sk == 0 && kb == 0 && tid < 4) {
+            float b0 = (float)*reinterpret_cast<const __nv_fp8_e4m3*>(&b_regs[0]);
+            printf("[DIAG-B] tid=%d k0=%d n_start=%d b_regs[0]=0x%08x(%g)\n", tid, d_k0, d_n_start, b_regs[0], b0);
+          }
 
           float* cp = c_regs[ms][ns];
           asm volatile(
@@ -171,7 +174,7 @@ torch::Tensor w4a8_fp8_fused_gemm(
 
   dim3 grid(M / kTileM, ((int)N + kTileN - 1) / kTileN);
   dim3 block(kWarps * kWarpSize);
-  constexpr int kSmemBytes = kTileK * (kTileN + kWPadN) + kTileM * kTileK;  // ~17.5KB
+  constexpr int kSmemBytes = kTileN * kTileK * 2;  // 16KB
 
   auto stream = c10::cuda::getCurrentCUDAStream();
   w4a8_fp8_qmma_kernel<<<grid, block, kSmemBytes, stream>>>(
