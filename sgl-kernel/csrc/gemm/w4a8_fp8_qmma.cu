@@ -117,33 +117,15 @@ __global__ void w4a8_fp8_qmma_kernel(
           }
 
           float* cp = c_regs[ms][ns];
-
-          // DIAG: check A and B fragment values for warp 0, first iteration
-          if (warp_id == 0 && ms == 0 && ns == 0 && sk == 0 && kb == 0) {
-            int d_row0 = wm + lane_id / 4;
-            int d_col0 = sk + (lane_id % 4) * 4;
-            float a0_f = (float)*reinterpret_cast<const __nv_fp8_e4m3*>(&a_regs[0]);
-            float a1_f = (float)*reinterpret_cast<const __nv_fp8_e4m3*>(&a_regs[1]);
-            int d_n_idx = wn + lane_id / 4;
-            int d_k0 = sk + (lane_id % 4) * 4;
-            float b0_f = (float)*reinterpret_cast<const __nv_fp8_e4m3*>(&b_regs[0]);
-            float b1_f = (float)*reinterpret_cast<const __nv_fp8_e4m3*>(&b_regs[1]);
-            printf("[DIAG] tid=%d lane=%d A[row0=%d][col0=%d]=0x%08x(%g) A[row0=%d][col1=%d]=0x%08x(%g) | B[n_idx=%d][k0=%d]=0x%08x(%g) B[n_idx=%d][k1=%d]=0x%08x(%g) | c={%g,%g,%g,%g}\n",
-                   tid, lane_id,
-                   d_row0, d_col0, a_regs[0], a0_f,
-                   d_row0, d_col0+16, a_regs[1], a1_f,
-                   d_n_idx, d_k0, b_regs[0], b0_f,
-                   d_n_idx, d_k0+16, b_regs[1], b1_f,
-                   cp[0], cp[1], cp[2], cp[3]);
-          }
-
+          float c0 = cp[0], c1 = cp[1], c2 = cp[2], c3 = cp[3];
           asm volatile(
               "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
               "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
-              : "+f"(cp[0]), "+f"(cp[1]), "+f"(cp[2]), "+f"(cp[3])
+              : "=f"(c0), "=f"(c1), "=f"(c2), "=f"(c3)
               : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
                 "r"(b_regs[0]), "r"(b_regs[1]),
-                "f"(cp[0]), "f"(cp[1]), "f"(cp[2]), "f"(cp[3]));
+                "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+          cp[0] = c0; cp[1] = c1; cp[2] = c2; cp[3] = c3;
         }
       }
     }
