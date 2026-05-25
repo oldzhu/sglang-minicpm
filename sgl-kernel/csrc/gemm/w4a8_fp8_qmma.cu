@@ -108,16 +108,16 @@ __global__ void w4a8_fp8_qmma_kernel(
           // Thread t: b[0]=B[t/4][(t%4)*4..+4], b[1]=B[t/4][(t%4)*4+16..+4]
           //   = 4 consecutive N values at same K, consecutive in memory.
           uint32_t b_regs[2];
+          int d_k0 = sk + lane_id / 4;
+          int d_n_start = wn + (lane_id % 4) * 4;
           {
-            int k0 = sk + lane_id / 4;
-            int n_start = wn + (lane_id % 4) * 4;
-            memcpy(&b_regs[0], &W_fp8[k0 * kTileN + n_start], sizeof(uint32_t));
-            memcpy(&b_regs[1], &W_fp8[(k0 + 16) * kTileN + n_start], sizeof(uint32_t));
+            memcpy(&b_regs[0], &W_fp8[d_k0 * kTileN + d_n_start], sizeof(uint32_t));
+            memcpy(&b_regs[1], &W_fp8[(d_k0 + 16) * kTileN + d_n_start], sizeof(uint32_t));
           }
           // DIAG: check B fragment for warp 0
           if (warp_id == 0 && ms == 0 && ns == 0 && sk == 0 && kb == 0 && tid < 4) {
             float b0 = (float)*reinterpret_cast<const __nv_fp8_e4m3*>(&b_regs[0]);
-            printf("[DIAG-B] tid=%d k0=%d n_start=%d b_regs[0]=0x%08x(%g)\n", tid, k0, n_start, b_regs[0], b0);
+            printf("[DIAG-B] tid=%d k0=%d n_start=%d b_regs[0]=0x%08x(%g)\n", tid, d_k0, d_n_start, b_regs[0], b0);
           }
 
           float* cp = c_regs[ms][ns];
