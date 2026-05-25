@@ -120,8 +120,8 @@ __global__ void w4a8_fp8_qmma_kernel(
               : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
                 "r"(b_regs[0]), "r"(b_regs[1]),
                 "f"(cp[0]), "f"(cp[1]), "f"(cp[2]), "f"(cp[3]));
-          // DIAG: print accumulator for warp 0, after first MMA of each sk
-          if (warp_id == 0 && ms == 0 && ns == 0 && kb == 0 && tid < 4) {
+          // DIAG: print accumulator for warp 0, after sk=0 first MMA
+          if (warp_id == 0 && ms == 0 && ns == 0 && sk == 0 && kb == 0 && tid < 4) {
             printf("[DIAG-C] tid=%d sk=%d c={%g,%g,%g,%g}\n", tid, sk, cp[0], cp[1], cp[2], cp[3]);
           }
         }
