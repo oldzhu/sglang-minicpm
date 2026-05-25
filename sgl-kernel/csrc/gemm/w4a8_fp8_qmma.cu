@@ -41,10 +41,10 @@ __global__ void w4a8_fp8_qmma_kernel(
   const int warp_m0 = warp_id * (kTileM / kWarps);
 
   extern __shared__ char smem_raw[];
-  // W_fp8: col-major [K][N_padded], need extra N padding for B fragment
-  constexpr int kWStrideN = kTileN + kWPadN;
+  // W_fp8: col-major [K][N], need extra N padding for B fragment (reads N+16..N+19)
+  constexpr int kWPadN = 24;  // extra N padding for B fragment over-read
   __nv_fp8_e4m3* W_fp8 = reinterpret_cast<__nv_fp8_e4m3*>(smem_raw);
-  __nv_fp8_e4m3* A_fp8_smem = W_fp8 + kTileK * kWStrideN;
+  __nv_fp8_e4m3* A_fp8_smem = W_fp8 + kTileK * (kTileN + kWPadN);
 
   float c_regs[2][16][4];
   for (int ms = 0; ms < 2; ++ms)
@@ -56,12 +56,11 @@ __global__ void w4a8_fp8_qmma_kernel(
 
     // Phase 1: INT4 -> FP8 dequant into W_fp8, stored in COL-MAJOR format
     // [K][N] so that the MMA B fragment can read 4 consecutive N values at same K.
-    // B fragment reads up to N + 19, so we need to zero-pad the extra N positions.
-    for (int i = tid; i < kTileK * (kTileN + kWPadN); i += blockDim.x) {
-      int k = i / (kTileN + kWPadN), n = i % (kTileN + kWPadN);
+    for (int i = tid; i < kTileN * kTileK; i += blockDim.x) {
+      int n = i / kTileK, k = i % kTileK;
       int kg = kb + k, ng = n0 + n;
-      __nv_fp8_e4m3 val{0};
-      if (kg < K && ng < N && k < kTileK && n < kTileN) {
+      __nv_fp8_e4m3 val;
+      if (kg < K && ng < N) {
         int kp = kg / 8, kbit = (kg % 8) * 4;
         int w4 = (qweight[kp * N + ng] >> kbit) & 0xF;
         int gid = kg / group_size, z4 = 0;
@@ -72,7 +71,8 @@ __global__ void w4a8_fp8_qmma_kernel(
         float fv = ((float)w4 - (float)z4) * __bfloat162float(scales[gid * N + ng]);
         val = __nv_fp8_e4m3(fv);
       }
-      W_fp8[k * (kTileN + kWPadN) + n] = val;
+      // Store col-major: W_fp8[k][n] = W_fp8[k * kTileN + n]
+      W_fp8[k * kTileN + n] = val;
     }
 
     // Phase 2: Load FP8 activations -> A_fp8_smem [M][K]
@@ -114,8 +114,8 @@ __global__ void w4a8_fp8_qmma_kernel(
           int d_k0 = sk + lane_id / 4;
           int d_n_start = wn + (lane_id % 4) * 4;
           {
-            memcpy(&b_regs[0], &W_fp8[d_k0 * kWStrideN + d_n_start], sizeof(uint32_t));
-            memcpy(&b_regs[1], &W_fp8[(d_k0 + 16) * kWStrideN + d_n_start], sizeof(uint32_t));
+            memcpy(&b_regs[0], &W_fp8[d_k0 * kTileN + d_n_start], sizeof(uint32_t));
+            memcpy(&b_regs[1], &W_fp8[(d_k0 + 16) * kTileN + d_n_start], sizeof(uint32_t));
           }
 
           float* cp = c_regs[ms][ns];
@@ -172,7 +172,7 @@ torch::Tensor w4a8_fp8_fused_gemm(
 
   dim3 grid(M / kTileM, ((int)N + kTileN - 1) / kTileN);
   dim3 block(kWarps * kWarpSize);
-  constexpr int kSmemBytes = kTileK * kWStrideN + kTileM * kTileK;  // ~17.5KB
+  constexpr int kSmemBytes = kTileK * (kTileN + kWPadN) + kTileM * kTileK;  // ~17.5KB
 
   auto stream = c10::cuda::getCurrentCUDAStream();
   w4a8_fp8_qmma_kernel<<<grid, block, kSmemBytes, stream>>>(
