@@ -412,3 +412,234 @@ Option C: **Hybrid dispatch** — Use fused kernel for M ≥ 128 (prefill), Marl
                     │   (if not tied embeddings)     │
                     └──────────────────────────────┘
 ```
+
+---
+
+## 7. Dense vs Sparse Attention — Kernel↔Formula Mapping
+
+> **This section clarifies Q2/Q3**: In the 8 `minicpm4` layers, `--force-dense-minicpm`
+> changes HOW attention is computed, but QKV/O projections are IDENTICAL in both modes.
+
+### 7.1 Dense Mode (current with `--force-dense-minicpm`)
+
+```
+QKV → Split → RoPE → FA3 Dense Attention → O
+
+Q = x @ W_Q  (4096 → 4096, 50M FLOPs)   ← W4A8 ✅
+K = x @ W_K  (4096 → 1024)               ← combined in QKV
+V = x @ W_V  (4096 → 1024)               ← combined in QKV
+
+RoPE: q' = q·cos(θ·pos) + rotate_half(q)·sin(θ·pos)
+            θ_i = base^{-2i/d}, base=10000
+
+Attention (FlashAttention-3):
+  S = Q @ K^T / √d           scores: (1, num_heads, cache_len)
+  P = softmax(S)              row-wise softmax
+  O = P @ V                   weighted sum: (1, num_heads, head_dim)
+  
+  FLOPs: 4 × num_heads × cache_len × head_dim
+       = 4 × 32 × cache_len × 128
+         cache_len=100K → 1.6G FLOPs (memory-bound, bottleneck is KV cache load)
+```
+
+**Kernel call chain**:
+```
+RadixAttention.forward()  [radix_attention.py:95]
+└─ MiniCPMBackend.forward_decode()  [minicpm_backend.py:1161]
+   └─ flashinfer.batch_decode_with_padded_kv_cache()  OR
+   └─ flash_attn_3_varlen_func()                      [GPU kernel]
+      └─ Formula: softmax(Q·K^T/√d)·V
+```
+
+### 7.2 Sparse Mode (without `--force-dense-minicpm`, when seq_len ≥ dense_len)
+
+The sparse path adds THREE stages of pre-processing before sparse attention:
+
+```
+QKV → Split → RoPE → [Stage1: Compress Keys] → [Stage2: TopK] → [Stage3: Sparse FA] → O
+```
+
+**Stage 1: Key Compression** (`compress_k_to_scratch_kernel`, Triton kernel)
+```
+K1 = avg_pool(K, kernel_size=32, stride=16)   // K: (cache_len, heads, dim) → (cache_len/16, heads, dim)
+K2 = avg_pool(K, kernel_size=128, stride=64)  // → (cache_len/64, heads, dim)
+```
+
+**Stage 2: TopK Selection** (`compressed_attention`, max_pool_1d_varlen)
+```
+S1 = Q @ K1^T / √d               // coarse scores: (1, num_heads, cache_len/16)
+S2 = Q @ K2^T / √d               // fine scores: (1, num_heads, cache_len/64)
+block_scores = max_pool_1d(S1)   // pool over windows
+topk_blocks = topk(block_scores, k=sparse_topk)  // k=8 blocks
+// Each block = sparse_block_size=32 tokens → 256 sparse tokens per head
+```
+
+**Stage 3: Sparse FlashAttention** (`sparse_kernel_extension` or `flashinfer`)
+```
+K_sparse = gather(K, topk_blocks)     // (1, num_heads, 256) sparse tokens
+V_sparse = gather(V, topk_blocks)
+S = Q @ K_sparse^T / √d               // sparse scores
+P = softmax(S)
+O = P @ V_sparse                      // sparse output
+
+FLOPs: 4 × 32 × 256 × 128 ≈ 4.2M (vs 1.6G dense = 380× less compute!)
+```
+
+**Kernel call chain (sparse mode)**:
+```
+RadixAttention.forward()  [radix_attention.py:95]
+└─ MiniCPMBackend.forward_decode()  [minicpm_backend.py:1161]
+   ├─ get_topk_for_sparse()  [minicpm_backend.py:872]
+   │  ├─ compress_k_to_scratch_kernel()        [Triton kernel]
+   │  └─ compressed_attention()                 [minicpm_sparse_utils.py:498]
+   │     └─ max_pooling_1d_varlen() + topk()   [infllmv2 kernel]
+   └─ AttentionParams → flashinfer.batch_decode()  [GPU kernel]
+```
+
+**Comparison: Dense vs Sparse (per decode token, cache_len=100K)**:
+
+| Component | Dense (FA3) | Sparse (TopK) | Ratio |
+|-----------|------------|---------------|-------|
+| **Attention formula** | softmax(Q·K^T/√d)·V | masked softmax on top-k blocks | — |
+| **K,V tokens processed** | 100K (all) | ~256 (sparse topk) | 390× less |
+| **Attention FLOPs** | 1.6G | 4.2M | 380× |
+| **Extra pre-processing** | 0 | Key compression + TopK (~2M FLOPs) | — |
+| **Memory access** | Full KV cache read | Sparse KV gather | ~100× less BW |
+| **QKV/O projections** | IDENTICAL (50M + 33M) | IDENTICAL (50M + 33M) | 1× |
+
+> **Key insight**: QKV/O projections are **unchanged** between dense and sparse mode.
+> Same `MiniCPMAttention` class, same `qkv_proj`/`o_proj` calls, same dimensions.
+> Only the attention COMPUTE step changes (which kernel is called for the Q·K·V operation).
+
+---
+
+## 8. Full Call Chain — Top to Bottom
+
+```
+MiniCPMForCausalLM.forward()           [minicpm.py:745]
+└─ MiniCPMModel.forward()              [minicpm.py:688]
+   ├─ embed_tokens(input_ids) × scale_emb   [minicpm.py:709]
+   └─ for layer_id in 0..31:
+      └─ MiniCPMDecoderLayer.forward() [minicpm.py:626]
+         │
+         ├─ input_layernorm(hidden_states, residual)  [RMSNorm, minicpm.py:636]
+         │
+         ├─ [IF mixer_type == "minicpm4"]: MiniCPMAttention.forward()  [minicpm.py:267]
+         │  │
+         │  ├─ qkv_proj(hidden_states)         [minicpm.py:267]
+         │  │  └─ GPTQMarlinLinearMethod.apply()  [gptq.py:951]
+         │  │     ├─ [IF SOAR_W4A8_REAL_FP8_GEMM=1] → torch.ops.w4a8_fused.w4a8_fp8_fused_gemm()
+         │  │     └─ [ELSE] → gptq_marlin_repack() + marlin_gemm()
+         │  │        Formula: qkv = W_qkv @ x + b     [D×3·D_out matmul]
+         │  │
+         │  ├─ q, k, v = qkv.split([4096,1024,1024])  [minicpm.py:268]
+         │  │
+         │  ├─ q, k = rotary_emb(positions, q, k)     [minicpm.py:270]
+         │  │  └─ MRotaryEmbedding (or fused_qk_norm_rope CUDA kernel)
+         │  │     Formula: q'_i = q_i·cos(θ·pos) + rotate_half(q_i)·sin(θ·pos)
+         │  │
+         │  ├─ attn_output = attn(q, k, v, forward_batch)  [minicpm.py:273]
+         │  │  └─ RadixAttention.forward()    [radix_attention.py:95]
+         │  │     └─ MiniCPMBackend.forward_extend/decode()  [minicpm_backend.py]
+         │  │        [DENSE mode]:
+         │  │        └─ flashinfer.batch_decode_with_padded_kv_cache()
+         │  │           Formula: softmax(Q·K^T/√d)·V
+         │  │        [SPARSE mode]:
+         │  │        ├─ compress_k_to_scratch_kernel()   [Triton kernel]
+         │  │        ├─ compressed_attention() → topk    [minicpm_sparse_utils.py]
+         │  │        └─ flashinfer.batch_decode()         [GPU kernel]
+         │  │
+         │  └─ o_proj(attn_output)           [minicpm.py:279]
+         │     └─ GPTQMarlinLinearMethod.apply()  [gptq.py:951]
+         │        Formula: out = W_o @ attn_output + b   [D×D matmul]
+         │
+         ├─ [ELIF mixer_type == "lightning"]: MiniCPMLightningMixer.forward()  [minicpm.py:476]
+         │  │
+         │  ├─ qkv_proj(hidden_states)        [minicpm.py:488]
+         │  ├─ q, k = q_norm(q), k_norm(k)    [minicpm.py:511]
+         │  ├─ q, k = rotary_emb(pos, q, k)   [minicpm.py:512]
+         │  ├─ SimpleGLAAttnBackend.forward()  [hybrid_linear_attn_backend.py:1724]
+         │  │  [DECODE]: fused_recurrent_simple_gla(q,k,v,...)
+         │  │     Formula: h_t = λ·h_{t-1} + k_t⊗v_t, o_t = q_t·h_t
+         │  │  [PREFILL]: chunk_simple_gla(q,k,v,...)
+         │  └─ o_proj(o) + z_proj(gate)       [minicpm.py:518-521]
+         │
+         ├─ hidden_states *= residual_scale   [minicpm.py:648]
+         │
+         ├─ post_attention_layernorm(h, residual)  [RMSNorm, minicpm.py:651]
+         │
+         ├─ mlp(hidden_states)                [MiniCPMMLP, minicpm.py:162]
+         │  ├─ gate_up_proj(h)                [gptq.py:951]
+         │  │  Formula: [gate|up] = W_gu @ h     [D×2·D_int matmul, 235M FLOPs]
+         │  ├─ SiluAndMul(gate_up)            [activation.py]
+         │  │  Formula: out = up ⊙ silu(gate)
+         │  └─ down_proj(out)                 [gptq.py:951]
+         │     Formula: out = W_d @ out           [D_int×D matmul, 117M FLOPs]
+         │
+         └─ hidden_states *= residual_scale   [minicpm.py:654]
+
+└─ self.norm(hidden_states)                   [RMSNorm, minicpm.py:713]
+└─ [IF lm_head]: lm_head(hidden_states)       [Linear]
+```
+
+---
+
+## 9. FLOPs Calculation Methodology (Decode, M=1)
+
+### 9.1 Matmul FLOPs
+
+Standard formula: **FLOPs = 2 × M × K × N** (one multiply + one add per element)
+
+| Projection | Shape (M×K×N) | FLOPs Formula | Result |
+|-----------|---------------|---------------|--------|
+| QKV Sparse | 1 × 4096 × 6144 | 2 × 1 × 4096 × 6144 | **50.3M** |
+| QKV Lightning | 1 × 4096 × 3072 | 2 × 1 × 4096 × 3072 | **25.2M** |
+| O Sparse | 1 × 4096 × 4096 | 2 × 1 × 4096 × 4096 | **33.6M** |
+| Gate-Up | 1 × 4096 × 28672 | 2 × 1 × 4096 × 28672 | **234.9M** |
+| Down | 1 × 14336 × 4096 | 2 × 1 × 14336 × 4096 | **117.4M** |
+
+Note: GPTQ INT4 matmuls have same FLOPs count as FP16 — quantization reduces memory, not compute.
+
+### 9.2 Attention FLOPs (decode, M=1)
+
+**Dense FA3**: `4 × num_heads × cache_len × head_dim`
+
+With cache_len=100K: 4 × 32 × 100,000 × 128 ≈ **1.64G FLOPs**
+But this is **memory-bound** — actual wall-clock dominated by KV cache load (32 × 100,000 × 128 × 1 byte ≈ 400 MB). At 1398 GB/s bandwidth, theoretical minimum = 400MB/1398GB/s ≈ 0.3ms. FLOPs aren't the bottleneck.
+
+**Sparse TopK**: `4 × num_heads × sparse_tokens × head_dim + key_compression`
+
+With sparse_tokens=256: 4 × 32 × 256 × 128 ≈ **4.2M FLOPs**
+Plus key compression: ~2M FLOPs. Total ≈ 6M FLOPs.
+
+**GLA Recurrent**: `heads × (head_dim² + head_dim)` ≈ 16 × (64² + 64) ≈ **66K FLOPs**
+
+### 9.3 Percentage Breakdown (Sparse Layer Decode)
+
+| Op | Raw FLOPs | Adjusted* | Percentage |
+|----|-----------|-----------|------------|
+| Gate-Up matmul | 235M | 235M | **54%** |
+| Down matmul | 117M | 117M | **27%** |
+| QKV matmul | 50M | 50M | **11%** |
+| O matmul | 34M | 34M | **8%** |
+| Attention | ~0.1M–1.6G | ~0.3ms (BW-bound) | **<1% of time** |
+| **Total matmul** | **436M** | — | **100%** |
+
+*\*Adjusted: attention is counted at 0 for FLOPs percentage because it's memory-bound, not compute-bound. The matmuls dominate compute time.*
+
+---
+
+## 10. File Reference Index
+
+| Component | File | Key Lines |
+|-----------|------|-----------|
+| Model definition | `python/sglang/srt/models/minicpm.py` | L132-L288 (attention/MLP), L525-L654 (decoder layer) |
+| GPTQ quantization | `python/sglang/srt/layers/quantization/gptq.py` | L880-L970 (W4A8 setup), L951 (apply dispatch) |
+| Dense attention backend | `python/sglang/srt/layers/attention/minicpm_backend.py` | L150-L210 (init), L942-L1050 (prefill), L1161-L1300 (decode) |
+| Sparse attention utils | `python/sglang/srt/layers/attention/minicpm_sparse_utils.py` | L498 (compressed_attention) |
+| Lightning attn backend | `python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py` | L1445-L1810 (SimpleGLAAttnBackend) |
+| RadixAttention dispatch | `python/sglang/srt/layers/radix_attention.py` | L95-L133 |
+| Model config | `python/sglang/srt/configs/model_config.py` | L107 (force_dense), L238 (has_sparse), L248 (sparse_ids) |
+| Server args | `python/sglang/srt/server_args.py` | L542 (force_dense_minicpm) |
+| Fused kernel | `sgl-kernel/csrc/gemm/w4a8_fp8_qmma.cu` | L1-L176 (SM120 warp-level FP8 mma.sync) |
+| prepare_env.sh | `benchmark/soar/demo_sala/prepare_env.sh` | All env vars and server args |
