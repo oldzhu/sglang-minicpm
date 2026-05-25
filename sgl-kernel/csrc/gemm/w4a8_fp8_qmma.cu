@@ -51,7 +51,8 @@ __global__ void w4a8_fp8_qmma_kernel(
 
   for (int kb = 0; kb < K; kb += kTileK) {
 
-    // Phase 1: INT4 -> FP8 dequant into W_fp8 [N][K]
+    // Phase 1: INT4 -> FP8 dequant into W_fp8, stored in COL-MAJOR format
+    // [K][N] so that the MMA B fragment can read 4 consecutive N values at same K.
     for (int i = tid; i < kTileN * kTileK; i += blockDim.x) {
       int n = i / kTileK, k = i % kTileK;
       int kg = kb + k, ng = n0 + n;
@@ -67,7 +68,8 @@ __global__ void w4a8_fp8_qmma_kernel(
         float fv = ((float)w4 - (float)z4) * __bfloat162float(scales[gid * N + ng]);
         val = __nv_fp8_e4m3(fv);
       }
-      W_fp8[n * kTileK + k] = val;
+      // Store col-major: W_fp8[k][n] = W_fp8[k * kTileN + n]
+      W_fp8[k * kTileN + n] = val;
     }
 
     // Phase 2: Load FP8 activations -> A_fp8_smem [M][K]
@@ -101,15 +103,16 @@ __global__ void w4a8_fp8_qmma_kernel(
             memcpy(&a_regs[3], &A_fp8_smem[row1 * kTileK + col1], sizeof(uint32_t));
           }
 
-          // B fragment: m16n8k32 FP8 col-major (stored as W_fp8[n][k]).
-          // Thread t: b[0]=W[wn+t/4][(t%4)*4..+4], b[1]=W[wn+t/4][(t%4)*4+16..+4]
+          // B fragment: m16n8k32 FP8 col-major, shape [32, 8] (K=32, N=8).
+          // W_fp8 stored as col-major [K][N] = W_fp8[k * kTileN + n].
+          // Thread t: b[0]=B[t/4][(t%4)*4..+4], b[1]=B[t/4][(t%4)*4+16..+4]
+          //   = 4 consecutive N values at same K, consecutive in memory.
           uint32_t b_regs[2];
           {
-            int n_idx = wn + lane_id / 4;
-            int k0 = sk + (lane_id % 4) * 4;
-            int k1 = k0 + 16;
-            memcpy(&b_regs[0], &W_fp8[n_idx * kTileK + k0], sizeof(uint32_t));
-            memcpy(&b_regs[1], &W_fp8[n_idx * kTileK + k1], sizeof(uint32_t));
+            int k0 = sk + lane_id / 4;
+            int n_start = wn + (lane_id % 4) * 4;
+            memcpy(&b_regs[0], &W_fp8[k0 * kTileN + n_start], sizeof(uint32_t));
+            memcpy(&b_regs[1], &W_fp8[(k0 + 16) * kTileN + n_start], sizeof(uint32_t));
           }
 
           float* cp = c_regs[ms][ns];
@@ -120,10 +123,6 @@ __global__ void w4a8_fp8_qmma_kernel(
               : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
                 "r"(b_regs[0]), "r"(b_regs[1]),
                 "f"(cp[0]), "f"(cp[1]), "f"(cp[2]), "f"(cp[3]));
-          // DIAG: print accumulator for warp 0
-          if (warp_id == 0 && ms == 0 && ns == 0 && tid < 4) {
-            printf("[DIAG-C] tid=%d kb=%d sk=%d c={%g,%g,%g,%g}\n", tid, kb, sk, cp[0], cp[1], cp[2], cp[3]);
-          }
         }
       }
     }
