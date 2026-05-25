@@ -117,6 +117,7 @@ __global__ void w4a8_fp8_qmma_kernel(
           // B[K_idx][N_start..N_start+3] = W_fp8[N_start..N_start+3][K_idx]
           // These are NOT consecutive in SMEM (stride = kTileK)!
           // We need to gather 4 individual bytes.
+          uint32_t b_regs[2];
           {
             int k_idx = sk + lane_id / 4;  // K index within tile (0..31)
             int n_start = wn + (lane_id % 4) * 4;  // N start (0,4,8,12 within 8-wide tile)
