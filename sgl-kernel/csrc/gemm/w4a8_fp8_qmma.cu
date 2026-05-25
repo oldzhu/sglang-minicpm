@@ -116,6 +116,14 @@ __global__ void w4a8_fp8_qmma_kernel(
             memcpy(&b_regs[1], &W_fp8[n_idx * kTileK + k1], sizeof(uint32_t));
           }
 
+          // DIAG: check A fragment values for warp 0, first iteration
+          if (warp_id == 0 && ms == 0 && ns == 0 && sk == 0 && kb == 0) {
+            float a0_f = (float)*reinterpret_cast<const __nv_fp8_e4m3*>(&a_regs[0]);
+            float a1_f = (float)*reinterpret_cast<const __nv_fp8_e4m3*>(&a_regs[1]);
+            printf("[DIAG-A] tid=%d lane=%d row0=%d col0=%d a_regs[0]=0x%08x(%g) a_regs[1]=0x%08x(%g)\n",
+                   tid, lane_id, row0, col0, a_regs[0], a0_f, a_regs[1], a1_f);
+          }
+
           float* cp = c_regs[ms][ns];
           asm volatile(
               "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
