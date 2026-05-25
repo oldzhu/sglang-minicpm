@@ -28,7 +28,7 @@ static constexpr int kWarps = 4;
 __global__ void w4a8_fp8_qmma_kernel(
     const int32_t* __restrict__ qweight,
     const int32_t* __restrict__ qzeros,
-    const float* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ scales,
     const __nv_fp8_e4m3* __restrict__ a_fp8,
     __nv_bfloat16* __restrict__ c_bf16,
     int M, int N, int K, int group_size, int lda, int ldc) {
@@ -64,7 +64,7 @@ __global__ void w4a8_fp8_qmma_kernel(
           int zn = ng / 8, zb = (ng % 8) * 4;
           z4 = ((qzeros[gid * (N / 8) + zn] >> zb) & 0xF) + 1;
         }
-        float fv = ((float)w4 - (float)z4) * scales[gid * N + ng];
+        float fv = ((float)w4 - (float)z4) * __bfloat162float(scales[gid * N + ng]);
         val = static_cast<__nv_fp8_e4m3>(
             __nv_cvt_float_to_fp8(fv, __NV_SATFINITE, __NV_E4M3));
       }
@@ -154,7 +154,7 @@ torch::Tensor w4a8_fp8_fused_gemm(
   w4a8_fp8_qmma_kernel<<<grid, block, kSmemBytes, stream>>>(
       static_cast<const int32_t*>(qweight.const_data_ptr()),
       qzeros.numel() > 0 ? static_cast<const int32_t*>(qzeros.const_data_ptr()) : nullptr,
-      static_cast<const float*>(scales.const_data_ptr()),
+      static_cast<const __nv_bfloat16*>(scales.const_data_ptr()),
       static_cast<const __nv_fp8_e4m3*>(a_fp8.const_data_ptr()),
       static_cast<__nv_bfloat16*>(c_bf16.data_ptr()),
       M, (int)N, (int)K, (int)group_size,
