@@ -105,15 +105,28 @@ __global__ void w4a8_fp8_qmma_kernel(
             memcpy(&a_regs[3], &A_fp8_smem[row1 * kTileK + col1], sizeof(uint32_t));
           }
 
-          // B fragment: m16n8k32 FP8 col-major (stored as W_fp8[n][k]).
-          // Thread t: b[0]=W[wn+t/4][(t%4)*4..+4], b[1]=W[wn+t/4][(t%4)*4+16..+4]
-          uint32_t b_regs[2];
+          // B fragment: m16n8k32 FP8 col-major, shape [32, 8] (K=32, N=8).
+          // Col-major: B[k][n] stored at k*8+n.
+          // Thread t: b[0]=B[t/4][(t%4)*4..+4], b[1]=B[t/4][(t%4)*4+16..+4]
+          //   = 4 consecutive bytes at K=t/4, N=(t%4)*4..+4
+          // Our SMEM: W_fp8[n][k] stored as row-major with stride kTileK.
+          // For col-major B[k][n], we need to read from W_fp8[n][k] with
+          // k = K_idx (inner), n = N_idx (outer).
+          // b_regs[0] = B[K_idx][N_start..N_start+3] = W_fp8[N_start..N_start+3][K_idx]
+          // But W_fp8 is row-major [N][K], so W_fp8[n][k] = W_fp8[n * kTileK + k]
+          // B[K_idx][N_start..N_start+3] = W_fp8[N_start..N_start+3][K_idx]
+          // These are NOT consecutive in SMEM (stride = kTileK)!
+          // We need to gather 4 individual bytes.
           {
-            int n_idx = wn + lane_id / 4;
-            int k0 = sk + (lane_id % 4) * 4;
-            int k1 = k0 + 16;
-            memcpy(&b_regs[0], &W_fp8[n_idx * kTileK + k0], sizeof(uint32_t));
-            memcpy(&b_regs[1], &W_fp8[n_idx * kTileK + k1], sizeof(uint32_t));
+            int k_idx = sk + lane_id / 4;  // K index within tile (0..31)
+            int n_start = wn + (lane_id % 4) * 4;  // N start (0,4,8,12 within 8-wide tile)
+            uint8_t b0_bytes[4], b1_bytes[4];
+            for (int i = 0; i < 4; ++i) {
+              b0_bytes[i] = (uint8_t)W_fp8[(n_start + i) * kTileK + k_idx];
+              b1_bytes[i] = (uint8_t)W_fp8[(n_start + 16 + i) * kTileK + k_idx];
+            }
+            memcpy(&b_regs[0], b0_bytes, sizeof(uint32_t));
+            memcpy(&b_regs[1], b1_bytes, sizeof(uint32_t));
           }
 
           float* cp = c_regs[ms][ns];
