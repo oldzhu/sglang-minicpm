@@ -87,28 +87,30 @@ __global__ void w4a8_fp8_qmma_kernel(
         for (int ns = 0; ns < 16; ++ns) {
           int wn = ns * kMmaN;
 
-          // Load A fragment with memcpy (FP8=1 byte, uint32 needs 4-byte alignment)
+          // A fragment: m16n8k32 FP8 row-major, PTX ISA layout.
+          // Thread t: a[0]=A[t/4][(t%4)*4..+4], a[1]=A[t/4][(t%4)*4+16..+4],
+          //           a[2]=A[t/4+8][(t%4)*4..+4], a[3]=A[t/4+8][(t%4)*4+16..+4]
           uint32_t a_regs[4];
-          for (int r = 0; r < 4; ++r) {
-            int row = wm + lane_id / 4 + r * 8;
-            int col = sk + (lane_id % 4) * 8;
-            if (row < kTileM) {
-              memcpy(&a_regs[r], &A_fp8_smem[row * kTileK + col], sizeof(uint32_t));
-            } else {
-              a_regs[r] = 0u;
-            }
+          {
+            int row0 = wm + lane_id / 4;
+            int row1 = row0 + 8;
+            int col0 = sk + (lane_id % 4) * 4;
+            int col1 = col0 + 16;
+            memcpy(&a_regs[0], &A_fp8_smem[row0 * kTileK + col0], sizeof(uint32_t));
+            memcpy(&a_regs[1], &A_fp8_smem[row0 * kTileK + col1], sizeof(uint32_t));
+            memcpy(&a_regs[2], &A_fp8_smem[row1 * kTileK + col0], sizeof(uint32_t));
+            memcpy(&a_regs[3], &A_fp8_smem[row1 * kTileK + col1], sizeof(uint32_t));
           }
 
-          // Load B fragment with memcpy
+          // B fragment: m16n8k32 FP8 col-major (stored as W_fp8[n][k]).
+          // Thread t: b[0]=W[wn+t/4][(t%4)*4..+4], b[1]=W[wn+t/4][(t%4)*4+16..+4]
           uint32_t b_regs[2];
-          for (int r = 0; r < 2; ++r) {
-            int krow = sk + lane_id / 4 + r * 16;
-            int ncol = wn + (lane_id % 4) * 2;
-            if (krow < kTileK && ncol < kTileN) {
-              memcpy(&b_regs[r], &W_fp8[ncol * kTileK + krow], sizeof(uint32_t));
-            } else {
-              b_regs[r] = 0u;
-            }
+          {
+            int n_idx = wn + lane_id / 4;
+            int k0 = sk + (lane_id % 4) * 4;
+            int k1 = k0 + 16;
+            memcpy(&b_regs[0], &W_fp8[n_idx * kTileK + k0], sizeof(uint32_t));
+            memcpy(&b_regs[1], &W_fp8[n_idx * kTileK + k1], sizeof(uint32_t));
           }
 
           float* cp = c_regs[ms][ns];
@@ -126,15 +128,26 @@ __global__ void w4a8_fp8_qmma_kernel(
   }
 
   // Epilogue: accumulators -> BF16
+  // m16n8 D layout per thread t: rows {t/4, t/4+8}, cols {2*(t%4), 2*(t%4)+1}
+  //   cp[0]->(t/4,   2*(t%4))  cp[1]->(t/4,   2*(t%4)+1)
+  //   cp[2]->(t/4+8, 2*(t%4))  cp[3]->(t/4+8, 2*(t%4)+1)
   for (int ms = 0; ms < 2; ++ms) {
+    int wm = warp_m0 + ms * kMmaM;
     for (int ns = 0; ns < 16; ++ns) {
+      int wn = ns * kMmaN;
       float* cp = c_regs[ms][ns];
-      for (int i = 0; i < 4; ++i) {
-        int mi = warp_m0 + ms * kMmaM + (lane_id * 4 + i) / kMmaN;
-        int ni = n0 + ns * kMmaN + (lane_id * 4 + i) % kMmaN;
-        if (m0 + mi < M && ni < N)
-          c_bf16[(m0 + mi) * ldc + ni] = __float2bfloat16(cp[i]);
-      }
+      int row0 = wm + lane_id / 4;
+      int row1 = row0 + 8;
+      int col0 = wn + 2 * (lane_id % 4);
+      int col1 = col0 + 1;
+      if (m0 + row0 < M && n0 + col0 < N)
+        c_bf16[(m0 + row0) * ldc + n0 + col0] = __float2bfloat16(cp[0]);
+      if (m0 + row0 < M && n0 + col1 < N)
+        c_bf16[(m0 + row0) * ldc + n0 + col1] = __float2bfloat16(cp[1]);
+      if (m0 + row1 < M && n0 + col0 < N)
+        c_bf16[(m0 + row1) * ldc + n0 + col0] = __float2bfloat16(cp[2]);
+      if (m0 + row1 < M && n0 + col1 < N)
+        c_bf16[(m0 + row1) * ldc + n0 + col1] = __float2bfloat16(cp[3]);
     }
   }
 }
