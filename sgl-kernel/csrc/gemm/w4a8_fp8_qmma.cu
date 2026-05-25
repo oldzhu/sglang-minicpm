@@ -87,22 +87,28 @@ __global__ void w4a8_fp8_qmma_kernel(
         for (int ns = 0; ns < 16; ++ns) {
           int wn = ns * kMmaN;
 
+          // Load A fragment with memcpy (FP8=1 byte, uint32 needs 4-byte alignment)
           uint32_t a_regs[4];
           for (int r = 0; r < 4; ++r) {
             int row = wm + lane_id / 4 + r * 8;
             int col = sk + (lane_id % 4) * 8;
-            a_regs[r] = (row < kTileM)
-                ? *reinterpret_cast<const uint32_t*>(&A_fp8_smem[row * kTileK + col])
-                : 0u;
+            if (row < kTileM) {
+              memcpy(&a_regs[r], &A_fp8_smem[row * kTileK + col], sizeof(uint32_t));
+            } else {
+              a_regs[r] = 0u;
+            }
           }
 
+          // Load B fragment with memcpy
           uint32_t b_regs[2];
           for (int r = 0; r < 2; ++r) {
             int krow = sk + lane_id / 4 + r * 16;
             int ncol = wn + (lane_id % 4) * 2;
-            b_regs[r] = (krow < kTileK && ncol < kTileN)
-                ? *reinterpret_cast<const uint32_t*>(&W_fp8[ncol * kTileK + krow])
-                : 0u;
+            if (krow < kTileK && ncol < kTileN) {
+              memcpy(&b_regs[r], &W_fp8[ncol * kTileK + krow], sizeof(uint32_t));
+            } else {
+              b_regs[r] = 0u;
+            }
           }
 
           float* cp = c_regs[ms][ns];
