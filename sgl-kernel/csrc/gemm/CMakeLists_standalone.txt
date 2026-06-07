@@ -59,6 +59,8 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 option(USE_CUTLASS_QMMA "Build the CUTLASS SM100 mixed-input QMMA kernel" OFF)
 # Option: use the register-only dequant v2 manual kernel
 option(USE_V2_KERNEL "Build the register-only dequant manual kernel (w4a8_fp8_qmma_v2.cu)" OFF)
+# Option: use the cp.async pipeline v3 manual kernel
+option(USE_V3_KERNEL "Build the cp.async pipeline manual kernel (w4a8_fp8_qmma_v3.cu)" OFF)
 
 # ---- Source files ----
 if(USE_CUTLASS_QMMA)
@@ -67,6 +69,12 @@ if(USE_CUTLASS_QMMA)
         ${CMAKE_CURRENT_SOURCE_DIR}/../sglang-minicpm/sgl-kernel/csrc/gemm/w4a8_fp8_qmma_sm120.cu
     )
     message(STATUS "Building CUTLASS QMMA kernel (w4a8_fp8_qmma_sm120.cu)")
+elseif(USE_V3_KERNEL)
+    # Manual PTX kernel with cp.async multi-stage pipeline (Phase 2)
+    set(SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/../sglang-minicpm/sgl-kernel/csrc/gemm/w4a8_fp8_qmma_v3.cu
+    )
+    message(STATUS "Building cp.async pipeline v3 QMMA kernel (w4a8_fp8_qmma_v3.cu)")
 elseif(USE_V2_KERNEL)
     # Manual PTX kernel with register-only INT4 dequant (Path B)
     set(SOURCES
