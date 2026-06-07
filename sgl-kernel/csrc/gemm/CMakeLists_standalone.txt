@@ -3,12 +3,29 @@
 # Builds the W4A8 fused INT4→FP8 dequant + tcgen05 QMMA GEMM kernel
 # as an independent .so that can be loaded via torch.ops.load_library().
 #
-# Usage (on fcloud):
+# Two build modes:
+#   1. Manual kernel (default): w4a8_fp8_qmma.cu — raw PTX mma.sync, no CUTLASS
+#   2. CUTLASS QMMA kernel: w4a8_fp8_qmma_sm120.cu — CUTLASS SM100 mixed-input builder
+#
+# To build the CUTLASS version, pass:
+#   -DUSE_CUTLASS_QMMA=ON -DCUTLASS_SOURCE_DIR=/path/to/cutlass
+#
+# Usage (on fcloud, manual kernel):
 #   mkdir -p /root/standalone_fused/build && cd /root/standalone_fused/build
 #   cmake .. \
 #     -DTorch_DIR=/app/sglang_minicpm_sala_env/lib/python3.10/site-packages/torch/share/cmake/Torch \
 #     -DCMAKE_CUDA_ARCHITECTURES=120 \
 #     -DCMAKE_BUILD_TYPE=Release
+#   cmake --build . -- -j2
+#
+# Usage (on fcloud, CUTLASS QMMA kernel):
+#   mkdir -p /root/standalone_fused/build && cd /root/standalone_fused/build
+#   cmake .. \
+#     -DTorch_DIR=/app/sglang_minicpm_sala_env/lib/python3.10/site-packages/torch/share/cmake/Torch \
+#     -DCMAKE_CUDA_ARCHITECTURES=120 \
+#     -DCMAKE_BUILD_TYPE=Release \
+#     -DUSE_CUTLASS_QMMA=ON \
+#     -DCUTLASS_SOURCE_DIR=/root/sglang-minicpm/sgl-kernel/build/_deps/repo-cutlass-src
 #   cmake --build . -- -j2
 #
 # Then copy to submission_sim:
@@ -32,24 +49,55 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
+# Option: use CUTLASS QMMA kernel instead of manual kernel
+option(USE_CUTLASS_QMMA "Build the CUTLASS SM100 mixed-input QMMA kernel" OFF)
+# Option: use the register-only dequant v2 manual kernel
+option(USE_V2_KERNEL "Build the register-only dequant manual kernel (w4a8_fp8_qmma_v2.cu)" OFF)
+
 # ---- Source files ----
-# Use the QMMA version (w4a8_fp8_qmma.cu) for SM120 tcgen05 path.
-# Fallback: w4a8_fp8_fused_gemm.cu is the old wmma kernel (148 TFLOPS).
-set(SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/../sgl-kernel/csrc/gemm/w4a8_fp8_qmma.cu
-)
+if(USE_CUTLASS_QMMA)
+    # CUTLASS-based kernel using SM100 mixed-input builder (tcgen05 QMMA)
+    set(SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/../sglang-minicpm/sgl-kernel/csrc/gemm/w4a8_fp8_qmma_sm120.cu
+    )
+    message(STATUS "Building CUTLASS QMMA kernel (w4a8_fp8_qmma_sm120.cu)")
+elseif(USE_V2_KERNEL)
+    # Manual PTX kernel with register-only INT4 dequant (Path B)
+    set(SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/../sglang-minicpm/sgl-kernel/csrc/gemm/w4a8_fp8_qmma_v2.cu
+    )
+    message(STATUS "Building register-only v2 QMMA kernel (w4a8_fp8_qmma_v2.cu)")
+else()
+    # Manual PTX kernel using mma.sync (fallback)
+    set(SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/../sglang-minicpm/sgl-kernel/csrc/gemm/w4a8_fp8_qmma.cu
+    )
+    message(STATUS "Building manual QMMA kernel (w4a8_fp8_qmma.cu)")
+endif()
 
 # ---- Build the shared library ----
 add_library(w4a8_fused_gemm SHARED ${SOURCES})
 
 target_include_directories(w4a8_fused_gemm PRIVATE
     ${Torch_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../sgl-kernel/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../sglang-minicpm/sgl-kernel/csrc
 )
+
+if(USE_CUTLASS_QMMA)
+    if(NOT CUTLASS_SOURCE_DIR)
+        message(FATAL_ERROR "USE_CUTLASS_QMMA=ON requires -DCUTLASS_SOURCE_DIR=/path/to/cutlass")
+    endif()
+    target_include_directories(w4a8_fused_gemm PRIVATE
+        ${CUTLASS_SOURCE_DIR}/include
+        ${CUTLASS_SOURCE_DIR}/tools/util/include
+    )
+    message(STATUS "CUTLASS source dir: ${CUTLASS_SOURCE_DIR}")
+endif()
 
 target_compile_options(w4a8_fused_gemm PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-arch=sm_120a>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>
+    $<$<COMPILE_LANGUAGE:CUDA>:-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1>
 )
 
 target_link_libraries(w4a8_fused_gemm PRIVATE
