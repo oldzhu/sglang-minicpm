@@ -42,6 +42,12 @@ project(w4a8_fused_gemm LANGUAGES CXX CUDA)
 # Find Torch (required for torch::Tensor, TORCH_CHECK, TORCH_LIBRARY, etc.)
 find_package(Torch REQUIRED)
 
+# Torch injects a global -gencode list (compute_75..compute_120) into
+# CMAKE_CUDA_FLAGS. compute_75 (< sm_89) cannot assemble FP8 mma and aborts
+# ptxas. Strip all inherited -gencode entries and rely solely on our explicit
+# -arch=sm_120a (set in target_compile_options below).
+string(REGEX REPLACE "-gencode arch=[^ ]+,code=[^ ]+" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+
 # CUDA 12.8+ required for tcgen05 PTX instructions
 find_package(CUDA REQUIRED)
 
