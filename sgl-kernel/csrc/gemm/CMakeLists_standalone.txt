@@ -106,9 +106,13 @@ target_link_libraries(w4a8_fused_gemm PRIVATE
     c10
 )
 
-# Set output name
+# Set output name.
+# CUDA_ARCHITECTURES OFF: we pass -arch=sm_120a explicitly in
+# target_compile_options, so prevent CMake from injecting its own default
+# -gencode (e.g. compute_75) which would fail on FP8 mma (needs sm_89+).
 set_target_properties(w4a8_fused_gemm PROPERTIES
     OUTPUT_NAME w4a8_fused_gemm
     PREFIX lib
     SUFFIX .so
+    CUDA_ARCHITECTURES OFF
 )
